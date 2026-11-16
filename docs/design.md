@@ -4,9 +4,11 @@
 
 `refl` sends the active conversation to the OpenAI-compatible chat endpoint in `llama-server`. The model can inspect UTF-8 files with `read_file` and `grep_search`, run Bash commands with `bash`, and make changes with `write_file` and `edit_file`. Reflect executes calls in the order they appear and returns each observation with the corresponding tool call ID. The terminal lists each call with its command, path, or search pattern. The model continues until it returns a final answer or reaches the request limit.
 
+Reflect builds the system prompt for each request from its current instructions, the project's `REFLECT.md`, and the list of project skills. A resumed session therefore follows the current instructions and the current `--linear`, `--no-verify`, and `--thinking` settings.
+
 The CLI and file tools use Python filesystem APIs on all platforms. PowerShell and MSYS2 launch the same CLI. The `bash` tool invokes Bash from the workspace directory. On Windows, Bash can come from MSYS2 or Git for Windows. `rg` is an external executable used by `grep_search` on all four target platforms.
 
-The launch directory is the workspace unless `--workspace` selects one explicitly. An empty workspace can start a session. When `REFLECT.md` exists at the workspace root, the model reads it as project guidance. The file tools preserve existing instructions and configuration from other coding agents, and allow writes in their skill directories. Bash runs with the launching user's permissions and receives the project's preservation rule as model guidance.
+The launch directory is the workspace unless `--workspace` selects one explicitly. An empty workspace can start a session. The file tools preserve existing instructions and configuration from other coding agents, and allow writes in their skill directories. Bash runs with the launching user's permissions and receives the project's preservation rule as model guidance.
 
 ## Conversation trees
 
@@ -24,7 +26,7 @@ flowchart TD
     G --> H[Main branch continues the task]
 ```
 
-Solid arrows are parent links in the saved tree. The dotted arrow is the verdict copied into the main conversation. A verifier's tool calls and observations remain on its branch. Nodes from a fork with a usable verdict are marked `merged`. Forks that fail or exhaust the request budget are marked `pruned` and retained in the session for inspection.
+Solid arrows are parent links in the saved tree. The dotted arrow is the verdict copied into the main conversation. A fork's tool calls and observations remain on its branch. Nodes from a fork with a usable result are marked `merged`. Forks that fail or exhaust the request budget are marked `pruned` and retained in the session for inspection.
 
 Reflect writes UTF-8 JSON to `.refl/sessions/<session-id>.json` at startup, when it accepts a prompt, and after each completed model and tool round. It writes to a temporary file in the same directory and replaces the session file once the snapshot is complete. The session ID includes a UTC timestamp and a unique suffix. Session files can hold prompts, file contents, and command output, so Reflect adds a `.gitignore` to `.refl/sessions/` and `.refl/strategies/` that keeps Git from tracking them in any workspace. It leaves an existing `.gitignore` in those directories unchanged.
 
@@ -32,7 +34,7 @@ Reflect writes UTF-8 JSON to `.refl/sessions/<session-id>.json` at startup, when
 refl --workspace ./project --resume SESSION_ID "Continue with the next step."
 ```
 
-Resuming copies the saved tree into a new session file and continues from the saved active node. The copied tree includes earlier forks. A saved turn interrupted before a final answer is closed with a brief transcript note when the next prompt begins. The CLI prints the new session ID at startup. Reflect builds the system prompt for each request, so a resumed session follows the current instructions and the `--linear` setting.
+Resuming copies the saved tree into a new session file and continues from the saved active node. The copied tree includes earlier forks. A saved turn interrupted before a final answer is closed with a brief transcript note when the next prompt begins. The CLI prints the new session ID at startup.
 
 `/tree` displays every branch and marks the current node. The newest continuation of a node stays at the same indentation, and earlier branches such as forks are indented above it. `/checkout <node_id>` can select a main, verification, or reflection node. The next prompt extends the selected path, and earlier branches remain visible in the tree. If the selected node falls inside a tool round, Reflect adds skipped results for tool calls still awaiting a result. The next task operates on the workspace as it exists when the task starts.
 
@@ -53,23 +55,28 @@ Verification tests can exercise a claim that changes after an edit. Start with `
 
 ## Strategic reflection
 
-Reflect checks up to four actual main-branch tool results from the current task. It starts a reflection batch when it observes one of these patterns.
+Reflect watches the actual main-branch tool results of the current task and starts a reflection batch when it sees one of these patterns. The first four look at the latest four results. The last two look at the whole task.
 
 - Two consecutive failures for the same action, or the same failure from two calls to the same tool.
 - Two writes to the same file that leave its bytes unchanged.
 - Three calls with the same action and unchanged results, including a command that repeatedly exits successfully with the same output.
 - Three changes to the same file without a successful Bash result between them.
-- Three identical failures from the same call during a task, even with edits between the runs. Fractional numbers such as test durations are ignored when comparing the results.
+- Three identical failures from the same call, even with edits between the runs. Fractional numbers such as test durations are ignored when comparing the results.
+- A Bash command that has run at least four times returns a result it already returned earlier, but not the one just before it. This catches edits that go back and forth. The exit code does not matter, because a command such as `python check.py; cat report.txt` exits successfully even when the check fails. Repeating a passing check returns the same result twice in a row and does not count.
 
-Each batch runs three reviewers with different roles. Reflect saves their branches and summarizes their proposals in the main conversation. The main branch starts with the cheapest idea whose failure it can detect quickly, runs its check, and moves on if it fails. Three parallel slots let the server work on all three reviewers at once. On a single slot they run one after another.
+### Reflection batches
 
-The request limit covers the main loop and its forks. Automatic reflection starts when the budget can cover the reviewers plus at least two main requests. If the turn reaches its last request after reflection, it uses that request for a Bash smoke check and reports the observed result. If the model answers in text instead, Reflect returns that answer.
+Each batch runs three read-only reviewers with different roles. Three parallel slots let the server work on all three at once. On a single slot they run one after another. Reflect saves their branches and adds their proposals to the main conversation in two groups. Evidence-based ideas come from the grounded roles, which inspect the workspace. Unverified ideas come from the other roles.
 
-`/reflect` starts a batch on the current conversation on demand. It records the proposals and waits for the next task. Automatic reflection pacing applies to detections from tool results.
+The main branch then makes one request without tools to choose an idea. It names the reviewer, the observations the idea explains, and its first step. Reflect keeps that plan in the conversation and asks the main branch to carry it out. The instructions ask it to prefer the evidence-based idea that explains the most of what it observed, to try unverified ideas only when the evidence does not settle the question, and not to return to the edits or commands it repeated before the reflection. Without this step, a model without thinking sometimes started with the cheapest idea and went back to its loop even when a reviewer had named the cause. [Results so far](benchmark-plan.md#results-so-far)
+
+The request limit covers the main loop and its forks. Automatic reflection starts only when the budget can cover the reviewers, the decision request, and at least two main requests. If the turn reaches its last request after reflection, it uses that request for a Bash smoke check and reports the observed result. If the model answers in text instead, Reflect returns that answer.
+
+`/reflect` starts a batch on the current conversation on demand. It records the proposals and waits for the next task, so it skips the decision step. Automatic reflection pacing applies only to detections from tool results.
 
 ### Reviewer roles
 
-Reviewers that share the same context, tools, and prompt tend to return the same idea. In a test with a 27B model, three fixed lenses gave one distinct proposal in each of six reflections. Reflect therefore picks each batch's reviewers from a pool of roles, and the roles differ in what they see, which tools they have, and what kind of idea they return.
+Reviewers that share the same context, tools, and prompt tend to return the same idea, as the three fixed lenses of earlier versions did. Reflect therefore picks each batch's reviewers from a pool of roles, and the roles differ in what they see, which tools they have, and what kind of idea they return.
 
 | Group | Role | Looks for | Sees |
 | --- | --- | --- | --- |
@@ -86,7 +93,7 @@ Reviewers that share the same context, tools, and prompt tend to return the same
 | Lateral | Backtrack | The earliest decision that led into the dead end | Conversation |
 | Lateral | Ask the user | The one question whose answer would unblock the task | Summary |
 
-The summary holds the task prompt, the reason for reflecting, the latest six main-branch actions with their results, and the names at the workspace root. Each write or edit in it shows an excerpt of what changed, so a reviewer can tell which fixes were already tried. Roles that see only the summary cost one short request and do not inherit the main branch's framing. Roles with tools get one request to inspect the workspace and a second to answer. Existing patterns joins only when the workspace has project skills or Git history.
+The summary holds the task prompt, the reason for reflecting, the latest six main-branch actions with their results, and the names at the workspace root. Each write or edit in it shows an excerpt of what changed, so a reviewer can tell which fixes were already tried. Roles that see only the summary cost one short request and do not inherit the main branch's framing. Roles with tools get one request to inspect the workspace and a second to answer. Existing patterns joins only when the workspace has project skills or Git history. It gets up to six recent Git commit subjects and opens an explicitly mentioned project skill or the workspace's sole skill as a starting point.
 
 A reflection temperature sets the mix of groups. It starts at 0 for the first batch in a task and rises by one with each further batch, up to 2. It drops back to 0 when a failing command passes or an unchanged file finally changes, and with each new task. `/reflect` uses temperature 2.
 
@@ -96,31 +103,22 @@ A reflection temperature sets the mix of groups. It starts at 0 for the first ba
 | 1 | Grounded, alternative, lateral |
 | 2 | Alternative, lateral, lateral |
 
-Within a group, Reflect prefers roles not yet used in the task, then roles that suit the stall. A repeated failure suits roles such as Diagnosis and Switch tools, and a result that never changes suits roles such as Known alternative and Premortem. Alternative and lateral roles also sample at a higher model temperature.
+Within a group, Reflect prefers roles not yet used in the task, then roles that suit the stall. A repeated failure suits roles such as Diagnosis and Switch tools, and a result that never changes suits roles such as Known alternative and Premortem. Alternative and lateral roles also sample at a higher model temperature. With a reasoning model, most of a reviewer's time goes into its thinking step, and `--thinking main` skips that step for the forks.
 
-With a reasoning model, most of a reviewer's time goes into its thinking step. `--thinking main` skips that step for verification and reflection forks and keeps it on the main branch, which decides what to do with the ideas.
-
-Every reviewer answers in the same fields: the proposal, its basis, the cost of trying it, and the result that would show it failed. Ideas may be unverified, so each must be cheap to rule out. The Analogy role first restates the problem in abstract terms without words from the project's domain: the parts, how they relate, the goal, and what blocks it. Only then does it name a field with the same structure, map the parts, and give one concrete step. Simulated annealing came about the same way, when the cooling of metals was mapped onto the travelling salesman problem.
-
-The Existing patterns role gets up to six recent Git commit subjects and opens an explicitly mentioned project skill or the workspace's sole skill as a starting point. These sources can point to a working baseline.
+Every reviewer answers in the same fields: the proposal, its basis, the cost of trying it, and the result that would show it failed. Ideas may be unverified, so each must be cheap to rule out, and none may contradict the task's stated requirements. The Analogy role first restates the problem in abstract terms without words from the project's domain: the parts, how they relate, the goal, and what blocks it. Only then does it name a field with the same structure, map the parts, and give one concrete step. Simulated annealing came about the same way, when the cooling of metals was mapped onto the travelling salesman problem.
 
 ### Reflection pacing
 
 Reflect adapts to observed results during the session. After each reflection batch, it waits for at least two new tool results before starting another. Further batches without a recovery raise that interval to four and then eight results. The delay resets if a recently failing command passes or a file that recently stayed unchanged finally changes. Reflect also suppresses repeat reviews for the same pattern within a task. A new user prompt starts a fresh observation window, and the pacing is saved with the session so `--resume` carries it forward.
 
-A single failed attempt gives the model room to recover. The throttle uses observed results across model sizes. Repeated output is a signal to investigate, and a reviewer can propose a direct check on the artifact or milestone if the shell output alone gives little evidence of progress.
-
-If a reviewer discovers a useful tool, the main branch can try it and record the successful command for future work. [Project skills](project-skills.md)
-
-The project retrospectives add a useful question for reviewers. Check whether the expected milestone or artifact advanced even when the command reports success. Match the scenario and environment when comparing results. [Lessons from two development retrospectives](retrospective-lessons.md)
+A single failed attempt gives the model room to recover. Repeated output is a signal to investigate, and a reviewer can propose a direct check on the artifact or milestone when the shell output alone gives little evidence of progress.
 
 ### Skills and Strategy
 
-The CLI shows a **Skills** block when a note is read or saved. A **Strategy** block shows why reflection started, the proposals that came back, and the main-branch tool attempts that follow. Reflect records those attempts and their results in `.refl/strategies/<session-id>.md`. The session tree keeps the full tool observations. A future findings view can follow an action to its observed outcome and link each entry back to the relevant command, result, or file.
+The CLI shows a **Skills** block when a note is read or saved. A **Strategy** block shows why reflection started, the temperature and roles, the proposals that came back, the chosen plan, and the main-branch tool attempts that follow. Reflect records the same in `.refl/strategies/<session-id>.md`, and the session tree keeps the full tool observations.
 
-- **x86 disassembler found.** Show the executable and the successful discovery or version check. If the project installed it, link to the install result and the follow-up check.
-- **Assembler tutorial saved.** Show the source and local path, and link to the tool result that confirmed the saved file could be read.
-- **DSP ↔ CPU communication moved from I/O to SSI/DMA.** Link to the implementation and the check of the new path. Include a before-and-after timing result when both runs used the same workload.
-- **Workflow saved as a project skill.** Link to the skill and the command and input that demonstrated it.
+If a reviewer discovers a useful tool, the main branch can try it and record the successful command as a project skill. [Project skills](project-skills.md)
 
-An entry can start with the current attempt and update as evidence arrives. A result that changes the next action can link to the strategy decision and its rationale. A result that improves a repeatable workflow can link to the skill it creates or updates. The tree holds the detailed investigation and the skill file holds the steps worth reusing.
+The project retrospectives add a useful question for reviewers. Check whether the expected milestone or artifact advanced even when the command reports success. Match the scenario and environment when comparing results. [Lessons from two development retrospectives](retrospective-lessons.md)
+
+A possible extension is a findings view that follows each action to its observed outcome. Each entry could link back to the command, result, or file that supports it, to the strategy decision that led to it, and to the skill it created or updated.

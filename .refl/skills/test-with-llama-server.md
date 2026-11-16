@@ -8,7 +8,7 @@ Start a local server with two slots. The CPU configuration below was used with Q
 llama-server -m model.gguf --host 127.0.0.1 --port 8081 --jinja -np 2 -c 8192 --reasoning off --no-ui --device none
 ```
 
-If the binary is outside `PATH` on Windows, launch the built `llama-server.exe` directly.
+If the binary is outside `PATH` on Windows, launch the built `llama-server.exe` directly. This small context is enough for the smoke test. Longer sessions need a larger `-c`, because Reflect sends the whole conversation with every request. For a reasoning model, `refl --thinking off` turns its thinking step off per request instead of `--reasoning off` on the server.
 
 In the test workspace, create `status.txt` containing `old_ready`. Ask Reflect to copy the tag as its first reply and report the verdict when it arrives.
 

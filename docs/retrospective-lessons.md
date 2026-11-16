@@ -18,7 +18,7 @@ Reflect can establish an acceptance check early by naming the input, expected us
 
 Verify that comparison runs start from matching states and advance through the intended workload. Identical output can come from a stalled execution. Output can also match a reference while missing a real-time deadline. Check scenario identity, evidence of progress, fidelity, and timing.
 
-Phase 3 can look for repeated errors and for checks that keep returning the same result without reaching an expected milestone. Examples are a command that exits successfully while leaving the expected artifact unchanged, or a benchmark that emits repeated samples without advancing its checkpoint. Before choosing a remedy, a reviewer should identify the actual path, match the inputs and environment to the reference, and propose a small test that would show progress. Use the same workload before and after a change and keep behavior and timing results separately visible.
+Strategic reflection looks for repeated errors and for checks that keep returning the same result without reaching an expected milestone. Examples are a command that exits successfully while leaving the expected artifact unchanged, or a benchmark that emits repeated samples without advancing its checkpoint. Before choosing a remedy, a reviewer should identify the actual path, match the inputs and environment to the reference, and propose a small test that would show progress. Use the same workload before and after a change and keep behavior and timing results separately visible.
 
 ## State what was verified
 

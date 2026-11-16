@@ -8,7 +8,7 @@ Reflect adds paths for `.refl/skills/*.md` to the model's context. The model can
 
 Skills reuse the existing tools. The main branch can verify an installation with `bash`, run a command, and save or update a note with `write_file` or `edit_file`. A verifier can read the notes and check their claims against workspace evidence. The Existing patterns reviewer looks for a relevant skill when progress stalls and can pass a proven command or procedure back to the main branch. The project skill index reflects files added during the current run, so they are available to the next model request as well as future sessions.
 
-This repository includes a skill for running the verification smoke test against a local server. [Test Reflect against llama-server](../.refl/skills/test-with-llama-server.md)
+This repository includes two skills: a verification smoke test against a local server, and the paired reflection benchmark. [Test Reflect against llama-server](../.refl/skills/test-with-llama-server.md), [Benchmark reflection against llama-server](../.refl/skills/benchmark-reflection.md)
 
 ## From investigation to skill
 
@@ -41,9 +41,9 @@ listing as data when inspecting the instructions.
 
 The template uses a sample path. In a real project, use the command and input that you verified and note the observed result.
 
-## Choosing a tool for x86 binaries
+## Example: choosing a tool for x86 binaries
 
-First identify the file format and execution mode. A flat 16-bit DOS `.COM` file starts at offset `0x100`, so `ndisasm -b 16 -o100h` can generate a static instruction listing with the matching origin. NDISASM treats its input as raw bytes. For a container format such as a DOS `.EXE`, use a workflow that accounts for headers and the executable's entry point. [NASM NDISASM manual](https://www.nasm.us/doc/nasmab.html)
+The following example shows how a skill can capture a tool choice for one kind of input. First identify the file format and execution mode. A flat 16-bit DOS `.COM` file starts at offset `0x100`, so `ndisasm -b 16 -o100h` can generate a static instruction listing with the matching origin. NDISASM treats its input as raw bytes. For a container format such as a DOS `.EXE`, use a workflow that accounts for headers and the executable's entry point. [NASM NDISASM manual](https://www.nasm.us/doc/nasmab.html)
 
 When the question is how the program behaves at runtime, a tool like DOSBox can run DOS software and let you observe that behavior. A skill can record the successful emulator configuration, invocation, and observed result alongside a separate static disassembly note. [DOSBox Staging manual](https://www.dosbox-staging.org/0.83/manual/introduction/what-is-dosbox-staging/)
 
