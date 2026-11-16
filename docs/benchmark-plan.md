@@ -14,7 +14,7 @@ Run the upstream grader on a known reference solution before trusting the adapte
 
 | Arm | Configuration |
 | --- | --- |
-| Linear | Reflect's main tool loop with verification and reflection disabled. Its prompt omits the fork instructions. |
+| Linear | Run with `--linear`. Reflect uses its main tool loop, omits the verification instruction, and skips both kinds of forks. |
 | Forks | The same main loop with verification and strategic reflection enabled. |
 
 Pin the Reflect revision, GGUF hash and quantization, llama.cpp build, chat template, sampling settings, hardware, and effective context per slot. Give both arms the same task prompt, main tools, permissions, and initial project guidance and skills. Start a fresh session for each task so learned skills and pacing from prior tasks stay out of the comparison. Record the run order, use the same cache policy, and alternate which arm runs first across tasks.

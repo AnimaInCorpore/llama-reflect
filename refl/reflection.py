@@ -1,5 +1,6 @@
 import json
 import os
+import re
 from collections import deque
 from dataclasses import dataclass
 
@@ -18,6 +19,15 @@ REFLECTION_PROMPT = (
 )
 
 _FILE_WRITES = {"write_file", "edit_file"}
+_FRACTIONAL = re.compile(r"\d+\.\d+")
+
+
+def _failure_signature(result):
+    """Compare failures while ignoring fractional numbers such as test durations."""
+    output = result.get("output")
+    if isinstance(output, str):
+        output = _FRACTIONAL.sub("#", output)
+    return json.dumps({**result, "output": output}, sort_keys=True)
 
 
 @dataclass
@@ -44,10 +54,14 @@ class StallDetector:
         self.pacing = pacing
         self.recent = deque(maxlen=4)
         self.reported = set()
+        # Failure signatures per action for the whole task, so an edit-and-retest cycle that keeps
+        # failing the same way is visible even after it scrolls out of the recent window.
+        self.failures = {}
 
     def start_turn(self):
         self.recent.clear()
         self.reported.clear()
+        self.failures.clear()
 
     def record(self, function, result):
         name = function["name"]
@@ -81,6 +95,12 @@ class StallDetector:
             self.reported = {key for key in self.reported if key[0] == "edits"}
         elif passed:
             self.reported = {key for key in self.reported if key[0] != "edits"}
+        if observation.failed:
+            signature = _failure_signature(result)
+            previous, count = self.failures.get(observation.action, (None, 0))
+            self.failures[observation.action] = (signature, count + 1 if previous == signature else 1)
+        else:
+            self.failures.pop(observation.action, None)
         self.recent.append(observation)
 
     def stall(self):
@@ -95,6 +115,15 @@ class StallDetector:
                 diagnostic = json.dumps(latest.result, sort_keys=True)
                 return self._report(("diagnostic", latest.name, diagnostic),
                                     f"Two {latest.name} calls produced the same failure.")
+        if latest.failed:
+            signature, count = self.failures.get(latest.action, (None, 0))
+            if count >= 3:
+                reason = self._report(("repeated failure", latest.action, signature),
+                                      f"{latest.subject} failed the same way three times.")
+                if reason:
+                    # Require three more identical failures before this pattern triggers again.
+                    self.failures[latest.action] = (signature, 0)
+                    return reason
 
         unchanged = 0
         no_op_writes = 0

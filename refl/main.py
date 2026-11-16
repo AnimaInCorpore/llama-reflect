@@ -1,6 +1,7 @@
 import argparse
 import asyncio
 import os
+import re
 import sys
 from pathlib import Path
 
@@ -13,6 +14,10 @@ from .tree import ConversationTree
 
 
 _TREE_COMMANDS = {"/tree", "/checkout"}
+_COMMANDS = _TREE_COMMANDS | {"/reflect", "/exit"}
+_SLASH_WORD = re.compile(r"/[A-Za-z][\w-]*")
+# MSYS2 rewrites a leading-slash argument such as /tree into C:/Program Files/Git/tree.
+_MSYS_COMMAND = re.compile(r"[A-Za-z]:[\\/](?:[^\n]*[\\/])?(tree|checkout|reflect|exit)(?:\s+[^\n]*)?")
 
 
 def _positive_int(value):
@@ -24,6 +29,18 @@ def _positive_int(value):
 
 def _status(message):
     print(message, file=sys.stderr, flush=True)
+
+
+def _tolerant_output(stream):
+    """Escape characters the console encoding cannot represent instead of failing."""
+    reconfigure = getattr(stream, "reconfigure", None)
+    if reconfigure is not None:
+        reconfigure(errors="backslashreplace")
+
+
+def _check_command(command, argument):
+    if not argument and command not in _COMMANDS and _SLASH_WORD.fullmatch(command):
+        raise ValueError(f"Unknown command {command}. Use /reflect, /tree, /checkout <node_id>, or /exit.")
 
 
 def _open_tree(root, resume, *, persist=True):
@@ -42,10 +59,7 @@ def _tree_command(tree, command, argument):
     if command == "/tree":
         if argument:
             raise ValueError("Usage: /tree")
-        output = tree.render()
-        if sys.stdout.encoding:
-            output = output.encode(sys.stdout.encoding, "backslashreplace").decode(sys.stdout.encoding)
-        print(output, flush=True)
+        print(tree.render(), flush=True)
         return
 
     try:
@@ -58,6 +72,7 @@ def _tree_command(tree, command, argument):
 
 async def _submit(engine, prompt):
     command, argument = _split_prompt(prompt)
+    _check_command(command, argument)
     if command in _TREE_COMMANDS:
         _tree_command(engine.tree, command, argument)
         if command == "/checkout":
@@ -66,6 +81,8 @@ async def _submit(engine, prompt):
         if argument:
             raise ValueError("Usage: /reflect")
         await engine.reflect()
+    elif command == "/exit":
+        raise ValueError("Usage: /exit")
     else:
         print(await engine.respond(prompt), flush=True)
 
@@ -76,6 +93,11 @@ async def _run(args):
         raise ValueError(f"Workspace directory does not exist: {root}")
     if args.prompt is not None:
         command, argument = _split_prompt(args.prompt)
+        _check_command(command, argument)
+        if command == "/exit":
+            if argument:
+                raise ValueError("Usage: /exit")
+            return
         if command in _TREE_COMMANDS:
             tree = _open_tree(root, args.resume, persist=False)
             _tree_command(tree, command, argument)
@@ -101,7 +123,7 @@ async def _run(args):
             _status(f"Slot status unavailable ({error})")
 
         tree = _open_tree(root, args.resume)
-        engine = Engine(server, model, workspace, tree, args.max_turns, args.max_tokens, _status)
+        engine = Engine(server, model, workspace, tree, args.max_turns, args.max_tokens, _status, forks=not args.linear)
         if args.prompt is not None:
             await _submit(engine, args.prompt)
             return
@@ -134,12 +156,21 @@ def main(argv=None):
     parser.add_argument("--workspace", type=Path, default=Path.cwd(), help="workspace root (default: current directory)")
     parser.add_argument("--resume", metavar="SESSION_ID", help="continue a saved conversation in a new session")
     parser.add_argument("--bash", help="Bash executable (default: detect Bash)")
-    parser.add_argument("--max-turns", type=_positive_int, default=20, help="model requests per prompt (default: 20)")
+    parser.add_argument("--linear", action="store_true", help="run the main tool loop with both kinds of forks disabled")
+    parser.add_argument("--max-turns", type=_positive_int, default=20,
+                        help="model requests per prompt across all branches (default: 20)")
     parser.add_argument("--max-tokens", type=_positive_int, default=2048, help="output tokens per completion (default: 2048)")
     parser.add_argument("--timeout", type=_positive_int, default=180, help="model request timeout in seconds (default: 180)")
     args = parser.parse_args(argv)
     if args.prompt is not None and not args.prompt.strip():
         parser.error("prompt must be nonempty")
+    if args.prompt is not None and (mangled := _MSYS_COMMAND.fullmatch(args.prompt.strip())):
+        parser.error(
+            f"the prompt looks like /{mangled[1]} rewritten as a Windows path by MSYS2. Set "
+            "MSYS2_ARG_CONV_EXCL='/tree;/checkout;/reflect' for one-shot slash commands, as described in the README."
+        )
+    for stream in (sys.stdout, sys.stderr):
+        _tolerant_output(stream)
     try:
         asyncio.run(_run(args))
     except KeyboardInterrupt:

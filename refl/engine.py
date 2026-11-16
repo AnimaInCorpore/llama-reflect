@@ -5,24 +5,33 @@ import re
 from .client import ServerError
 from .reflection import LENSES, REFLECTION_PROMPT, StallDetector
 from .tools import TOOLS
+from .tree import ensure_git_ignored
 
 
-SYSTEM_PROMPT = (
+_PROMPT_START = (
     "You are Reflect, a coding agent working in the current workspace. "
     "Use the provided tools to carry out the user's request. Use workspace-relative paths. "
     "Read a file before editing it and check the result of each tool call. "
     "If a tool returns an error or a nonzero exit code, use that information to recover. "
+)
+_VERIFICATION_INSTRUCTION = (
     "On the main branch, before acting on an unchecked assumption about a file, API, or config key, "
     "emit <verify>specific claim</verify> and wait for the verification verdict. "
+)
+_PROMPT_END = (
     "Prefer existing tools for mechanical work and check the project skills for a relevant workflow. "
     "On the main branch, after confirming a reusable command or workflow, write or update a short Markdown "
     "skill under .refl/skills/ with when to use it and the command that worked. "
     "When the task is complete, give a brief final answer."
 )
+SYSTEM_PROMPT = _PROMPT_START + _VERIFICATION_INSTRUCTION + _PROMPT_END
+_LINEAR_PROMPT = _PROMPT_START + _PROMPT_END
 
 _VERIFY_TAG = re.compile(r"<verify>(.*?)</verify>", re.DOTALL | re.IGNORECASE)
 _READ_ONLY_NAMES = {"read_file", "grep_search"}
 _READ_ONLY_TOOLS = [tool for tool in TOOLS if tool["function"]["name"] in _READ_ONLY_NAMES]
+_BASH_TOOLS = [tool for tool in TOOLS if tool["function"]["name"] == "bash"]
+_REVIEW_REQUESTS = 2
 _PROJECT_WRITE_RULE = (
     "Preserve existing AGENTS.md, AGENTS.override.md, CLAUDE.md, CLAUDE.local.md, .mcp.json, and configuration "
     "under .agents/, .claude/, .codex/, and .pi/ when using tools, including Bash. Project skill files can be "
@@ -51,10 +60,40 @@ _EVIDENCE_PROMPT = (
     "say whether it agrees with the claim, and cite the file and line if available. Set status to supported "
     "if the evidence confirms the claim, contradicted if it disproves the claim, or insufficient if it does neither."
 )
+_RECOMMENDATION_PROMPT = (
+    "You are a read-only reviewer summarizing why a coding task stalled. In recommendation, give one "
+    "concrete next action, the evidence behind it, and a check the main branch can run. Keep it brief."
+)
+_RECOMMENDATION_SCHEMA = {
+    "type": "json_object",
+    "schema": {
+        "type": "object",
+        "properties": {"recommendation": {"type": "string"}},
+        "required": ["recommendation"],
+        "additionalProperties": False,
+    },
+}
 
 
 class TurnLimitError(RuntimeError):
     """The turn used all of its allotted model requests."""
+
+
+def _call_summary(function):
+    """Describe a tool call for the terminal and the strategy log, such as `bash pytest -x`."""
+    name = function["name"]
+    try:
+        args = json.loads(function["arguments"])
+    except (TypeError, ValueError):
+        args = None
+    parts = [name]
+    if isinstance(args, dict):
+        if name == "grep_search":
+            parts += [json.dumps(args.get("pattern", ""), ensure_ascii=False), str(args.get("path", ""))]
+        else:
+            parts.append(str(args.get("command") or args.get("path") or ""))
+    text = " ".join(" ".join(parts).split())
+    return text if len(text) <= 200 else text[:197] + "..."
 
 
 def _tool_calls(message):
@@ -79,23 +118,28 @@ def _tool_calls(message):
 
 
 class Engine:
-    def __init__(self, server, model, workspace, tree, max_turns, max_tokens, on_tool):
+    def __init__(self, server, model, workspace, tree, max_turns, max_tokens, on_tool, *, forks=True):
         self.server = server
         self.model = model
         self.workspace = workspace
         self.tree = tree
         self.stalls = StallDetector(tree.reflection)
         self.max_turns = max_turns
+        self.requests_left = None
         self.max_tokens = max_tokens
         self.on_tool = on_tool
+        self.forks = forks
         self.strategy_sections = []
         self.track_strategy = False
         self.strategy_path = f".refl/strategies/{tree.path.stem}.md"
+        # Verdicts from the current task, reused until a main-branch command or write can change the evidence.
+        self.verdicts = {}
 
     def _messages(self, leaf, *, system_prompt=None):
         messages = self.tree.messages(leaf)
         skills = self.workspace.skill_paths()
-        system = system_prompt or messages[0]["content"]
+        # Build the main prompt for each request so resumed sessions and --linear use the current instructions.
+        system = system_prompt or (SYSTEM_PROMPT if self.forks else _LINEAR_PROMPT)
         system += "\n\n" + _PROJECT_WRITE_RULE
         guidance = self.workspace.project_guidance()
         if guidance:
@@ -105,9 +149,17 @@ class Engine:
         messages[0] = {**messages[0], "content": system}
         return messages
 
+    async def _complete(self, messages, tools, *, fork=False, response_format=None):
+        if self.requests_left is not None:
+            if self.requests_left <= (1 if fork else 0):
+                raise TurnLimitError("No model requests remain for this step.")
+            self.requests_left -= 1
+        return await self.server.complete(self.model, messages, tools, self.max_tokens, response_format=response_format)
+
     def _strategy_event(self, text):
         self.strategy_sections.append(text)
         try:
+            ensure_git_ignored(self.workspace.root / ".refl" / "strategies")
             self.workspace.write_file(self.strategy_path, "# Strategy\n\n" + "\n\n".join(self.strategy_sections) + "\n")
         except (OSError, RuntimeError, ValueError) as error:
             self.on_tool(f"Strategy log unavailable: {error}")
@@ -124,18 +176,16 @@ class Engine:
             elif read_only and name not in _READ_ONLY_NAMES:
                 result = {"error": f"{name} is unavailable in a read-only {branch_type} fork."}
             else:
+                summary = _call_summary(function)
                 tracking = not read_only and self.track_strategy
                 if tracking:
-                    try:
-                        args = json.loads(function["arguments"])
-                    except ValueError:
-                        args = None
-                    target = (args.get("command") or args.get("path") or "") if isinstance(args, dict) else ""
-                    attempt = (" ".join(f"{name} {target}".split()))[:200]
-                    self._strategy_event(f"### Attempt\n\n    {attempt}")
-                    self.on_tool(f"Strategy\nTrying {attempt}")
-                self.on_tool(prefix + name)
+                    self._strategy_event(f"### Attempt\n\n    {summary}")
+                    self.on_tool(f"Strategy\nTrying {summary}")
+                else:
+                    self.on_tool(prefix + summary)
                 result = await asyncio.to_thread(self.workspace.execute, function)
+                if not read_only and (name == "bash" or result.get("changed") is True):
+                    self.verdicts.clear()
                 if tracking:
                     observation = json.dumps(result, ensure_ascii=False) if "output" in result or "error" in result else str(result)
                     self._strategy_event(f"Result\n\n    {observation[:600]}")
@@ -166,8 +216,8 @@ class Engine:
         reason = "Verification reached its three-request limit."
         try:
             for attempt in range(3):
-                message = await self.server.complete(
-                    self.model, self._messages(leaf, system_prompt=_VERIFY_PROMPT), _READ_ONLY_TOOLS, self.max_tokens,
+                message = await self._complete(
+                    self._messages(leaf, system_prompt=_VERIFY_PROMPT), _READ_ONLY_TOOLS, fork=True,
                 )
                 calls = _tool_calls(message)
                 leaf = self.tree.append(message, parent_id=leaf, branch_type="verification")
@@ -186,8 +236,8 @@ class Engine:
                     {"role": "system", "content": _EVIDENCE_PROMPT},
                     {"role": "user", "content": f"Claim: {claim}\n\nCurrent evidence:\n" + "\n\n".join(evidence)},
                 ]
-                message = await self.server.complete(
-                    self.model, messages, [], self.max_tokens, response_format=_VERDICT_SCHEMA,
+                message = await self._complete(
+                    messages, [], fork=True, response_format=_VERDICT_SCHEMA,
                 )
                 leaf = self.tree.append(message, parent_id=leaf, branch_type="verification")
                 try:
@@ -201,7 +251,7 @@ class Engine:
                     pass
                 reason = "The verifier returned an invalid verdict."
                 break
-        except ServerError as error:
+        except (ServerError, TurnLimitError) as error:
             reason = str(error)
 
         self.tree.finish_fork(leaf, anchor, "pruned")
@@ -236,25 +286,38 @@ class Engine:
             leaf = self.tree.append({"role": "assistant", "content": None, "tool_calls": [call]},
                                     parent_id=leaf, branch_type="reflection")
             leaf, _ = await self._observe(leaf, [call], branch_type="reflection")
-        reason = "The reviewer reached its three-request limit."
+        reason = "The reviewer returned no proposal."
         try:
-            for _ in range(3):
-                message = await self.server.complete(
-                    self.model, self._messages(leaf, system_prompt=REFLECTION_PROMPT),
-                    _READ_ONLY_TOOLS, self.max_tokens,
+            for attempt in range(_REVIEW_REQUESTS):
+                final = attempt == _REVIEW_REQUESTS - 1
+                if final:
+                    leaf = self.tree.append({
+                        "role": "user",
+                        "content": "Give your recommendation now using the evidence already in the conversation.",
+                    }, parent_id=leaf, branch_type="reflection")
+                prompt = _RECOMMENDATION_PROMPT if final else REFLECTION_PROMPT
+                message = await self._complete(
+                    self._messages(leaf, system_prompt=prompt), [] if final else _READ_ONLY_TOOLS, fork=True,
+                    response_format=_RECOMMENDATION_SCHEMA if final else None,
                 )
                 calls = _tool_calls(message)
+                if final and calls:
+                    raise ServerError("The reviewer called a tool on its final request.")
                 leaf = self.tree.append(message, parent_id=leaf, branch_type="reflection")
                 if calls:
                     leaf, _ = await self._observe(leaf, calls, branch_type="reflection")
                     continue
                 proposal = message.get("content")
+                if final:
+                    try:
+                        proposal = json.loads(proposal)["recommendation"]
+                    except (KeyError, TypeError, ValueError):
+                        proposal = None
                 if isinstance(proposal, str) and proposal.strip():
                     self.tree.finish_fork(leaf, anchor, "merged")
                     return " ".join(proposal.split())[:600]
-                reason = "The reviewer returned no proposal."
                 break
-        except ServerError as error:
+        except (ServerError, TurnLimitError) as error:
             reason = str(error)
 
         self.tree.finish_fork(leaf, anchor, "pruned")
@@ -277,9 +340,10 @@ class Engine:
             "content": (
                 f"Reflection results\n{heading}: {reason}\n\n"
                 + summary
-                + "\n\nChoose an evidence-backed next action. Check whether it advances "
-                "the expected result. Use a relevant saved skill if one applies. Update it if the check confirms "
-                "a reusable improvement."
+                + "\n\nTry the smallest evidence-backed fix first. Start with the Simpler approach if it fits the evidence. "
+                "For a localized fix, read only the lines you need and apply a targeted edit_file call. "
+                "Preserve unrelated code. Focus on making the fix now and keep the final request for rerunning "
+                "the smoke check that reproduced the failure."
             ),
         })
 
@@ -302,6 +366,8 @@ class Engine:
             self.tree.append({"role": "assistant", "content": "[The previous turn ended before a final answer.]"})
 
     async def reflect(self):
+        if not self.forks:
+            raise ValueError("Run refl without --linear to use /reflect.")
         if self.tree.head == 0:
             raise ValueError("Start a task before using /reflect.")
         self._close_unfinished_round()
@@ -312,9 +378,11 @@ class Engine:
 
     async def respond(self, prompt):
         self.stalls.start_turn()
+        self.verdicts = {}
         self._close_unfinished_round()
         self.tree.append({"role": "user", "content": prompt})
         self.tree.save()
+        self.requests_left = self.max_turns
         try:
             return await self._respond()
         except (ServerError, TurnLimitError) as error:
@@ -323,26 +391,63 @@ class Engine:
             raise
         finally:
             self.track_strategy = False
+            self.requests_left = None
+
+    async def _smoke_check(self):
+        self.tree.append({
+            "role": "user",
+            "content": (
+                "Run the smoke check now. Use one bash call with the command that reproduced the failure "
+                "or the applicable check from the reflection findings. This is the final request. "
+                "If there is no applicable smoke check, say so."
+            ),
+        })
+        message = await self._complete(self._messages(self.tree.head), _BASH_TOOLS)
+        calls = _tool_calls(message)
+        if calls and (len(calls) != 1 or calls[0]["function"]["name"] != "bash"):
+            raise ServerError("Expected one Bash smoke check on the final request.")
+        leaf = self.tree.append(message)
+        if not calls:
+            self.tree.save()
+            answer = message.get("content")
+            if isinstance(answer, str) and answer.strip():
+                return answer.strip()
+            return "No smoke check was run."
+        leaf, _ = await self._observe(leaf, calls, stalls=self.stalls)
+        result = json.loads(self.tree.nodes[leaf].message["content"])
+        if "error" in result:
+            summary = f"Smoke check could not run. {result['error']}"
+        else:
+            summary = f"Smoke check exited with code {result['exit_code']}.\n{result['output']}".rstrip()
+        self.tree.append({"role": "assistant", "content": summary})
+        self.tree.save()
+        return summary
 
     async def _respond(self):
-        for _ in range(self.max_turns):
-            message = await self.server.complete(
-                self.model, self._messages(self.tree.head), TOOLS, self.max_tokens,
-            )
+        reflected = False
+        while self.requests_left:
+            if reflected and self.requests_left == 1:
+                return await self._smoke_check()
+            message = await self._complete(self._messages(self.tree.head), TOOLS)
             calls = _tool_calls(message)
             answer = message.get("content")
             if answer is not None and not isinstance(answer, str):
                 raise ServerError("Expected text in the assistant message")
             answer = answer or ""
-            claims = list(dict.fromkeys(claim.strip() for claim in _VERIFY_TAG.findall(answer) if claim.strip()))
+            claims = list(dict.fromkeys(
+                " ".join(claim.split()) for claim in _VERIFY_TAG.findall(answer) if claim.strip()
+            )) if self.forks else []
+            # A claim already checked in this task keeps its verdict, so restating it can end the turn.
+            claims = [claim for claim in claims if claim not in self.verdicts]
             if not calls and not answer.strip():
                 raise ServerError("Model returned neither an answer nor a tool call")
 
             leaf = self.tree.append(message)
-            await self._observe(leaf, calls, defer=bool(claims), stalls=self.stalls)
+            await self._observe(leaf, calls, defer=bool(claims), stalls=self.stalls if self.forks else None)
             if claims:
                 anchor = self.tree.head
                 verdicts = await asyncio.gather(*(self._verify(anchor, claim) for claim in claims))
+                self.verdicts.update(zip(claims, verdicts))
                 findings = [f"{claim}\n{verdict}" for claim, verdict in zip(claims, verdicts)]
                 for verdict in verdicts:
                     self.on_tool(verdict)
@@ -354,9 +459,11 @@ class Engine:
                         "Reissue any deferred calls that are still needed."
                     ),
                 })
-            elif calls and (stall := self.stalls.stall()):
+            elif (self.forks and calls and self.requests_left >= len(LENSES) * _REVIEW_REQUESTS + 2
+                  and (stall := self.stalls.stall())):
                 self.tree.save()
                 await self._reflect(stall)
+                reflected = True
             self.tree.save()
             if not claims and not calls:
                 return answer.strip()

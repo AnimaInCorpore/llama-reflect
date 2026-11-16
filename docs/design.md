@@ -2,7 +2,7 @@
 
 ## The coding loop
 
-`refl` sends the active conversation to the OpenAI-compatible chat endpoint in `llama-server`. The model can inspect UTF-8 files with `read_file` and `grep_search`, run Bash commands with `bash`, and make changes with `write_file` and `edit_file`. Reflect executes calls in the order they appear and returns each observation with the corresponding tool call ID. The model continues until it returns a final answer or reaches the request limit.
+`refl` sends the active conversation to the OpenAI-compatible chat endpoint in `llama-server`. The model can inspect UTF-8 files with `read_file` and `grep_search`, run Bash commands with `bash`, and make changes with `write_file` and `edit_file`. Reflect executes calls in the order they appear and returns each observation with the corresponding tool call ID. The terminal lists each call with its command, path, or search pattern. The model continues until it returns a final answer or reaches the request limit.
 
 The CLI and file tools use Python filesystem APIs on all platforms. PowerShell and MSYS2 launch the same CLI. The `bash` tool invokes Bash from the workspace directory. On Windows, Bash can come from MSYS2 or Git for Windows. `rg` is an external executable used by `grep_search` on all four target platforms.
 
@@ -26,20 +26,20 @@ flowchart TD
 
 Solid arrows are parent links in the saved tree. The dotted arrow is the verdict copied into the main conversation. A verifier's tool calls and observations remain on its branch. Nodes from a fork with a usable verdict are marked `merged`. Forks that fail or exhaust the request budget are marked `pruned` and retained in the session for inspection.
 
-Reflect writes UTF-8 JSON to `.refl/sessions/<session-id>.json` at startup, when it accepts a prompt, and after each completed model and tool round. It writes to a temporary file in the same directory and replaces the session file once the snapshot is complete. The session ID includes a UTC timestamp and a unique suffix. The project ignores session files in Git because they can hold prompts, file contents, and command output.
+Reflect writes UTF-8 JSON to `.refl/sessions/<session-id>.json` at startup, when it accepts a prompt, and after each completed model and tool round. It writes to a temporary file in the same directory and replaces the session file once the snapshot is complete. The session ID includes a UTC timestamp and a unique suffix. Session files can hold prompts, file contents, and command output, so Reflect adds a `.gitignore` to `.refl/sessions/` and `.refl/strategies/` that keeps Git from tracking them in any workspace. It leaves an existing `.gitignore` in those directories unchanged.
 
 ```text
 refl --workspace ./project --resume SESSION_ID "Continue with the next step."
 ```
 
-Resuming copies the saved tree into a new session file and continues from the saved active node. The copied tree includes earlier forks. A saved turn interrupted before a final answer is closed with a brief transcript note when the next prompt begins. The CLI prints the new session ID at startup.
+Resuming copies the saved tree into a new session file and continues from the saved active node. The copied tree includes earlier forks. A saved turn interrupted before a final answer is closed with a brief transcript note when the next prompt begins. The CLI prints the new session ID at startup. Reflect builds the system prompt for each request, so a resumed session follows the current instructions and the `--linear` setting.
 
-`/tree` displays every branch and marks the current node. `/checkout <node_id>` can select a main, verification, or reflection node. The next prompt extends the selected path, and earlier branches remain visible in the tree. If the selected node falls inside a tool round, Reflect adds skipped results for tool calls still awaiting a result. The next task operates on the workspace as it exists when the task starts.
+`/tree` displays every branch and marks the current node. The newest continuation of a node stays at the same indentation, and earlier branches such as forks are indented above it. `/checkout <node_id>` can select a main, verification, or reflection node. The next prompt extends the selected path, and earlier branches remain visible in the tree. If the selected node falls inside a tool round, Reflect adds skipped results for tool calls still awaiting a result. The next task operates on the workspace as it exists when the task starts.
 
 ## Verification forks
 
 1. The main model sees the entire conversation along the active path. Its system prompt asks it to emit `<verify>specific claim</verify>` before relying on an unchecked assumption about a file, API, or config key.
-2. After the model reply completes, Reflect extracts distinct nonempty claims from its visible text. Tool calls accompanying a tag receive a deferred observation. The model can reissue a call after seeing the verdict.
+2. After the model reply completes, Reflect extracts distinct nonempty claims from its visible text. Tool calls accompanying a tag receive a deferred observation. The model can reissue a call after seeing the verdict. A claim already checked in the current task keeps its verdict until a main-branch Bash command or file change could alter the evidence, so restating it in a final answer ends the turn.
 3. Reflect forks from the latest main node and adds an instruction naming the claim. Each verifier receives the conversation up to the fork point with a verification-specific system prompt. Multiple claims in one reply start concurrently. `llama-server` schedules them on its available slots.
 4. Each verifier gets up to three model requests. It can locate evidence with `read_file` or `grep_search`. Reflect also checks the tool name before dispatch, so any attempted shell command or write stays unexecuted.
 5. Once a lookup succeeds, a verdict request contains the claim and the fresh workspace evidence. It uses `llama-server`'s JSON response format to request an explanation and a status of `supported`, `contradicted`, or `insufficient`. Reflect displays these as `VERIFIED`, `FALSE ASSUMPTION`, and `UNVERIFIED`. A useful explanation cites the file and line. If the request budget runs out or the server fails to provide a usable verdict, Reflect passes back `UNVERIFIED`.
@@ -57,8 +57,11 @@ Reflect checks up to four actual main-branch tool results from the current task.
 - Two writes to the same file that leave its bytes unchanged.
 - Three calls with the same action and unchanged results, including a command that repeatedly exits successfully with the same output.
 - Three changes to the same file without a successful Bash result between them.
+- Three identical failures from the same call during a task, even with edits between the runs. Fractional numbers such as test durations are ignored when comparing the results.
 
-Each reviewer receives the main conversation up to the stall and the reason it was called. The three reviewers check assumptions, look for project patterns and skills, and propose a simpler route with a visible progress check. Each gets up to three model requests and can use `read_file` and `grep_search`. Reflect saves their branches and summarizes their proposals in the main conversation. The main branch chooses an action and runs any changes or tests. Three parallel slots let the server work on all three requests at once.
+Each reviewer receives the main conversation up to the stall and the reason it was called. The three reviewers check assumptions, look for project patterns and skills, and propose a simpler route with a visible progress check. Each gets one request with `read_file` and `grep_search` available and may recommend an action immediately. If it calls a tool, its second request asks for a recommendation with tools disabled. Reflect saves their branches and summarizes their proposals in the main conversation. The main branch chooses an action and runs any changes or tests. Three parallel slots let the server work on all three requests at once.
+
+The request limit covers the main loop and its forks. Automatic reflection starts when the budget can cover the reviewers plus at least two main requests. The main loop tries the smallest suggestion supported by the evidence. If the turn reaches its last request after reflection, it uses that request for a Bash smoke check and reports the observed result. If the model answers in text instead, Reflect returns that answer.
 
 `/reflect` starts the same reviewers on the current conversation on demand. It records their proposals and waits for the next task. Automatic reflection pacing applies to detections from tool results.
 

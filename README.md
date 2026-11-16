@@ -32,7 +32,7 @@ Omit the prompt for an interactive session. Type `/exit` or send EOF to quit. Us
 - `/tree` shows the saved branches, their node IDs and statuses, and the current conversation node.
 - `/checkout <node_id>` switches the conversation to that node. The next prompt grows a new branch and operates on the current workspace files.
 
-You can inspect a saved tree with `refl --resume SESSION_ID "/tree"` while the server is stopped. For one-shot slash commands entered in MSYS2, prefix the invocation with `MSYS2_ARG_CONV_EXCL='/tree;/checkout;/reflect'` so the shell passes the command through as typed.
+You can inspect a saved tree with `refl --resume SESSION_ID "/tree"` while the server is stopped. For one-shot slash commands entered in MSYS2, prefix the invocation with `MSYS2_ARG_CONV_EXCL='/tree;/checkout;/reflect'` so the shell passes the command through as typed. Reflect reports a command that MSYS2 converted to a Windows path, and an unknown single-word command such as `/tre`, instead of sending it to the model.
 
 Put `rg` (ripgrep) on `PATH` for `grep_search`. On Linux and macOS, `bash` uses Bash from `PATH`. On Windows, Reflect looks for Bash from MSYS2 or Git for Windows. Pass `--bash` with the executable path to choose a specific installation.
 
@@ -40,9 +40,9 @@ The file tools work with UTF-8 text under the workspace. `edit_file` requires a 
 
 ## Sessions and verification
 
-Reflect saves the main conversation and its forks in `.refl/sessions/<session-id>.json` inside the workspace. It prints the session ID at startup and saves when a prompt is accepted and after each completed round. Use `--resume <session-id>` in the same workspace to continue the saved main branch in a new session.
+Reflect saves the main conversation and its forks in `.refl/sessions/<session-id>.json` inside the workspace and adds a `.gitignore` there so Git skips them. It prints the session ID at startup and saves when a prompt is accepted and after each completed round. Use `--resume <session-id>` in the same workspace to continue the saved main branch in a new session.
 
-When a completed model reply contains `<verify>specific claim</verify>`, Reflect starts a verifier with the conversation up to that point. Each verifier has up to three model requests and can use `read_file` and `grep_search`. Distinct claims in the same reply run concurrently. Tool calls in that reply are deferred so the main branch can act on the verdicts.
+When a completed model reply contains `<verify>specific claim</verify>`, Reflect starts a verifier with the conversation up to that point. Each verifier has up to three model requests and can use `read_file` and `grep_search`. Distinct claims in the same reply run concurrently. Tool calls in that reply are deferred so the main branch can act on the verdicts. A claim checked earlier in the same task keeps its verdict until a Bash command or file change.
 
 ```text
 refl "Before editing settings.py, emit <verify>settings.py defines MAX_RETRIES</verify>. Use the verdict to decide what to edit."
@@ -58,5 +58,7 @@ The file tools protect existing shared agent instructions and configuration unde
 - [Project skills and tool discovery](docs/project-skills.md)
 - [Lessons from development retrospectives](docs/retrospective-lessons.md)
 - [Benchmark plan for the first release](docs/benchmark-plan.md)
+
+Run the offline tests from this checkout with `python -m unittest`. They use a scripted model and need no server.
 
 Reflect is available under the [MIT License](LICENSE).

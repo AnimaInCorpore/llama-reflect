@@ -206,13 +206,15 @@ class WorkspaceTools:
         if start_line < 1 or (end_line is not None and end_line < start_line):
             raise ValueError("Expected positive line numbers with start_line <= end_line")
         limit = min(end_line, start_line + 79) if end_line is not None else start_line + 79
+        count = limit - start_line + 1
         with self._file(path).open(encoding="utf-8") as source:
-            lines = islice(source, start_line - 1, limit)
-            lines = (line.rstrip("\r\n") for line in lines)
-            output = "\n".join(f"{number}: {line}" for number, line in enumerate(lines, start_line))
+            # Read one extra line to tell the model whether the file continues past the limit.
+            lines = [line.rstrip("\r\n") for line in islice(source, start_line - 1, limit + 1)]
+        more = len(lines) > count
+        output = "\n".join(f"{number}: {line}" for number, line in enumerate(lines[:count], start_line))
         if len(output) > _OUTPUT_LIMIT:
             output = output[:_OUTPUT_LIMIT] + "\n[Remaining output truncated]"
-        if end_line is not None and end_line > limit:
+        if more and (end_line is None or end_line > limit):
             output += f"\n[Line limit reached. Continue from line {limit + 1}.]"
         return {"output": output or "No lines in the requested range."}
 

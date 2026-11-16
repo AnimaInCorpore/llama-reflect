@@ -16,4 +16,4 @@ In the test workspace, create `status.txt` containing `old_ready`. Ask Reflect t
 refl --url http://127.0.0.1:8081 --workspace ./test-workspace "Copy <verify>status.txt contains old_ready</verify> verbatim as your first reply. Wait for the verification results and report the verdict."
 ```
 
-Expect a `verify read_file` or `verify grep_search` event followed by `[VERIFIED]`. Inspect the session JSON to confirm there is a verification branch with a tool result and a main branch that received the verdict. Save the session ID if you need to test `--resume` after changing the fixture.
+Expect a `verify read_file status.txt` or `verify grep_search …` event followed by `[VERIFIED]`. Inspect the session JSON to confirm there is a verification branch with a tool result and a main branch that received the verdict. Save the session ID if you need to test `--resume` after changing the fixture.

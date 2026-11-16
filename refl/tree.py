@@ -9,6 +9,14 @@ from typing import Optional
 from uuid import uuid4
 
 
+def ensure_git_ignored(directory):
+    """Create the directory with a .gitignore that keeps Git from tracking its contents."""
+    directory.mkdir(parents=True, exist_ok=True)
+    ignore = directory / ".gitignore"
+    if not ignore.exists():
+        ignore.write_text("*\n", encoding="utf-8")
+
+
 @dataclass
 class Node:
     id: int
@@ -93,10 +101,12 @@ class ConversationTree:
         for node in self.nodes[1:]:
             children[node.parent_id].append(node.id)
 
+        # The newest child continues at the same indentation, so a long conversation stays flat.
+        # Earlier children are forks or abandoned branches and are drawn as indented branches first.
         lines = []
-        pending = [(0, "", "", "")]
+        pending = [(0, "", "")]
         while pending:
-            node_id, prefix, connector, child_prefix = pending.pop()
+            node_id, prefix, child_prefix = pending.pop()
             node = self.nodes[node_id]
             role = node.message.get("role", "")
             content = node.message.get("content") or ""
@@ -109,12 +119,12 @@ class ConversationTree:
             if len(preview) > 68:
                 preview = preview[:65] + "..."
             head = " [current]" if node_id == self.head else ""
-            lines.append(f"{prefix}{connector}{node_id} {node.branch_type}/{role} ({node.status}){head} {preview}".rstrip())
-            for index in range(len(children[node_id]) - 1, -1, -1):
-                last = index == len(children[node_id]) - 1
-                branch = "+-- " if not last else "\\-- "
-                indent = "|   " if not last else "    "
-                pending.append((children[node_id][index], child_prefix, branch, child_prefix + indent))
+            lines.append(f"{prefix}{node_id} {node.branch_type}/{role} ({node.status}){head} {preview}".rstrip())
+            kids = children[node_id]
+            if kids:
+                pending.append((kids[-1], child_prefix, child_prefix))
+                for kid in reversed(kids[:-1]):
+                    pending.append((kid, child_prefix + "+-- ", child_prefix + "|   "))
         return "\n".join(lines)
 
     def finish_fork(self, leaf, anchor, status):
@@ -124,7 +134,7 @@ class ConversationTree:
             leaf = node.parent_id
 
     def save(self):
-        self.path.parent.mkdir(parents=True, exist_ok=True)
+        ensure_git_ignored(self.path.parent)
         data = {
             "version": 1,
             "main_head": self.head,
