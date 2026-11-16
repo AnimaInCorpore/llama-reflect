@@ -54,7 +54,7 @@ import httpx  # noqa: E402
 
 from refl.client import LlamaClient, ServerError  # noqa: E402
 from refl.engine import (  # noqa: E402
-    _EVIDENCE_PROMPT, _PROPOSAL_PROMPT, _VERIFY_PROMPT, SYSTEM_PROMPT, Engine, TurnLimitError,
+    _EVIDENCE_PROMPT, _PROPOSAL_PROMPT, _VERIFY_PROMPT, SYSTEM_PROMPT, THINKING_MODES, Engine, TurnLimitError,
 )
 from refl.reflection import REFLECTION_PROMPT, ROLES, StallDetector  # noqa: E402
 from refl.tools import WorkspaceTools  # noqa: E402
@@ -569,7 +569,8 @@ async def run_arm(task, arm, workspace, args):
         tree = ConversationTree(workspace / ".refl" / "sessions", SYSTEM_PROMPT)
         started = time.monotonic()
         engine = Engine(server, model, WorkspaceTools(workspace), tree, args.max_turns, args.max_tokens,
-                        lambda text: events.append([round(time.monotonic() - started, 1), text]), **ARMS[arm])
+                        lambda text: events.append([round(time.monotonic() - started, 1), text]), **ARMS[arm],
+                        thinking=args.thinking)
         answer = None
         work = (respond_after_stall(engine, task, args.max_turns, args.heat) if args.seeded
                 else engine.respond(task.prompt))
@@ -596,6 +597,7 @@ async def run_arm(task, arm, workspace, args):
         "task": task.name,
         "arm": arm,
         "mode": f"seeded at heat {args.heat}" if args.seeded else "natural",
+        "thinking": args.thinking,
         "passed": passed,
         "check": detail,
         "outcome": outcome,
@@ -734,6 +736,8 @@ def main():
                         help="start each run from the task's scripted stall (tasks without one are skipped)")
     parser.add_argument("--heat", type=int, choices=range(3), default=0,
                         help="with --seeded, reflection temperature for the seeded stall (default: 0)")
+    parser.add_argument("--thinking", choices=THINKING_MODES, default="auto",
+                        help="thinking mode as in refl --thinking (default: auto)")
     parser.add_argument("--validate", action="store_true", help="check the fixtures and reference fixes only")
     parser.add_argument("--judge", metavar="RESULTS_DIR",
                         help="count distinct ideas in the reflections of an earlier run and exit")

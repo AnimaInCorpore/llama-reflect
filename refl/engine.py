@@ -100,6 +100,11 @@ def _format_proposal(answer):
     return " ".join(part if part.endswith((".", "?", "!")) else part + "." for part in parts)
 
 
+# auto leaves thinking to the chat template, off disables it for every request, and main keeps it
+# only for main-branch requests.
+THINKING_MODES = ("auto", "off", "main")
+
+
 class TurnLimitError(RuntimeError):
     """The turn used all of its allotted model requests."""
 
@@ -166,7 +171,7 @@ def _tool_calls(message):
 
 class Engine:
     def __init__(self, server, model, workspace, tree, max_turns, max_tokens, on_tool, *, forks=True,
-                 verification=True):
+                 verification=True, thinking="auto"):
         self.server = server
         self.model = model
         self.workspace = workspace
@@ -178,6 +183,9 @@ class Engine:
         self.on_tool = on_tool
         self.forks = forks
         self.verification = forks and verification
+        if thinking not in THINKING_MODES:
+            raise ValueError(f"Unknown thinking mode {thinking!r}")
+        self.thinking = thinking
         self.strategy_sections = []
         self.track_strategy = False
         self.strategy_path = f".refl/strategies/{tree.path.stem}.md"
@@ -233,8 +241,10 @@ class Engine:
             if self.requests_left <= (1 if fork else 0):
                 raise TurnLimitError("No model requests remain for this step.")
             self.requests_left -= 1
+        thinking = self.thinking == "auto" or (self.thinking == "main" and not fork)
         return await self.server.complete(self.model, messages, tools, self.max_tokens,
-                                          response_format=response_format, temperature=temperature)
+                                          response_format=response_format, temperature=temperature,
+                                          thinking=thinking)
 
     def _strategy_event(self, text):
         self.strategy_sections.append(text)

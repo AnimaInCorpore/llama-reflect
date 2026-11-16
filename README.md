@@ -50,6 +50,8 @@ refl "Before editing settings.py, emit <verify>settings.py defines MAX_RETRIES</
 
 Pass `--no-verify` to skip verification forks and the tag instruction while keeping strategic reflection, or `--linear` to run without either kind of fork.
 
+`--thinking off` asks the chat template to skip the model's thinking step for every request, and `--thinking main` keeps it for the main branch only. Reflect sends `chat_template_kwargs` with `enable_thinking`, which Qwen3-style templates read and other templates ignore. Without thinking, a reasoning model answers much faster and uses fewer tokens, but it may plan less carefully.
+
 Reflect discovers reusable Markdown skills under `.refl/skills/`. When a tool or workflow succeeds, the main branch can record the command for future sessions.
 
 Repeated failures and unchanged results can trigger three read-only reviewers with different roles. The first reflection in a task looks for causes and evidence. Further stalls in the same task raise a reflection temperature that brings in alternative and lateral roles, such as switching tools, borrowing a mechanism from another field, or questioning a constraint. Each reviewer returns an idea with its basis, the cost of trying it, and the result that would show it failed. Reflect gives the main branch the ideas and adapts how often it intervenes as the session continues. [Reviewer roles](docs/design.md#reviewer-roles) The terminal shows **Skills** and **Strategy** updates, and `.refl/strategies/<session-id>.md` records the proposals, attempts, and tool results.

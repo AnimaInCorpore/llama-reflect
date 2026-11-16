@@ -129,6 +129,15 @@ class EngineTest(unittest.TestCase):
         self.assertIn("- write_file a.txt (content: alpha\\nbeta)\n", brief)
         self.assertIn('- edit_file a.txt (replaced "beta" with "gamma")\n', brief)
 
+    def test_thinking_modes(self):
+        replies = [text(_CLAIM), call("read_file", path="status.txt"), verdict(), text("Done.")]
+        for mode, main_thinks, fork_thinks in (("auto", True, True), ("main", True, False), ("off", False, False)):
+            engine, server, _ = make_engine(self.root, list(replies), thinking=mode)
+            asyncio.run(engine.respond("Check the status."))
+            main = [request["thinking"] for request in server.requests if request["system"].startswith("You are Reflect,")]
+            forks = [request["thinking"] for request in server.requests if not request["system"].startswith("You are Reflect,")]
+            self.assertEqual((set(main), set(forks)), ({main_thinks}, {fork_thinks}), mode)
+
     def test_strategy_log_is_git_ignored(self):
         engine, _, _ = make_engine(self.root, [])
         engine._strategy_event("## Reflection")

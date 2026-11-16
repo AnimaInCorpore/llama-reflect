@@ -16,13 +16,15 @@ class FakeServer:
         self.replies = list(replies)
         self.requests = []
 
-    async def complete(self, model, messages, tools, max_tokens, *, response_format=None, temperature=0.0):
+    async def complete(self, model, messages, tools, max_tokens, *, response_format=None, temperature=0.0,
+                       thinking=True):
         self.requests.append({
             "system": messages[0]["content"],
             "messages": messages,
             "tools": [tool["function"]["name"] for tool in tools],
             "response_format": response_format,
             "temperature": temperature,
+            "thinking": thinking,
         })
         if not self.replies:
             raise AssertionError("Unexpected model request")
@@ -45,10 +47,10 @@ def verdict(status="supported", reason="status.txt line 1 contains old_ready"):
     return text(json.dumps({"reason": reason, "status": status}))
 
 
-def make_engine(root, replies, *, max_turns=20, forks=True, verification=True):
+def make_engine(root, replies, *, max_turns=20, forks=True, verification=True, thinking="auto"):
     events = []
     tree = ConversationTree(Path(root) / ".refl" / "sessions", SYSTEM_PROMPT)
     server = FakeServer(replies)
     engine = Engine(server, "model", WorkspaceTools(root), tree, max_turns, 256, events.append,
-                    forks=forks, verification=verification)
+                    forks=forks, verification=verification, thinking=thinking)
     return engine, server, events

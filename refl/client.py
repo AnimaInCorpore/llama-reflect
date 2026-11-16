@@ -48,7 +48,8 @@ class LlamaClient:
             raise ServerError("Unexpected /slots response")
         return len(slots), sum(slot["is_processing"] for slot in slots)
 
-    async def complete(self, model, messages, tools, max_tokens, *, response_format=None, temperature=0.0):
+    async def complete(self, model, messages, tools, max_tokens, *, response_format=None, temperature=0.0,
+                       thinking=True):
         payload = {
             "model": model,
             "messages": messages,
@@ -58,6 +59,9 @@ class LlamaClient:
         }
         if response_format is not None:
             payload["response_format"] = response_format
+        if not thinking:
+            # Chat templates with a thinking mode, such as Qwen3's, read this flag. Others ignore it.
+            payload["chat_template_kwargs"] = {"enable_thinking": False}
         data = await self._request("POST", "/v1/chat/completions", json=payload)
         try:
             choice = data["choices"][0]

@@ -98,6 +98,8 @@ A reflection temperature sets the mix of groups. It starts at 0 for the first ba
 
 Within a group, Reflect prefers roles not yet used in the task, then roles that suit the stall. A repeated failure suits roles such as Diagnosis and Switch tools, and a result that never changes suits roles such as Known alternative and Premortem. Alternative and lateral roles also sample at a higher model temperature.
 
+With a reasoning model, most of a reviewer's time goes into its thinking step. `--thinking main` skips that step for verification and reflection forks and keeps it on the main branch, which decides what to do with the ideas.
+
 Every reviewer answers in the same fields: the proposal, its basis, the cost of trying it, and the result that would show it failed. Ideas may be unverified, so each must be cheap to rule out. The Analogy role first restates the problem in abstract terms without words from the project's domain: the parts, how they relate, the goal, and what blocks it. Only then does it name a field with the same structure, map the parts, and give one concrete step. Simulated annealing came about the same way, when the cooling of metals was mapped onto the travelling salesman problem.
 
 The Existing patterns role gets up to six recent Git commit subjects and opens an explicitly mentioned project skill or the workspace's sole skill as a starting point. These sources can point to a working baseline.
