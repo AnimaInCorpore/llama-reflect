@@ -82,11 +82,14 @@ class ConversationTree:
             self.head = node.id
         return node.id
 
-    def messages(self, leaf):
+    def messages(self, leaf, *, start=None):
+        """Return the messages from the root, or from the `start` node, down to `leaf`."""
         path = []
         while leaf is not None:
             node = self.nodes[leaf]
             path.append(node.message)
+            if leaf == start:
+                break
             leaf = node.parent_id
         return list(reversed(path))
 

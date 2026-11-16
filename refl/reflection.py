@@ -5,18 +5,106 @@ from collections import deque
 from dataclasses import dataclass
 
 
-LENSES = (
-    ("Assumptions", "Find one assumption that conflicts with the latest tool results. Check it against the workspace."),
-    ("Existing patterns", "Read a relevant project skill or working example. Find a proven tool or procedure to reuse."),
-    ("Simpler approach", "Propose a smaller route with a check that shows whether the expected result advanced."),
-)
-
 REFLECTION_PROMPT = (
     "You are a read-only reviewer investigating why a coding task stalled. Use the recent tool results as "
     "evidence and open relevant project skills with read_file. You can inspect the workspace with read_file "
     "and grep_search. Give one concrete next action, the evidence behind it, and a check the main branch "
     "can run to see progress. Keep your proposal brief."
 )
+
+FAILURE, NO_PROGRESS, MANUAL = "failure", "no progress", "manual"
+_ANY = frozenset({FAILURE, NO_PROGRESS, MANUAL})
+PROPOSAL_FIELDS = ("proposal", "basis", "cost", "fails_if")
+
+
+@dataclass(frozen=True)
+class Role:
+    """A reviewer role. The group sets when it is used, and fits lists the stall kinds it suits."""
+
+    name: str
+    group: str
+    focus: str
+    fits: frozenset = _ANY
+    tools: bool = False  # inspects the workspace with read_file and grep_search
+    brief: bool = True  # sees a short summary of the stall instead of the whole conversation
+    temperature: float = 0.0
+    fields: tuple = PROPOSAL_FIELDS  # answer fields, generated in this order
+
+
+# Earlier roles in each group take priority when several fit.
+ROLES = (
+    Role("Existing patterns", "grounded",
+         "Find a project skill, commit, or working example that solved a similar step, and propose reusing it.",
+         tools=True, brief=False),
+    Role("Diagnosis", "grounded",
+         "Name two or three competing causes for the stall, the evidence for each, and one cheap check whose "
+         "result tells them apart. Propose running that check first.",
+         frozenset({FAILURE, NO_PROGRESS}), tools=True, brief=False),
+    Role("Observe", "grounded",
+         "Find a value or state that the main branch assumes instead of observing. Propose the smallest command "
+         "that prints it.",
+         frozenset({FAILURE, NO_PROGRESS}), tools=True, brief=False),
+    Role("Known alternative", "alternative",
+         "Name an established technique or tool that solves this kind of problem differently from the current "
+         "approach. Say where it is standard, how to apply it here, and how to check that it is available.",
+         frozenset({NO_PROGRESS, MANUAL}), tools=True, temperature=0.3),
+    Role("Switch tools", "alternative",
+         "Keep the goal and change the instrument. Propose doing the blocked step with a different tool or "
+         "language, such as Bash instead of the file tools or Python instead of sed.",
+         frozenset({FAILURE}), temperature=0.3),
+    Role("Shrink the problem", "alternative",
+         "Propose a smaller version of the problem to solve first, such as a minimal reproduction, a single "
+         "case, or a bisection over inputs or commits.",
+         frozenset({FAILURE, NO_PROGRESS}), temperature=0.3),
+    Role("Premortem", "alternative",
+         "Assume that the approach the main branch keeps trying will fail. Name the most likely reason and the "
+         "change that avoids it.",
+         frozenset({NO_PROGRESS, MANUAL}), brief=False, temperature=0.3),
+    Role("Analogy", "lateral",
+         "First restate the stalled problem in abstraction without words from this project's domain: the parts "
+         "involved, how they relate, the goal, and what blocks it. Then name a field of engineering or science "
+         "where a problem with the same structure is solved routinely. In basis, name that field, map each "
+         "abstract part onto it, and name the mechanism that transfers. In proposal, give one concrete step "
+         "here that applies the mechanism.",
+         temperature=0.8, fields=("abstraction", "basis", "proposal", "cost", "fails_if")),
+    Role("Naive shortcut", "lateral",
+         "Propose the simplest thing that might work, even without evidence that it will.",
+         temperature=0.8),
+    Role("Inversion", "lateral",
+         "Name a stated or assumed constraint that may be optional, or invert the goal. Say what becomes "
+         "possible without it and how to check whether it is really required.",
+         temperature=0.8),
+    Role("Backtrack", "lateral",
+         "Find the earliest decision that led into this dead end. Propose a different route from that point "
+         "and the changes to undo.",
+         frozenset({FAILURE, NO_PROGRESS}), brief=False, temperature=0.8),
+    Role("Ask the user", "lateral",
+         "Name the one question for the user whose answer would unblock the task, and what to do for each "
+         "likely answer.",
+         temperature=0.8),
+)
+
+# Role groups for each reflection temperature. Repeated stalls in a task raise the temperature.
+TEMPERATURE_SLOTS = (
+    ("grounded", "grounded", "alternative"),
+    ("grounded", "alternative", "lateral"),
+    ("alternative", "lateral", "lateral"),
+)
+_KINDS = {"failure": FAILURE, "diagnostic": FAILURE, "repeated failure": FAILURE,
+          "unchanged file": NO_PROGRESS, "unchanged result": NO_PROGRESS, "edits": NO_PROGRESS}
+
+
+def choose_roles(level, kind, used=frozenset(), unavailable=frozenset()):
+    """Pick one role per slot of the temperature level, preferring unused roles that fit the stall kind."""
+    chosen = []
+    for group in TEMPERATURE_SLOTS[min(level, len(TEMPERATURE_SLOTS) - 1)]:
+        candidates = [role for role in ROLES
+                      if role.group == group and role not in chosen and role.name not in unavailable]
+        candidates.sort(key=lambda role: (role.name in used, kind not in role.fits))
+        if candidates:
+            chosen.append(candidates[0])
+    return chosen
+
 
 _FILE_WRITES = {"write_file", "edit_file"}
 _FRACTIONAL = re.compile(r"\d+\.\d+")
@@ -57,11 +145,26 @@ class StallDetector:
         # Failure signatures per action for the whole task, so an edit-and-retest cycle that keeps
         # failing the same way is visible even after it scrolls out of the recent window.
         self.failures = {}
+        self.kind = None  # stall kind of the latest report
+        self.batches = 0  # reflection batches since the task started or last made progress
+        self.used = set()  # role names used in those batches
 
     def start_turn(self):
         self.recent.clear()
         self.reported.clear()
         self.failures.clear()
+        self.kind = None
+        self.batches = 0
+        self.used.clear()
+
+    def plan(self, kind, *, unavailable=frozenset(), manual=False):
+        """Return the temperature level and roles for the next reflection batch, and record them."""
+        hottest = len(TEMPERATURE_SLOTS) - 1
+        level = hottest if manual else min(self.batches, hottest)
+        roles = choose_roles(level, kind, self.used, unavailable)
+        self.batches += 1
+        self.used.update(role.name for role in roles)
+        return level, roles
 
     def record(self, function, result):
         name = function["name"]
@@ -158,6 +261,7 @@ class StallDetector:
         if self.pacing["remaining"] or key in self.reported:
             return None
         self.reported.add(key)
+        self.kind = _KINDS[key[0]]
         delay = min(8, max(2, self.pacing["delay"] * 2))
         self.pacing.update(delay=delay, remaining=delay)
         return reason

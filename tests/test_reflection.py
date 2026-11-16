@@ -1,7 +1,39 @@
 import json
 import unittest
 
-from refl.reflection import StallDetector
+from refl.reflection import FAILURE, MANUAL, NO_PROGRESS, StallDetector, choose_roles
+
+
+def names(roles):
+    return [role.name for role in roles]
+
+
+class RoleTest(unittest.TestCase):
+    def test_first_reflection_is_grounded(self):
+        self.assertEqual(names(choose_roles(0, FAILURE, unavailable={"Existing patterns"})),
+                         ["Diagnosis", "Observe", "Switch tools"])
+        self.assertEqual(names(choose_roles(0, NO_PROGRESS)), ["Existing patterns", "Diagnosis", "Known alternative"])
+
+    def test_manual_reflection_uses_the_idea_roles(self):
+        self.assertEqual(names(choose_roles(2, MANUAL)), ["Known alternative", "Analogy", "Naive shortcut"])
+
+    def test_repeated_stalls_raise_the_temperature_and_rotate_roles(self):
+        detector = StallDetector({"delay": 0, "remaining": 0})
+        batches = [detector.plan(FAILURE, unavailable={"Existing patterns"}) for _ in range(3)]
+        self.assertEqual([level for level, _ in batches], [0, 1, 2])
+        self.assertEqual(names(batches[1][1]), ["Diagnosis", "Shrink the problem", "Analogy"])
+        self.assertEqual(names(batches[2][1]), ["Known alternative", "Naive shortcut", "Inversion"])
+
+    def test_progress_cools_down(self):
+        detector = StallDetector({"delay": 0, "remaining": 0})
+        detector.plan(FAILURE)
+        detector.plan(FAILURE)
+        detector.record({"name": "bash", "arguments": json.dumps({"command": "make"})}, {"exit_code": 1, "output": ""})
+        detector.record({"name": "bash", "arguments": json.dumps({"command": "make"})}, {"exit_code": 0, "output": ""})
+        self.assertEqual(detector.plan(FAILURE)[0], 0)
+
+    def test_manual_reflection_starts_hot(self):
+        self.assertEqual(StallDetector({"delay": 0, "remaining": 0}).plan(MANUAL, manual=True)[0], 2)
 
 
 class StallDetectorTest(unittest.TestCase):
@@ -21,6 +53,13 @@ class StallDetectorTest(unittest.TestCase):
         self.assertIsNone(self.record("bash", {"command": "pytest"}, {"exit_code": 1, "output": "1 failed in 0.05s"}))
         self.assertIsNone(self.cycle("1 failed in 0.07s"))
         self.assertEqual(self.cycle("1 failed in 0.04s"), "pytest failed the same way three times.")
+        self.assertEqual(self.detector.kind, FAILURE)
+
+    def test_unchanged_result_is_a_progress_stall(self):
+        for _ in range(3):
+            reason = self.record("bash", {"command": "make"}, {"exit_code": 0, "output": "Nothing to do."})
+        self.assertEqual(reason, "make returned the same result three times.")
+        self.assertEqual(self.detector.kind, NO_PROGRESS)
 
     def test_changing_failures_count_as_progress(self):
         self.record("bash", {"command": "pytest"}, {"exit_code": 1, "output": "3 failed"})

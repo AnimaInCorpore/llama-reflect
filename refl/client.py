@@ -48,12 +48,12 @@ class LlamaClient:
             raise ServerError("Unexpected /slots response")
         return len(slots), sum(slot["is_processing"] for slot in slots)
 
-    async def complete(self, model, messages, tools, max_tokens, *, response_format=None):
+    async def complete(self, model, messages, tools, max_tokens, *, response_format=None, temperature=0.0):
         payload = {
             "model": model,
             "messages": messages,
             "tools": tools,
-            "temperature": 0,
+            "temperature": temperature,
             "max_tokens": max_tokens,
         }
         if response_format is not None:

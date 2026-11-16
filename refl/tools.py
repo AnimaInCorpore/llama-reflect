@@ -126,6 +126,16 @@ class WorkspaceTools:
         return [path.relative_to(self.root).as_posix()
                 for path in sorted((self.root / ".refl" / "skills").glob("*.md")) if path.is_file()]
 
+    def top_level_entries(self, limit=40):
+        """Names at the workspace root, with a trailing slash for directories, for reviewer summaries."""
+        try:
+            entries = sorted(self.root.iterdir(), key=lambda entry: entry.name.casefold())
+        except OSError:
+            return []
+        names = [entry.name + ("/" if entry.is_dir() else "") for entry in entries
+                 if entry.name not in {".git", ".refl"}]
+        return names[:limit] + (["..."] if len(names) > limit else [])
+
     def skill_path(self, path):
         target = Path(os.path.abspath(self.root / path))
         if target.parent == self.root / ".refl" / "skills" and target.suffix == ".md":

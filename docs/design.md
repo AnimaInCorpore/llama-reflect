@@ -45,6 +45,8 @@ Resuming copies the saved tree into a new session file and continues from the sa
 5. Once a lookup succeeds, a verdict request contains the claim and the fresh workspace evidence. It uses `llama-server`'s JSON response format to request an explanation and a status of `supported`, `contradicted`, or `insufficient`. Reflect displays these as `VERIFIED`, `FALSE ASSUMPTION`, and `UNVERIFIED`. A useful explanation cites the file and line. If the request budget runs out or the server fails to provide a usable verdict, Reflect passes back `UNVERIFIED`.
 6. Reflect adds the verdicts to the main conversation and requests the next main response. Any further edits or commands run through the main branch's regular tool loop.
 
+`--no-verify` omits the verification instruction and skips verification forks while keeping strategic reflection. `--linear` skips both kinds of forks.
+
 The verdict records the model's interpretation. The saved tool observation gives reviewers access to the evidence behind it. Live tests with a small model showed that a correct file read can still lead to an incorrect verdict label.
 
 Verification tests can exercise a claim that changes after an edit. Start with `status.txt` containing `old_ready`, check the claim with a tag, and let the main branch replace the value. Resume the session and check the old claim again. In the saved tree, the initial verdict should precede the edit, and the later verifier should report the old claim as false.
@@ -59,13 +61,46 @@ Reflect checks up to four actual main-branch tool results from the current task.
 - Three changes to the same file without a successful Bash result between them.
 - Three identical failures from the same call during a task, even with edits between the runs. Fractional numbers such as test durations are ignored when comparing the results.
 
-Each reviewer receives the main conversation up to the stall and the reason it was called. The three reviewers check assumptions, look for project patterns and skills, and propose a simpler route with a visible progress check. Each gets one request with `read_file` and `grep_search` available and may recommend an action immediately. If it calls a tool, its second request asks for a recommendation with tools disabled. Reflect saves their branches and summarizes their proposals in the main conversation. The main branch chooses an action and runs any changes or tests. Three parallel slots let the server work on all three requests at once.
+Each batch runs three reviewers with different roles. Reflect saves their branches and summarizes their proposals in the main conversation. The main branch starts with the cheapest idea whose failure it can detect quickly, runs its check, and moves on if it fails. Three parallel slots let the server work on all three reviewers at once. On a single slot they run one after another.
 
-The request limit covers the main loop and its forks. Automatic reflection starts when the budget can cover the reviewers plus at least two main requests. The main loop tries the smallest suggestion supported by the evidence. If the turn reaches its last request after reflection, it uses that request for a Bash smoke check and reports the observed result. If the model answers in text instead, Reflect returns that answer.
+The request limit covers the main loop and its forks. Automatic reflection starts when the budget can cover the reviewers plus at least two main requests. If the turn reaches its last request after reflection, it uses that request for a Bash smoke check and reports the observed result. If the model answers in text instead, Reflect returns that answer.
 
-`/reflect` starts the same reviewers on the current conversation on demand. It records their proposals and waits for the next task. Automatic reflection pacing applies to detections from tool results.
+`/reflect` starts a batch on the current conversation on demand. It records the proposals and waits for the next task. Automatic reflection pacing applies to detections from tool results.
 
-The Existing patterns reviewer gets up to six recent Git commit subjects when Git and history are present. It opens an explicitly mentioned project skill or the workspace's sole skill as a starting point. These sources can point to a working baseline. Current tool results drive reflection pacing.
+### Reviewer roles
+
+Reviewers that share the same context, tools, and prompt tend to return the same idea. In a test with a 27B model, three fixed lenses gave one distinct proposal in each of six reflections. Reflect therefore picks each batch's reviewers from a pool of roles, and the roles differ in what they see, which tools they have, and what kind of idea they return.
+
+| Group | Role | Looks for | Sees |
+| --- | --- | --- | --- |
+| Grounded | Existing patterns | A project skill, commit, or working example to reuse | Conversation, tools, skills, recent commits |
+| Grounded | Diagnosis | Two or three competing causes and one check that tells them apart | Conversation, tools |
+| Grounded | Observe | A value the main branch assumes instead of printing | Conversation, tools |
+| Alternative | Known alternative | An established technique or tool for this kind of problem | Summary, tools |
+| Alternative | Switch tools | The same step with a different tool or language | Summary |
+| Alternative | Shrink the problem | A minimal reproduction, a single case, or a bisection | Summary |
+| Alternative | Premortem | Why the approach being repeated will fail | Conversation |
+| Lateral | Analogy | A field where a problem with the same structure is solved routinely | Summary |
+| Lateral | Naive shortcut | The simplest thing that might work, without proof | Summary |
+| Lateral | Inversion | A constraint that may be optional, or the goal turned around | Summary |
+| Lateral | Backtrack | The earliest decision that led into the dead end | Conversation |
+| Lateral | Ask the user | The one question whose answer would unblock the task | Summary |
+
+The summary holds the task prompt, the reason for reflecting, the latest six main-branch actions with their results, and the names at the workspace root. Each write or edit in it shows an excerpt of what changed, so a reviewer can tell which fixes were already tried. Roles that see only the summary cost one short request and do not inherit the main branch's framing. Roles with tools get one request to inspect the workspace and a second to answer. Existing patterns joins only when the workspace has project skills or Git history.
+
+A reflection temperature sets the mix of groups. It starts at 0 for the first batch in a task and rises by one with each further batch, up to 2. It drops back to 0 when a failing command passes or an unchanged file finally changes, and with each new task. `/reflect` uses temperature 2.
+
+| Temperature | Groups |
+| --- | --- |
+| 0 | Grounded, grounded, alternative |
+| 1 | Grounded, alternative, lateral |
+| 2 | Alternative, lateral, lateral |
+
+Within a group, Reflect prefers roles not yet used in the task, then roles that suit the stall. A repeated failure suits roles such as Diagnosis and Switch tools, and a result that never changes suits roles such as Known alternative and Premortem. Alternative and lateral roles also sample at a higher model temperature.
+
+Every reviewer answers in the same fields: the proposal, its basis, the cost of trying it, and the result that would show it failed. Ideas may be unverified, so each must be cheap to rule out. The Analogy role first restates the problem in abstract terms without words from the project's domain: the parts, how they relate, the goal, and what blocks it. Only then does it name a field with the same structure, map the parts, and give one concrete step. Simulated annealing came about the same way, when the cooling of metals was mapped onto the travelling salesman problem.
+
+The Existing patterns role gets up to six recent Git commit subjects and opens an explicitly mentioned project skill or the workspace's sole skill as a starting point. These sources can point to a working baseline.
 
 ### Reflection pacing
 

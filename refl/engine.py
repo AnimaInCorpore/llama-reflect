@@ -3,7 +3,7 @@ import json
 import re
 
 from .client import ServerError
-from .reflection import LENSES, REFLECTION_PROMPT, StallDetector
+from .reflection import MANUAL, REFLECTION_PROMPT, TEMPERATURE_SLOTS, StallDetector
 from .tools import TOOLS
 from .tree import ensure_git_ignored
 
@@ -25,13 +25,15 @@ _PROMPT_END = (
     "When the task is complete, give a brief final answer."
 )
 SYSTEM_PROMPT = _PROMPT_START + _VERIFICATION_INSTRUCTION + _PROMPT_END
-_LINEAR_PROMPT = _PROMPT_START + _PROMPT_END
+_NO_VERIFY_PROMPT = _PROMPT_START + _PROMPT_END
 
 _VERIFY_TAG = re.compile(r"<verify>(.*?)</verify>", re.DOTALL | re.IGNORECASE)
 _READ_ONLY_NAMES = {"read_file", "grep_search"}
 _READ_ONLY_TOOLS = [tool for tool in TOOLS if tool["function"]["name"] in _READ_ONLY_NAMES]
 _BASH_TOOLS = [tool for tool in TOOLS if tool["function"]["name"] == "bash"]
-_REVIEW_REQUESTS = 2
+_REVIEWERS = len(TEMPERATURE_SLOTS[0])
+_REVIEW_REQUESTS = 2  # at most, for a role with tools
+_ENGINE_PROMPTS = ("Verification results", "Reflection results", "Run the smoke check now.")
 _PROJECT_WRITE_RULE = (
     "Preserve existing AGENTS.md, AGENTS.override.md, CLAUDE.md, CLAUDE.local.md, .mcp.json, and configuration "
     "under .agents/, .claude/, .codex/, and .pi/ when using tools, including Bash. Project skill files can be "
@@ -60,19 +62,42 @@ _EVIDENCE_PROMPT = (
     "say whether it agrees with the claim, and cite the file and line if available. Set status to supported "
     "if the evidence confirms the claim, contradicted if it disproves the claim, or insufficient if it does neither."
 )
-_RECOMMENDATION_PROMPT = (
-    "You are a read-only reviewer summarizing why a coding task stalled. In recommendation, give one "
-    "concrete next action, the evidence behind it, and a check the main branch can run. Keep it brief."
+_PROPOSAL_PROMPT = (
+    "You are a read-only reviewer helping a coding task that stalled. Answer in your role. In proposal, give "
+    "one concrete next action. In basis, give the evidence, known technique, or analogy behind it, and say "
+    "whether it is unverified. In cost, say what trying it takes. In fails_if, give the result that would "
+    "show it did not work. Keep each field brief."
 )
-_RECOMMENDATION_SCHEMA = {
-    "type": "json_object",
-    "schema": {
-        "type": "object",
-        "properties": {"recommendation": {"type": "string"}},
-        "required": ["recommendation"],
-        "additionalProperties": False,
-    },
-}
+_FIELD_LABELS = {"abstraction": "Abstract form", "basis": "Basis", "cost": "Cost", "fails_if": "Fails if"}
+_AFTER_REFLECTION = (
+    "These ideas come from reviewers in different roles, and some are unverified by design. Start with the "
+    "cheapest idea whose failure you can detect quickly, say which role's idea you are trying, and run its "
+    "check. If it fails, move to the next idea. For a localized fix, read only the lines you need and make a "
+    "targeted edit. Preserve unrelated code and keep the final request for rerunning the check that showed "
+    "the problem."
+)
+
+
+def _proposal_schema(fields):
+    return {
+        "type": "json_object",
+        "schema": {
+            "type": "object",
+            "properties": {field: {"type": "string"} for field in fields},
+            "required": list(fields),
+            "additionalProperties": False,
+        },
+    }
+
+
+def _format_proposal(answer):
+    """Turn a structured reviewer answer into one line for the main branch."""
+    parts = [" ".join(answer["proposal"].split())]
+    for field, label in _FIELD_LABELS.items():
+        value = " ".join(str(answer.get(field, "")).split())
+        if value:
+            parts.append(f"{label}: {value}")
+    return " ".join(part if part.endswith((".", "?", "!")) else part + "." for part in parts)
 
 
 class TurnLimitError(RuntimeError):
@@ -94,6 +119,28 @@ def _call_summary(function):
             parts.append(str(args.get("command") or args.get("path") or ""))
     text = " ".join(" ".join(parts).split())
     return text if len(text) <= 200 else text[:197] + "..."
+
+
+def _excerpt(value, limit):
+    text = json.dumps(str(value or ""), ensure_ascii=False)[1:-1]
+    return text if len(text) <= limit else text[:limit - 3] + "..."
+
+
+def _action(function):
+    """Describe a main-branch call for a reviewer summary, including what a write or edit changed."""
+    summary = _call_summary(function)
+    try:
+        args = json.loads(function["arguments"])
+    except (TypeError, ValueError):
+        return summary
+    if not isinstance(args, dict):
+        return summary
+    if function["name"] == "write_file":
+        return f"{summary} (content: {_excerpt(args.get('content'), 300)})"
+    if function["name"] == "edit_file":
+        return (f"{summary} (replaced \"{_excerpt(args.get('old_text'), 120)}\" "
+                f"with \"{_excerpt(args.get('new_text'), 180)}\")")
+    return summary
 
 
 def _tool_calls(message):
@@ -118,7 +165,8 @@ def _tool_calls(message):
 
 
 class Engine:
-    def __init__(self, server, model, workspace, tree, max_turns, max_tokens, on_tool, *, forks=True):
+    def __init__(self, server, model, workspace, tree, max_turns, max_tokens, on_tool, *, forks=True,
+                 verification=True):
         self.server = server
         self.model = model
         self.workspace = workspace
@@ -129,6 +177,7 @@ class Engine:
         self.max_tokens = max_tokens
         self.on_tool = on_tool
         self.forks = forks
+        self.verification = forks and verification
         self.strategy_sections = []
         self.track_strategy = False
         self.strategy_path = f".refl/strategies/{tree.path.stem}.md"
@@ -138,8 +187,9 @@ class Engine:
     def _messages(self, leaf, *, system_prompt=None):
         messages = self.tree.messages(leaf)
         skills = self.workspace.skill_paths()
-        # Build the main prompt for each request so resumed sessions and --linear use the current instructions.
-        system = system_prompt or (SYSTEM_PROMPT if self.forks else _LINEAR_PROMPT)
+        # Build the main prompt for each request so resumed sessions, --linear, and --no-verify use the
+        # current instructions.
+        system = system_prompt or (SYSTEM_PROMPT if self.verification else _NO_VERIFY_PROMPT)
         system += "\n\n" + _PROJECT_WRITE_RULE
         guidance = self.workspace.project_guidance()
         if guidance:
@@ -149,12 +199,42 @@ class Engine:
         messages[0] = {**messages[0], "content": system}
         return messages
 
-    async def _complete(self, messages, tools, *, fork=False, response_format=None):
+    def _brief_messages(self, leaf, start, system):
+        """Messages for a role that sees only its own branch from `start`, without the main conversation."""
+        guidance = self.workspace.project_guidance()
+        if guidance:
+            system += "\n\nProject guidance from REFLECT.md:\n" + guidance
+        return [{"role": "system", "content": system}, *self.tree.messages(leaf, start=start)]
+
+    def _brief(self, anchor, reason):
+        """Summarize the task, the reason for reflecting, and the latest main-branch actions."""
+        messages = self.tree.messages(anchor)
+        task = next((message["content"] for message in reversed(messages)
+                     if message["role"] == "user" and isinstance(message.get("content"), str)
+                     and not message["content"].startswith(_ENGINE_PROMPTS)), "")
+        functions, actions = {}, []
+        for message in messages:
+            if message["role"] == "assistant":
+                for call in message.get("tool_calls") or []:
+                    functions[call["id"]] = call["function"]
+            elif message["role"] == "tool" and message.get("tool_call_id") in functions:
+                result = " ".join(str(message.get("content", "")).split())
+                actions.append(f"- {_action(functions[message['tool_call_id']])}\n  {result[:300]}")
+        parts = [f"Task: {task[:1500]}", f"Reflection reason: {reason}"]
+        if actions:
+            parts.append("Latest actions and results:\n" + "\n".join(actions[-6:]))
+        entries = self.workspace.top_level_entries()
+        if entries:
+            parts.append("Workspace top level: " + ", ".join(entries))
+        return "\n\n".join(parts)
+
+    async def _complete(self, messages, tools, *, fork=False, response_format=None, temperature=0.0):
         if self.requests_left is not None:
             if self.requests_left <= (1 if fork else 0):
                 raise TurnLimitError("No model requests remain for this step.")
             self.requests_left -= 1
-        return await self.server.complete(self.model, messages, tools, self.max_tokens, response_format=response_format)
+        return await self.server.complete(self.model, messages, tools, self.max_tokens,
+                                          response_format=response_format, temperature=temperature)
 
     def _strategy_event(self, text):
         self.strategy_sections.append(text)
@@ -257,12 +337,15 @@ class Engine:
         self.tree.finish_fork(leaf, anchor, "pruned")
         return f"[UNVERIFIED] {reason}"
 
-    async def _review(self, anchor, stall, name, focus):
-        self.on_tool(f"Reviewing {name.lower()}: {focus}")
-        history = ""
+    async def _review(self, anchor, stall, role, brief, history):
+        self.on_tool(f"Reviewing as {role.name}: {role.focus}")
+        request = f"Reflection role: {role.name}\nReview reason: {stall}\n\n{role.focus}"
+        if role.brief:
+            request = f"{brief}\n\n{request}"
         skill = None
-        if name == "Existing patterns":
-            history = await asyncio.to_thread(self.workspace.recent_commits)
+        if role.name == "Existing patterns":
+            if history:
+                request += "\n\nRecent project commits\n" + history
             paths = self.workspace.skill_paths()
             user_messages = (message.get("content", "") for message in reversed(self.tree.messages(anchor))
                              if message["role"] == "user")
@@ -270,13 +353,8 @@ class Engine:
                           if path in content), None)
             if skill is None and len(paths) == 1:
                 skill = paths[0]
-        request = f"Reflection lens: {name}\nReview reason: {stall}\n\n{focus}"
-        if history:
-            request += "\n\nRecent project commits\n" + history
-        leaf = self.tree.append({
-            "role": "user",
-            "content": request,
-        }, parent_id=anchor, branch_type="reflection")
+        start = leaf = self.tree.append({"role": "user", "content": request}, parent_id=anchor,
+                                        branch_type="reflection")
         if skill:
             call = {
                 "type": "function",
@@ -286,65 +364,71 @@ class Engine:
             leaf = self.tree.append({"role": "assistant", "content": None, "tool_calls": [call]},
                                     parent_id=leaf, branch_type="reflection")
             leaf, _ = await self._observe(leaf, [call], branch_type="reflection")
+
+        def context(leaf, prompt):
+            system = f"{prompt}\n\nYour role: {role.name}. {role.focus}"
+            return self._brief_messages(leaf, start, system) if role.brief else self._messages(leaf, system_prompt=system)
+
         reason = "The reviewer returned no proposal."
         try:
-            for attempt in range(_REVIEW_REQUESTS):
-                final = attempt == _REVIEW_REQUESTS - 1
-                if final:
-                    leaf = self.tree.append({
-                        "role": "user",
-                        "content": "Give your recommendation now using the evidence already in the conversation.",
-                    }, parent_id=leaf, branch_type="reflection")
-                prompt = _RECOMMENDATION_PROMPT if final else REFLECTION_PROMPT
-                message = await self._complete(
-                    self._messages(leaf, system_prompt=prompt), [] if final else _READ_ONLY_TOOLS, fork=True,
-                    response_format=_RECOMMENDATION_SCHEMA if final else None,
-                )
+            proposal = None
+            if role.tools:
+                # One request to gather evidence. A plain answer without tool calls is accepted as is.
+                message = await self._complete(context(leaf, REFLECTION_PROMPT), _READ_ONLY_TOOLS, fork=True,
+                                               temperature=role.temperature)
                 calls = _tool_calls(message)
-                if final and calls:
-                    raise ServerError("The reviewer called a tool on its final request.")
                 leaf = self.tree.append(message, parent_id=leaf, branch_type="reflection")
                 if calls:
                     leaf, _ = await self._observe(leaf, calls, branch_type="reflection")
-                    continue
-                proposal = message.get("content")
-                if final:
-                    try:
-                        proposal = json.loads(proposal)["recommendation"]
-                    except (KeyError, TypeError, ValueError):
-                        proposal = None
-                if isinstance(proposal, str) and proposal.strip():
-                    self.tree.finish_fork(leaf, anchor, "merged")
-                    return " ".join(proposal.split())[:600]
-                break
+                    leaf = self.tree.append({
+                        "role": "user",
+                        "content": "Give your answer now using the evidence already in the conversation.",
+                    }, parent_id=leaf, branch_type="reflection")
+                else:
+                    proposal = " ".join(str(message.get("content") or "").split())
+            if proposal is None:
+                message = await self._complete(
+                    context(leaf, _PROPOSAL_PROMPT), [], fork=True,
+                    response_format=_proposal_schema(role.fields), temperature=role.temperature,
+                )
+                if _tool_calls(message):
+                    raise ServerError("The reviewer called a tool on its final request.")
+                leaf = self.tree.append(message, parent_id=leaf, branch_type="reflection")
+                try:
+                    proposal = _format_proposal(json.loads(message.get("content") or ""))
+                except (AttributeError, KeyError, TypeError, ValueError):
+                    proposal = ""
+            if proposal.strip(" ."):
+                self.tree.finish_fork(leaf, anchor, "merged")
+                return proposal[:800]
         except (ServerError, TurnLimitError) as error:
             reason = str(error)
 
         self.tree.finish_fork(leaf, anchor, "pruned")
-        self.on_tool(f"Reflection {name}: {reason}")
+        self.on_tool(f"Reflection {role.name}: {reason}")
         return None
 
     async def _reflect(self, reason, *, manual=False):
         anchor = self.tree.head
         heading = "Request" if manual else "Observed stall"
-        self._strategy_event(f"## Reflection\n\n{heading}\n\n    {' '.join(reason.split())}")
-        self.on_tool(f"Strategy\nReflecting: {reason}\nTracking: {self.strategy_path}")
-        proposals = await asyncio.gather(*(self._review(anchor, reason, name, focus) for name, focus in LENSES))
-        findings = [f"{name}: {proposal}" for (name, _), proposal in zip(LENSES, proposals) if proposal]
+        history = await asyncio.to_thread(self.workspace.recent_commits)
+        unavailable = set() if history or self.workspace.skill_paths() else {"Existing patterns"}
+        level, roles = self.stalls.plan(MANUAL if manual else self.stalls.kind, unavailable=unavailable,
+                                        manual=manual)
+        names = ", ".join(role.name for role in roles)
+        self._strategy_event(
+            f"## Reflection\n\n{heading}\n\n    {' '.join(reason.split())}\n\nTemperature {level}: {names}")
+        self.on_tool(f"Strategy\nReflecting: {reason}\nTemperature {level}: {names}\nTracking: {self.strategy_path}")
+        brief = self._brief(anchor, reason)
+        proposals = await asyncio.gather(*(self._review(anchor, reason, role, brief, history) for role in roles))
+        findings = [f"{role.name}: {proposal}" for role, proposal in zip(roles, proposals) if proposal]
         summary = "\n".join(findings) or "The reviewers returned no usable proposals."
         self.on_tool(f"Strategy\nReflection proposals\n{summary}")
         self._strategy_event("### Proposals\n\n" + "\n".join(f"- {entry}" for entry in findings or [summary]))
         self.track_strategy = True
         self.tree.append({
             "role": "user",
-            "content": (
-                f"Reflection results\n{heading}: {reason}\n\n"
-                + summary
-                + "\n\nTry the smallest evidence-backed fix first. Start with the Simpler approach if it fits the evidence. "
-                "For a localized fix, read only the lines you need and apply a targeted edit_file call. "
-                "Preserve unrelated code. Focus on making the fix now and keep the final request for rerunning "
-                "the smoke check that reproduced the failure."
-            ),
+            "content": f"Reflection results\n{heading}: {reason}\n\n{summary}\n\n{_AFTER_REFLECTION}",
         })
 
     def _close_unfinished_round(self):
@@ -436,7 +520,7 @@ class Engine:
             answer = answer or ""
             claims = list(dict.fromkeys(
                 " ".join(claim.split()) for claim in _VERIFY_TAG.findall(answer) if claim.strip()
-            )) if self.forks else []
+            )) if self.verification else []
             # A claim already checked in this task keeps its verdict, so restating it can end the turn.
             claims = [claim for claim in claims if claim not in self.verdicts]
             if not calls and not answer.strip():
@@ -459,7 +543,7 @@ class Engine:
                         "Reissue any deferred calls that are still needed."
                     ),
                 })
-            elif (self.forks and calls and self.requests_left >= len(LENSES) * _REVIEW_REQUESTS + 2
+            elif (self.forks and calls and self.requests_left >= _REVIEWERS * _REVIEW_REQUESTS + 2
                   and (stall := self.stalls.stall())):
                 self.tree.save()
                 await self._reflect(stall)

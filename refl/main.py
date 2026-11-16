@@ -123,7 +123,8 @@ async def _run(args):
             _status(f"Slot status unavailable ({error})")
 
         tree = _open_tree(root, args.resume)
-        engine = Engine(server, model, workspace, tree, args.max_turns, args.max_tokens, _status, forks=not args.linear)
+        engine = Engine(server, model, workspace, tree, args.max_turns, args.max_tokens, _status,
+                        forks=not args.linear, verification=not args.no_verify)
         if args.prompt is not None:
             await _submit(engine, args.prompt)
             return
@@ -157,6 +158,8 @@ def main(argv=None):
     parser.add_argument("--resume", metavar="SESSION_ID", help="continue a saved conversation in a new session")
     parser.add_argument("--bash", help="Bash executable (default: detect Bash)")
     parser.add_argument("--linear", action="store_true", help="run the main tool loop with both kinds of forks disabled")
+    parser.add_argument("--no-verify", action="store_true",
+                        help="disable verification forks and keep strategic reflection")
     parser.add_argument("--max-turns", type=_positive_int, default=20,
                         help="model requests per prompt across all branches (default: 20)")
     parser.add_argument("--max-tokens", type=_positive_int, default=2048, help="output tokens per completion (default: 2048)")

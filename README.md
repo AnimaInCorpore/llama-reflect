@@ -28,7 +28,7 @@ Omit the prompt for an interactive session. Type `/exit` or send EOF to quit. Us
 
 ## Interactive commands
 
-- `/reflect` runs the three read-only reviewers on the current conversation and shows their proposals. Enter your next task when you are ready to continue.
+- `/reflect` runs three read-only reviewers on the current conversation and shows their ideas. It uses the idea-generating roles, such as Known alternative, Analogy, and Naive shortcut. Enter your next task when you are ready to continue.
 - `/tree` shows the saved branches, their node IDs and statuses, and the current conversation node.
 - `/checkout <node_id>` switches the conversation to that node. The next prompt grows a new branch and operates on the current workspace files.
 
@@ -48,9 +48,11 @@ When a completed model reply contains `<verify>specific claim</verify>`, Reflect
 refl "Before editing settings.py, emit <verify>settings.py defines MAX_RETRIES</verify>. Use the verdict to decide what to edit."
 ```
 
+Pass `--no-verify` to skip verification forks and the tag instruction while keeping strategic reflection, or `--linear` to run without either kind of fork.
+
 Reflect discovers reusable Markdown skills under `.refl/skills/`. When a tool or workflow succeeds, the main branch can record the command for future sessions.
 
-Repeated failures and unchanged results can trigger three parallel reviewers. They can inspect the workspace and read project skills. The Existing patterns reviewer can also see the six most recent Git commit subjects when a repository and Git are available. Reflect gives the main branch the proposals and adapts how often it intervenes as the session continues. The terminal shows **Skills** and **Strategy** updates, and `.refl/strategies/<session-id>.md` records the proposals, attempts, and tool results.
+Repeated failures and unchanged results can trigger three read-only reviewers with different roles. The first reflection in a task looks for causes and evidence. Further stalls in the same task raise a reflection temperature that brings in alternative and lateral roles, such as switching tools, borrowing a mechanism from another field, or questioning a constraint. Each reviewer returns an idea with its basis, the cost of trying it, and the result that would show it failed. Reflect gives the main branch the ideas and adapts how often it intervenes as the session continues. [Reviewer roles](docs/design.md#reviewer-roles) The terminal shows **Skills** and **Strategy** updates, and `.refl/strategies/<session-id>.md` records the proposals, attempts, and tool results.
 
 The file tools protect existing shared agent instructions and configuration under `.claude/`, `.codex/`, `.pi/`, and `.agents/`, with an exception for skill directories. Reflect passes the same guidance to the model for Bash commands, which run with your user permissions.
 
@@ -59,6 +61,6 @@ The file tools protect existing shared agent instructions and configuration unde
 - [Lessons from development retrospectives](docs/retrospective-lessons.md)
 - [Benchmark plan for the first release](docs/benchmark-plan.md)
 
-Run the offline tests from this checkout with `python -m unittest`. They use a scripted model and need no server.
+Run the offline tests from this checkout with `python -m unittest`. They use a scripted model and need no server. `python bench/reflection_ab.py` runs a paired reflection test against a live server, as described in the benchmark plan.
 
 Reflect is available under the [MIT License](LICENSE).
