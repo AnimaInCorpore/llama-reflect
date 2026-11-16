@@ -1,0 +1,18 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "llama-reflect"
+version = "0.1.0"
+description = "A local coding agent for llama-server"
+readme = "README.md"
+license = {file = "LICENSE"}
+requires-python = ">=3.9"
+dependencies = ["httpx>=0.28,<1"]
+
+[project.scripts]
+refl = "refl.main:main"
+
+[tool.setuptools]
+packages = ["refl"]
