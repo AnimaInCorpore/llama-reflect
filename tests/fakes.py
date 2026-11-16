@@ -47,6 +47,10 @@ def verdict(status="supported", reason="status.txt line 1 contains old_ready"):
     return text(json.dumps({"reason": reason, "status": status}))
 
 
+def decision(role="Diagnosis", reason="It explains the failures.", first_step="Run the check."):
+    return text(json.dumps({"role": role, "reason": reason, "first_step": first_step}))
+
+
 def make_engine(root, replies, *, max_turns=20, forks=True, verification=True, thinking="auto"):
     events = []
     tree = ConversationTree(Path(root) / ".refl" / "sessions", SYSTEM_PROMPT)

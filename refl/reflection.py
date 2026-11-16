@@ -8,8 +8,9 @@ from dataclasses import dataclass
 REFLECTION_PROMPT = (
     "You are a read-only reviewer investigating why a coding task stalled. Use the recent tool results as "
     "evidence and open relevant project skills with read_file. You can inspect the workspace with read_file "
-    "and grep_search. Give one concrete next action, the evidence behind it, and a check the main branch "
-    "can run to see progress. Keep your proposal brief."
+    "and grep_search. Check your idea against the task's requirements, such as a spec or tests in the "
+    "workspace, and do not propose anything they rule out. Give one concrete next action, the evidence "
+    "behind it, and a check the main branch can run to see progress. Keep your proposal brief."
 )
 
 FAILURE, NO_PROGRESS, MANUAL = "failure", "no progress", "manual"
@@ -91,7 +92,8 @@ TEMPERATURE_SLOTS = (
     ("alternative", "lateral", "lateral"),
 )
 _KINDS = {"failure": FAILURE, "diagnostic": FAILURE, "repeated failure": FAILURE,
-          "unchanged file": NO_PROGRESS, "unchanged result": NO_PROGRESS, "edits": NO_PROGRESS}
+          "unchanged file": NO_PROGRESS, "unchanged result": NO_PROGRESS, "edits": NO_PROGRESS,
+          "cycle": NO_PROGRESS}
 
 
 def choose_roles(level, kind, used=frozenset(), unavailable=frozenset()):
@@ -110,8 +112,8 @@ _FILE_WRITES = {"write_file", "edit_file"}
 _FRACTIONAL = re.compile(r"\d+\.\d+")
 
 
-def _failure_signature(result):
-    """Compare failures while ignoring fractional numbers such as test durations."""
+def _result_signature(result):
+    """Compare results while ignoring fractional numbers such as test durations."""
     output = result.get("output")
     if isinstance(output, str):
         output = _FRACTIONAL.sub("#", output)
@@ -145,6 +147,8 @@ class StallDetector:
         # Failure signatures per action for the whole task, so an edit-and-retest cycle that keeps
         # failing the same way is visible even after it scrolls out of the recent window.
         self.failures = {}
+        # Result signatures of each Bash command in the task, to notice edits that go back and forth.
+        self.outputs = {}
         self.kind = None  # stall kind of the latest report
         self.batches = 0  # reflection batches since the task started or last made progress
         self.used = set()  # role names used in those batches
@@ -153,6 +157,7 @@ class StallDetector:
         self.recent.clear()
         self.reported.clear()
         self.failures.clear()
+        self.outputs.clear()
         self.kind = None
         self.batches = 0
         self.used.clear()
@@ -198,12 +203,14 @@ class StallDetector:
             self.reported = {key for key in self.reported if key[0] == "edits"}
         elif passed:
             self.reported = {key for key in self.reported if key[0] != "edits"}
+        signature = _result_signature(result)
         if observation.failed:
-            signature = _failure_signature(result)
             previous, count = self.failures.get(observation.action, (None, 0))
             self.failures[observation.action] = (signature, count + 1 if previous == signature else 1)
         else:
             self.failures.pop(observation.action, None)
+        if name == "bash":
+            self.outputs.setdefault(observation.action, []).append(signature)
         self.recent.append(observation)
 
     def stall(self):
@@ -226,6 +233,16 @@ class StallDetector:
                 if reason:
                     # Require three more identical failures before this pattern triggers again.
                     self.failures[latest.action] = (signature, 0)
+                    return reason
+        if latest.name == "bash":
+            # A command that returns to an earlier result, but not the one just before, shows edits that go
+            # back and forth. The exit code does not matter, since `check; cat out` exits successfully.
+            history = self.outputs.get(latest.action, [])
+            if len(history) >= 4 and history[-1] != history[-2] and history[-1] in history[:-2]:
+                reason = self._report(("cycle", latest.action, history[-1]),
+                                      f"{latest.subject} returned an earlier result again.")
+                if reason:
+                    self.outputs[latest.action] = []
                     return reason
 
         unchanged = 0

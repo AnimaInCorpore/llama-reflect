@@ -33,7 +33,8 @@ _READ_ONLY_TOOLS = [tool for tool in TOOLS if tool["function"]["name"] in _READ_
 _BASH_TOOLS = [tool for tool in TOOLS if tool["function"]["name"] == "bash"]
 _REVIEWERS = len(TEMPERATURE_SLOTS[0])
 _REVIEW_REQUESTS = 2  # at most, for a role with tools
-_ENGINE_PROMPTS = ("Verification results", "Reflection results", "Run the smoke check now.")
+_ENGINE_PROMPTS = ("Verification results", "Reflection results", "Run the smoke check now.",
+                   "Carry out the plan now")
 _PROJECT_WRITE_RULE = (
     "Preserve existing AGENTS.md, AGENTS.override.md, CLAUDE.md, CLAUDE.local.md, .mcp.json, and configuration "
     "under .agents/, .claude/, .codex/, and .pi/ when using tools, including Bash. Project skill files can be "
@@ -64,18 +65,25 @@ _EVIDENCE_PROMPT = (
 )
 _PROPOSAL_PROMPT = (
     "You are a read-only reviewer helping a coding task that stalled. Answer in your role. In proposal, give "
-    "one concrete next action. In basis, give the evidence, known technique, or analogy behind it, and say "
-    "whether it is unverified. In cost, say what trying it takes. In fails_if, give the result that would "
-    "show it did not work. Keep each field brief."
+    "one concrete next action that does not contradict the task's stated requirements. In basis, give the "
+    "evidence, known technique, or analogy behind it, and say whether it is unverified. In cost, say what "
+    "trying it takes. In fails_if, give the result that would show it did not work. Keep each field brief."
 )
 _FIELD_LABELS = {"abstraction": "Abstract form", "basis": "Basis", "cost": "Cost", "fails_if": "Fails if"}
 _AFTER_REFLECTION = (
-    "These ideas come from reviewers in different roles, and some are unverified by design. Start with the "
-    "cheapest idea whose failure you can detect quickly, say which role's idea you are trying, and run its "
-    "check. If it fails, move to the next idea. For a localized fix, read only the lines you need and make a "
-    "targeted edit. Preserve unrelated code and keep the final request for rerunning the check that showed "
-    "the problem."
+    "Evidence-based ideas rest on results from this workspace. Unverified ideas have no evidence yet. Start with "
+    "the evidence-based idea that explains the most of what you observed, run its check, and act on what it "
+    "shows. Try unverified ideas only when the evidence does not settle the question. Do not go back to the "
+    "edits or commands you repeated before this reflection. For a localized fix, read only the lines you need "
+    "and make a targeted edit. Preserve unrelated code and keep the final request for rerunning the check that "
+    "showed the problem."
 )
+_DECISION_REQUEST = (
+    "Before you act, choose the idea to try first. In role, name the reviewer whose idea it is. In reason, say "
+    "which observations it explains. In first_step, give the exact action you will take next."
+)
+_DECISION_FIELDS = ("role", "reason", "first_step")
+_CARRY_OUT = "Carry out the plan now, starting with its first step."
 
 
 def _proposal_schema(fields):
@@ -431,15 +439,40 @@ class Engine:
         self.on_tool(f"Strategy\nReflecting: {reason}\nTemperature {level}: {names}\nTracking: {self.strategy_path}")
         brief = self._brief(anchor, reason)
         proposals = await asyncio.gather(*(self._review(anchor, reason, role, brief, history) for role in roles))
-        findings = [f"{role.name}: {proposal}" for role, proposal in zip(roles, proposals) if proposal]
-        summary = "\n".join(findings) or "The reviewers returned no usable proposals."
+        found = [(role, proposal) for role, proposal in zip(roles, proposals) if proposal]
+        # Grounded roles inspect the workspace, so their ideas come first and are labeled as evidence-based.
+        sections = []
+        for title, grounded in (("Evidence-based ideas", True), ("Unverified ideas", False)):
+            entries = [f"- {role.name}: {proposal}" for role, proposal in found if (role.group == "grounded") == grounded]
+            if entries:
+                sections.append(title + "\n" + "\n".join(entries))
+        summary = "\n\n".join(sections) or "The reviewers returned no usable proposals."
         self.on_tool(f"Strategy\nReflection proposals\n{summary}")
-        self._strategy_event("### Proposals\n\n" + "\n".join(f"- {entry}" for entry in findings or [summary]))
+        self._strategy_event("### Proposals\n\n" + summary)
         self.track_strategy = True
-        self.tree.append({
-            "role": "user",
-            "content": f"Reflection results\n{heading}: {reason}\n\n{summary}\n\n{_AFTER_REFLECTION}",
-        })
+        decide = bool(found) and not manual
+        content = f"Reflection results\n{heading}: {reason}\n\n{summary}\n\n{_AFTER_REFLECTION}"
+        self.tree.append({"role": "user", "content": content + ("\n\n" + _DECISION_REQUEST if decide else "")})
+        if decide:
+            await self._decide([role.name for role, _ in found])
+
+    async def _decide(self, names):
+        """Have the main branch commit to one reviewer's idea before it acts, without tools."""
+        schema = _proposal_schema(_DECISION_FIELDS)
+        schema["schema"]["properties"]["role"] = {"type": "string", "enum": names}
+        try:
+            message = await self._complete(self._messages(self.tree.head), [], response_format=schema)
+            decision = json.loads(message.get("content") or "")
+            plan = (f"Plan: try the {decision['role']} idea first. Reason: {' '.join(decision['reason'].split())} "
+                    f"First step: {' '.join(decision['first_step'].split())}")
+        except (AttributeError, KeyError, TypeError, ValueError, ServerError, TurnLimitError) as error:
+            self.on_tool(f"Strategy\nNo plan after reflection: {error}")
+            self.tree.append({"role": "assistant", "content": "I will follow the reflection results."})
+        else:
+            self.on_tool(f"Strategy\n{plan}")
+            self._strategy_event(f"### Plan\n\n{plan}")
+            self.tree.append({"role": "assistant", "content": plan})
+        self.tree.append({"role": "user", "content": _CARRY_OUT})
 
     def _close_unfinished_round(self):
         messages = self.tree.messages(self.tree.head)
@@ -553,7 +586,7 @@ class Engine:
                         "Reissue any deferred calls that are still needed."
                     ),
                 })
-            elif (self.forks and calls and self.requests_left >= _REVIEWERS * _REVIEW_REQUESTS + 2
+            elif (self.forks and calls and self.requests_left >= _REVIEWERS * _REVIEW_REQUESTS + 3
                   and (stall := self.stalls.stall())):
                 self.tree.save()
                 await self._reflect(stall)

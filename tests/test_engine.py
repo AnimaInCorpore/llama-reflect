@@ -6,7 +6,7 @@ from pathlib import Path
 
 from refl.engine import _call_summary
 
-from .fakes import call, make_engine, text, verdict
+from .fakes import call, decision, make_engine, text, verdict
 
 _CLAIM = "<verify>status.txt contains old_ready</verify>"
 
@@ -49,10 +49,10 @@ class EngineTest(unittest.TestCase):
     def test_smoke_check_request_answered_in_text(self):
         (self.root / "a.txt").write_text("a\n", encoding="utf-8")
         replies = [call("read_file", path="missing.txt"), call("read_file", path="missing.txt")]
-        replies += [text("Read a.txt first.")] * 3
+        replies += [text("Read a.txt first.")] * 3 + [decision()]
         replies += [call("read_file", path="a.txt", start_line=1, end_line=line) for line in range(1, 5)]
         replies += [text("All checks pass.")]
-        engine, server, events = make_engine(self.root, replies, max_turns=10)
+        engine, server, events = make_engine(self.root, replies, max_turns=11)
         self.assertEqual(asyncio.run(engine.respond("Fix it.")), "All checks pass.")
         self.assertTrue(any(event.startswith("Strategy\nReflecting") for event in events))
         self.assertEqual(server.requests[-1]["tools"], ["bash"])
@@ -88,7 +88,7 @@ class EngineTest(unittest.TestCase):
         self.assertFalse(any(event.startswith("Verifying") for event in events))
 
         replies = [call("read_file", path="missing.txt"), call("read_file", path="missing.txt")]
-        replies += [text("Read status.txt.")] * 3 + [text("Done.")]
+        replies += [text("Read status.txt.")] * 3 + [decision(), text("Done.")]
         engine, _, events = make_engine(self.root, replies, verification=False)
         self.assertEqual(asyncio.run(engine.respond("Fix it.")), "Done.")
         self.assertTrue(any(event.startswith("Strategy\nReflecting") for event in events))
@@ -98,7 +98,7 @@ class EngineTest(unittest.TestCase):
                                 "cost": "one command", "fails_if": "the file stays unchanged"}))
         replies = [call("read_file", path="missing.txt"), call("read_file", path="missing.txt"),
                    text("Check whether missing.txt exists."), text("Print the directory listing."), idea,
-                   text("Done.")]
+                   decision("Observe"), text("Done.")]
         engine, server, events = make_engine(self.root, replies)
         self.assertEqual(asyncio.run(engine.respond("Fix it.")), "Done.")
         self.assertIn("Temperature 0: Diagnosis, Observe, Switch tools", next(e for e in events if "Reflecting" in e))
@@ -115,8 +115,30 @@ class EngineTest(unittest.TestCase):
 
         results = next(node.message["content"] for node in engine.tree.nodes
                        if str(node.message.get("content", "")).startswith("Reflection results"))
-        self.assertIn("Switch tools: Edit the bytes with Python. Basis: UTF-8 tools fail. Cost: one command. "
+        self.assertIn("Evidence-based ideas\n- Diagnosis: Check whether missing.txt exists.\n"
+                      "- Observe: Print the directory listing.\n\nUnverified ideas\n"
+                      "- Switch tools: Edit the bytes with Python. Basis: UTF-8 tools fail. Cost: one command. "
                       "Fails if: the file stays unchanged.", results)
+
+        choice = next(request for request in server.requests if request["response_format"]
+                      and "role" in request["response_format"]["schema"]["properties"])
+        self.assertEqual(choice["tools"], [])
+        self.assertEqual(choice["response_format"]["schema"]["properties"]["role"]["enum"],
+                         ["Diagnosis", "Observe", "Switch tools"])
+        main = [node.message["content"] for node in engine.tree.nodes if node.branch_type == "main"]
+        self.assertIn("Plan: try the Observe idea first. Reason: It explains the failures. "
+                      "First step: Run the check.", main)
+        self.assertEqual(main[main.index(next(m for m in main if str(m).startswith("Plan:"))) + 1],
+                         "Carry out the plan now, starting with its first step.")
+
+    def test_unusable_decision_still_continues(self):
+        replies = [call("read_file", path="missing.txt"), call("read_file", path="missing.txt")]
+        replies += [text("Read status.txt.")] * 3 + [text("not json"), text("Done.")]
+        engine, _, events = make_engine(self.root, replies)
+        self.assertEqual(asyncio.run(engine.respond("Fix it.")), "Done.")
+        main = [node.message["content"] for node in engine.tree.nodes if node.branch_type == "main"]
+        self.assertIn("I will follow the reflection results.", main)
+        self.assertTrue(any(event.startswith("Strategy\nNo plan after reflection") for event in events))
 
     def test_brief_shows_what_writes_changed(self):
         engine, _, _ = make_engine(self.root, [

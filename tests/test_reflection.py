@@ -55,6 +55,21 @@ class StallDetectorTest(unittest.TestCase):
         self.assertEqual(self.cycle("1 failed in 0.04s"), "pytest failed the same way three times.")
         self.assertEqual(self.detector.kind, FAILURE)
 
+    def test_results_that_cycle_back(self):
+        check = "python check.py; cat report.txt"
+        outputs = ["FAILED\nW", "FAILED\nX", "FAILED\nY", "FAILED\nX"]
+        reasons = []
+        for output in outputs:
+            self.assertIsNone(self.record("edit_file", {"path": "report.py"}, {"output": "Edited", "changed": True}))
+            reasons.append(self.record("bash", {"command": check}, {"exit_code": 0, "output": output}))
+        self.assertEqual(reasons, [None, None, None, f"{check} returned an earlier result again."])
+        self.assertEqual(self.detector.kind, NO_PROGRESS)
+
+    def test_repeating_a_passing_check_is_not_a_cycle(self):
+        for output in ["1 failed", "2 failed", "OK", "OK", "OK"]:
+            self.record("edit_file", {"path": "app.py"}, {"output": "Edited", "changed": True})
+            self.assertIsNone(self.record("bash", {"command": "make check; echo done"}, {"exit_code": 0, "output": output}))
+
     def test_unchanged_result_is_a_progress_stall(self):
         for _ in range(3):
             reason = self.record("bash", {"command": "make"}, {"exit_code": 0, "output": "Nothing to do."})

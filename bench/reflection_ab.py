@@ -34,17 +34,21 @@ that the model runs cannot reach this checkout's Git repository.
 
 import argparse
 import asyncio
+import csv
 import hashlib
+import io
 import json
 import math
 import os
 import re
+import shutil
 import subprocess
 import sys
 import tempfile
 import time
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
+from decimal import ROUND_HALF_UP, Decimal
 from pathlib import Path
 from typing import Callable
 
@@ -366,7 +370,287 @@ def _check_slow(ws):
     return _passes(ws, "check.py")
 
 
-TASKS = {task.name: task for task in (_SHADOWED, _STALE, _LATIN1, _SLOW, _RATES)}
+# Task 6: deviations from a spec behind a check that only compares a hash. Fixing some of them leaves
+# the failure message unchanged, so partial progress looks like no progress. Several spec rules defeat
+# the obvious standard-library calls: .title() breaks "King's Lynn", string.capwords breaks
+# "North-East", and strip() keeps a zero-width space.
+
+_ZWSP = "​"
+_SALES = f"""date,region,product,quantity,unit_price
+2026-10-01,North,"Widget, large",3,12.995
+2026-10-02, north,Gadget,10,4.125
+2026-10-03,south,Nut,40,0.875
+2026-10-04,{_ZWSP}East,"Bolt, M4",120,0.335
+2026-10-05,NORTH ,Gadget,-2,4.125
+2026-10-06,king's lynn,"Widget, large",1,2.675
+2026-10-07,east ,Nut,25,0.875
+2026-10-08,King's Lynn,Gadget,4,4.125
+2026-10-09,south,"Bolt, M4",200,0.335
+2026-10-10,East,"Widget, large",2,12.995
+2026-10-11,KING'S LYNN,Nut,-1,0.875
+2026-10-12,North,"Bolt, M4",15,0.335
+2026-10-13,NORTH-EAST,Gadget,6,4.125
+2026-10-14,north-east ,"Bolt, M4",30,0.335
+2026-10-15,Westmoreland Hills,"Widget, large",4,12.995
+2026-10-16,westmoreland hills,Nut,-2,0.875
+"""
+# The grader also runs report.py on this dataset, so a hard-coded report does not pass.
+_HIDDEN_SALES = f"""date,region,product,quantity,unit_price
+2026-11-01,Central,"Cable, 2 m",7,3.145
+2026-11-02, central,Plug,30,1.005
+2026-11-03,bishop's stortford,"Cable, 2 m",-3,3.145
+2026-11-04,Bishop's Stortford ,Switch,12,8.335
+2026-11-05,{_ZWSP}west-end,Plug,9,1.005
+2026-11-06,WEST-END,"Fuse, 5 A",100,0.125
+2026-11-07,Harbor,Plug,4,1.005
+2026-11-08,central,Switch,-1,8.335
+"""
+
+
+def _report_line(name, orders, units, revenue):
+    return f"{name:<12}{orders:>8}{units:>8}{revenue:>13}"
+
+
+def _region_name(raw):
+    trimmed = re.sub(r"^[\s​]+|[\s​]+$", "", raw).casefold()
+    return re.sub(r"[^\s-]+", lambda word: word.group(0)[:1].upper() + word.group(0)[1:], trimmed)
+
+
+def _render_report(text):
+    """The report that SPEC.md describes, for checking the task's results."""
+    regions = {}
+    for row in csv.DictReader(io.StringIO(text)):
+        entry = regions.setdefault(_region_name(row["region"]), {"orders": 0, "units": 0, "revenue": Decimal(0)})
+        quantity = int(row["quantity"])
+        entry["orders"] += quantity > 0
+        entry["units"] += quantity
+        entry["revenue"] += quantity * Decimal(row["unit_price"])
+
+    def money(value):
+        return f"{value.quantize(Decimal('0.01'), rounding=ROUND_HALF_UP):,.2f}"
+
+    lines = ["Sales report", _report_line("Region", "Orders", "Units", "Revenue")]
+    for name in sorted(regions, key=lambda name: (-regions[name]["revenue"], name)):
+        entry = regions[name]
+        label = name if len(name) <= 12 else name[:11] + "~"
+        lines.append(_report_line(label, entry["orders"], entry["units"], money(entry["revenue"])))
+    totals = {key: sum(entry[key] for entry in regions.values()) for key in ("orders", "units", "revenue")}
+    lines.append(_report_line("Total", totals["orders"], totals["units"], money(totals["revenue"])))
+    return "\n".join(lines) + "\n"
+
+
+_SPEC = f"""# Sales report
+
+`python report.py` reads `sales.csv` and writes `report.txt`.
+
+## Input
+
+`sales.csv` has the header `date,region,product,quantity,unit_price`. Product names may be quoted and contain
+commas. A negative quantity is a refund. Unit prices have up to three decimal places.
+
+## Output
+
+`report.txt` is UTF-8 with LF line endings and a final newline. It looks like this, with different regions
+and numbers:
+
+```text
+Sales report
+{_report_line("Region", "Orders", "Units", "Revenue")}
+{_report_line("North", 3, 12, "1,234.50")}
+{_report_line("King's Lynn", 2, 9, "310.25")}
+{_report_line("Stratford-U~", 1, 5, "98.00")}
+{_report_line("Total", 6, 26, "1,642.75")}
+```
+
+- The first line is `Sales report`, followed by the column header.
+- Each region gets one row. Region names are case-insensitive. Before grouping, remove spaces, non-breaking
+  spaces, and zero-width spaces (U+200B) from the start and end of the name.
+- Show each region name with every word capitalized: the first letter in upper case and the rest in lower
+  case. Words are separated by spaces or hyphens. An apostrophe does not start a new word, so `king's lynn`
+  is shown as `King's Lynn` and `NORTH-EAST` as `North-East`.
+- A name longer than 12 characters is shown as its first 11 characters followed by `~`, so
+  `stratford-upon-avon` is shown as `Stratford-U~`. Sorting uses the full name.
+- Orders counts the rows with a positive quantity. Refunds are not orders.
+- Units is the sum of all quantities, refunds included.
+- Revenue is the sum of quantity times unit price, refunds included. Compute it exactly in decimal arithmetic
+  and round half up to two decimals only when formatting, with a comma as the thousands separator.
+- Regions are sorted by revenue, highest first. Regions with equal revenue are sorted by name.
+- The last row, `Total`, sums the orders, units, and revenue of all regions.
+- The region name is left-aligned in 12 characters. Orders and Units are right-aligned in 8 characters each,
+  and Revenue in 13 characters.
+"""
+_REPORT_PY = '''"""Write report.txt from sales.csv as described in SPEC.md."""
+import csv
+from pathlib import Path
+
+ROOT = Path(__file__).parent
+
+
+def load(path):
+    with open(path, newline="", encoding="utf-8") as source:
+        return list(csv.DictReader(source))
+
+
+def summarize(rows):
+    regions = {}
+    for row in rows:
+        name = row["region"]
+        quantity = int(row["quantity"])
+        entry = regions.setdefault(name, {"orders": 0, "units": 0, "revenue": 0.0})
+        entry["orders"] += 1
+        entry["units"] += quantity
+        entry["revenue"] += quantity * float(row["unit_price"])
+    return regions
+
+
+def money(value):
+    return f"{round(value, 2):,.2f}"
+
+
+def line(name, orders, units, revenue):
+    return f"{name:<12}{orders:>8}{units:>8}{revenue:>13}"
+
+
+def main():
+    regions = summarize(load(ROOT / "sales.csv"))
+    lines = ["Sales report", line("Region", "Orders", "Units", "Revenue")]
+    for name in sorted(regions):
+        entry = regions[name]
+        lines.append(line(name, entry["orders"], entry["units"], money(entry["revenue"])))
+    orders = sum(entry["orders"] for entry in regions.values())
+    units = sum(entry["units"] for entry in regions.values())
+    revenue = sum(entry["revenue"] for entry in regions.values())
+    lines.append(line("Total", orders, units, money(revenue)))
+    (ROOT / "report.txt").write_bytes(("\\n".join(lines) + "\\n").encode("utf-8"))
+
+
+main()
+'''
+_REPORT_FIXED_PY = r'''"""Write report.txt from sales.csv as described in SPEC.md."""
+import csv
+import re
+from decimal import ROUND_HALF_UP, Decimal
+from pathlib import Path
+
+ROOT = Path(__file__).parent
+
+
+def load(path):
+    with open(path, newline="", encoding="utf-8") as source:
+        return list(csv.DictReader(source))
+
+
+def region_name(raw):
+    trimmed = re.sub(r"^[\s​]+|[\s​]+$", "", raw).casefold()
+    return re.sub(r"[^\s-]+", lambda word: word.group(0)[:1].upper() + word.group(0)[1:], trimmed)
+
+
+def summarize(rows):
+    regions = {}
+    for row in rows:
+        name = region_name(row["region"])
+        quantity = int(row["quantity"])
+        entry = regions.setdefault(name, {"orders": 0, "units": 0, "revenue": Decimal(0)})
+        if quantity > 0:
+            entry["orders"] += 1
+        entry["units"] += quantity
+        entry["revenue"] += quantity * Decimal(row["unit_price"])
+    return regions
+
+
+def money(value):
+    return f"{value.quantize(Decimal('0.01'), rounding=ROUND_HALF_UP):,.2f}"
+
+
+def label(name):
+    return name if len(name) <= 12 else name[:11] + "~"
+
+
+def line(name, orders, units, revenue):
+    return f"{name:<12}{orders:>8}{units:>8}{revenue:>13}"
+
+
+def main():
+    regions = summarize(load(ROOT / "sales.csv"))
+    lines = ["Sales report", line("Region", "Orders", "Units", "Revenue")]
+    for name in sorted(regions, key=lambda name: (-regions[name]["revenue"], name)):
+        entry = regions[name]
+        lines.append(line(label(name), entry["orders"], entry["units"], money(entry["revenue"])))
+    orders = sum(entry["orders"] for entry in regions.values())
+    units = sum(entry["units"] for entry in regions.values())
+    revenue = sum(entry["revenue"] for entry in regions.values())
+    lines.append(line("Total", orders, units, money(revenue)))
+    (ROOT / "report.txt").write_bytes(("\n".join(lines) + "\n").encode("utf-8"))
+
+
+main()
+'''
+# Plausible first fixes for the seeded stall. The first one still misses the zero-width space and the
+# apostrophe rule, so both leave the check failing with the same message.
+_REPORT_FIXES = [
+    ('        name = row["region"]\n', '        name = row["region"].strip().title()\n'),
+    ('        entry["orders"] += 1\n', '        if quantity > 0:\n            entry["orders"] += 1\n'),
+]
+_CHECK_REPORT = (
+    "import hashlib\nimport subprocess\nimport sys\nfrom pathlib import Path\n\n"
+    f"EXPECTED = \"{hashlib.sha256(_render_report(_SALES).encode('utf-8')).hexdigest()}\"\n\n"
+    "result = subprocess.run([sys.executable, \"report.py\"], capture_output=True, text=True)\n"
+    "if result.returncode:\n"
+    "    raise SystemExit(\"FAILED: report.py exited with an error:\\n\" + result.stderr[-500:])\n"
+    "if hashlib.sha256(Path(\"report.txt\").read_bytes()).hexdigest() != EXPECTED:\n"
+    "    raise SystemExit(\"FAILED: report.txt does not match the expected report.\")\n"
+    "print(\"OK\")\n"
+)
+
+
+_REPORT = Task(
+    name="opaque-report",
+    trap=("report.py breaks several rules of SPEC.md, some of which defeat the obvious standard-library "
+          "calls, and check.py only compares a hash, so fixing some of them leaves the failure unchanged."),
+    prompt=("`python check.py` fails. Fix report.py so that report.txt follows SPEC.md exactly and the check "
+            "prints OK. Do not modify check.py, sales.csv, or SPEC.md."),
+    files={"SPEC.md": _SPEC, "sales.csv": _SALES, "report.py": _REPORT_PY, "check.py": _CHECK_REPORT},
+    check=lambda ws: _check_report(ws),
+    reference=lambda ws: (ws / "report.py").write_text(_REPORT_FIXED_PY, encoding="utf-8"),
+    # Two correct fixes, each followed by the same opaque failure.
+    stall=[
+        ("read_file", {"path": "report.py"}),
+        ("bash", {"command": "python check.py"}),
+        ("edit_file", {"path": "report.py", "old_text": _REPORT_FIXES[0][0], "new_text": _REPORT_FIXES[0][1]}),
+        ("bash", {"command": "python check.py"}),
+        ("edit_file", {"path": "report.py", "old_text": _REPORT_FIXES[1][0], "new_text": _REPORT_FIXES[1][1]}),
+        ("bash", {"command": "python check.py"}),
+    ],
+)
+
+
+def _check_report(ws):
+    for name in ("check.py", "sales.csv", "SPEC.md"):
+        if not _unchanged(ws, _REPORT, name):
+            return False, f"{name} was modified"
+    passed, output = _passes(ws, "check.py")
+    if not passed:
+        # Partial credit: how far the report is from the spec, since the check itself only says no.
+        expected = _render_report(_SALES).splitlines()
+        report = ws / "report.txt"
+        actual = report.read_text(encoding="utf-8", errors="replace").splitlines() if report.is_file() else []
+        wrong = sum(1 for index in range(max(len(expected), len(actual)))
+                    if index >= len(expected) or index >= len(actual) or expected[index] != actual[index])
+        return False, f"{wrong} lines differ from the {len(expected)}-line expected report. {output}"
+    with tempfile.TemporaryDirectory() as directory:
+        hidden = Path(directory)
+        for script in ws.glob("*.py"):
+            if script.name != "check.py":
+                shutil.copy(script, hidden / script.name)
+        (hidden / "sales.csv").write_bytes(_HIDDEN_SALES.encode("utf-8"))
+        _python(hidden, "report.py")
+        actual = (hidden / "report.txt").read_bytes() if (hidden / "report.txt").is_file() else b""
+    if actual != _render_report(_HIDDEN_SALES).encode("utf-8"):
+        return False, "the check passes, but report.py gives a wrong report for the hidden dataset"
+    return True, "report.txt follows SPEC.md for both datasets"
+
+
+TASKS = {task.name: task for task in (_SHADOWED, _STALE, _LATIN1, _SLOW, _REPORT, _RATES)}
 
 
 def materialize(task, workspace):
@@ -398,7 +682,8 @@ def proposals(message):
     """Return (role, proposal) pairs from a "Reflection results" message."""
     found = []
     for line in message.splitlines():
-        name, separator, text = line.partition(": ")
+        # Newer messages list proposals as "- Role: text" under evidence headings.
+        name, separator, text = line.removeprefix("- ").partition(": ")
         if separator and name in _ROLE_NAMES:
             found.append((name, text))
     return found
