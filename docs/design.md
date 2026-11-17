@@ -61,7 +61,7 @@ Verification tests can exercise a claim that changes after an edit. Start with `
 
 ## Strategic reflection
 
-Reflect watches the actual main-branch tool results of the current task and starts a reflection batch when it sees one of these patterns. The first four look at the latest four results. The other three look at the whole task.
+Reflect watches the actual main-branch tool results of the current task and starts a reflection batch when it sees one of these patterns. The first four look at the latest four results. The other four look at the whole task.
 
 - Two consecutive failures for the same action, or the same failure from two calls to the same tool.
 - Two writes to the same file that leave its bytes unchanged.
@@ -70,6 +70,7 @@ Reflect watches the actual main-branch tool results of the current task and star
 - Three identical failures from the same call, even with edits between the runs. Fractional numbers such as test durations are ignored when comparing the results.
 - A Bash command that has run at least four times returns a result it already returned earlier, but not the one just before it. This catches edits that go back and forth. The exit code does not matter, because a command such as `python check.py; cat report.txt` exits successfully even when the check fails. Repeating a passing check returns the same result twice in a row and does not count.
 - The model gives a final answer while the latest Bash command still fails and that command has run at least twice in the task. A small model often stopped this way, announcing a next step it never took. A single failed command does not count, because it can be the answer itself, as in checking whether a tool is installed. Instead of ending the turn, Reflect starts a batch and the main branch continues.
+- Fifteen tool results in a row change no file while a Bash command that failed earlier in the task has not passed since. This catches activity that never converges, such as a new script each time that tries combinations against a hash, where no action or result repeats. Solved benchmark runs went at most 10 results without a change. Replayed over 383 recorded runs, the rule fired in 7 failed runs and in none of the 279 solved ones. Without a failing command, such as during a pure investigation, a long stretch of reads does not count.
 
 ### Reflection batches
 

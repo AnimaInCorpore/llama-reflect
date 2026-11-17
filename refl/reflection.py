@@ -113,7 +113,7 @@ TEMPERATURE_SLOTS = (
 )
 _KINDS = {"failure": FAILURE, "diagnostic": FAILURE, "repeated failure": UNFIXED, "stopped": UNFIXED,
           "unchanged file": NO_PROGRESS, "unchanged result": NO_PROGRESS, "edits": NO_PROGRESS,
-          "cycle": NO_PROGRESS}
+          "cycle": NO_PROGRESS, "wandering": NO_PROGRESS}
 
 
 def choose_roles(level, kind, used=frozenset(), unavailable=frozenset()):
@@ -129,6 +129,9 @@ def choose_roles(level, kind, used=frozenset(), unavailable=frozenset()):
 
 
 _FILE_WRITES = {"write_file", "edit_file"}
+# Tool results in a row without a file change, while a failing command is unresolved, that count as a stall.
+# Solved runs of the benchmark went at most 10. A run that tried new scripts against a hash went 26.
+_QUIET_LIMIT = 15
 _FRACTIONAL = re.compile(r"\d+\.\d+")
 
 
@@ -171,6 +174,8 @@ class StallDetector:
         self.outputs = {}
         self.runs = {}  # how often each Bash command ran in the task
         self.last_bash = None
+        self.quiet = 0  # tool results in a row that changed no file
+        self.unresolved = None  # the latest failed Bash command that has not passed since
         self.kind = None  # stall kind of the latest report
         self.batches = 0  # reflection batches since the task started or last made progress
         self.used = set()  # role names used in those batches
@@ -182,6 +187,8 @@ class StallDetector:
         self.outputs.clear()
         self.runs.clear()
         self.last_bash = None
+        self.quiet = 0
+        self.unresolved = None
         self.kind = None
         self.batches = 0
         self.used.clear()
@@ -237,6 +244,11 @@ class StallDetector:
             self.outputs.setdefault(observation.action, []).append(signature)
             self.runs[observation.action] = self.runs.get(observation.action, 0) + 1
             self.last_bash = observation
+            if observation.failed:
+                self.unresolved = observation
+            elif self.unresolved is not None and self.unresolved.action == observation.action:
+                self.unresolved = None
+        self.quiet = 0 if changed else self.quiet + 1
         self.recent.append(observation)
 
     def stopped(self):
@@ -306,6 +318,14 @@ class StallDetector:
             if edits >= 3:
                 return self._report(("edits", latest.path),
                                     f"{latest.subject} was changed three times without a successful Bash check.")
+        if self.quiet >= _QUIET_LIMIT and self.unresolved is not None:
+            # Activity that never converges, such as a new script each time, repeats nothing the rules above see.
+            reason = self._report(("wandering", self.unresolved.action, self.quiet),
+                                  f"{self.quiet} tool calls in a row changed no file while {self.unresolved.subject} "
+                                  "still fails.")
+            if reason:
+                self.quiet = 0
+                return reason
         return None
 
     def _report(self, key, reason):

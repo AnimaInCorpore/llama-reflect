@@ -106,6 +106,34 @@ class StallDetectorTest(unittest.TestCase):
         self.assertEqual(self.detector.kind, UNFIXED)
         self.assertIsNone(self.detector.stopped())  # reported once
 
+    def explore(self, count, start=0):
+        """Different reads and scripts with different results, none of which changes a file."""
+        reasons = []
+        for index in range(start, start + count):
+            if index % 2:
+                reasons.append(self.record("read_file", {"path": f"notes{index}.txt"}, {"output": f"line {index}"}))
+            else:
+                reasons.append(self.record("bash", {"command": f"python try{index}.py"},
+                                           {"exit_code": 0, "output": f"no match {index}"}))
+        return reasons
+
+    def test_wandering_while_a_check_fails(self):
+        self.record("bash", {"command": "python check.py"}, {"exit_code": 1, "output": "FAILED"})
+        reasons = self.explore(14)
+        self.assertEqual(reasons[:-1], [None] * 13)
+        self.assertEqual(reasons[-1], "15 tool calls in a row changed no file while python check.py still fails.")
+        self.assertEqual(self.detector.kind, NO_PROGRESS)
+
+    def test_exploring_without_a_failure_is_not_a_stall(self):
+        self.assertEqual(self.explore(20), [None] * 20)
+
+    def test_a_file_change_restarts_the_count(self):
+        self.record("bash", {"command": "python check.py"}, {"exit_code": 1, "output": "FAILED"})
+        self.explore(10)
+        self.record("write_file", {"path": "report.py"}, {"output": "Wrote report.py", "changed": True})
+        self.assertEqual(self.explore(14, start=10), [None] * 14)
+        self.assertIsNotNone(self.explore(1, start=24)[0])
+
     def test_final_answer_after_the_check_passes(self):
         self.record("bash", {"command": "pytest"}, {"exit_code": 1, "output": "1 failed"})
         self.record("bash", {"command": "pytest"}, {"exit_code": 0, "output": "1 passed"})
