@@ -79,10 +79,12 @@ _AFTER_REFLECTION = (
     "showed the problem."
 )
 _DECISION_REQUEST = (
-    "Before you act, choose the idea to try first. In role, name the reviewer whose idea it is. In reason, say "
-    "which observations it explains. In first_step, give the exact action you will take next."
+    "Before you act, choose the idea to try first. In reason, say which idea you chose and which observations "
+    "it explains. In first_step, give the exact action you will take next. In role, name the reviewer whose "
+    "idea that is."
 )
-_DECISION_FIELDS = ("role", "reason", "first_step")
+# The role comes last, so the model names it after writing the plan and the label matches the plan.
+_DECISION_FIELDS = ("reason", "first_step", "role")
 _CARRY_OUT = "Carry out the plan now, starting with its first step."
 
 
@@ -296,7 +298,8 @@ class Engine:
             parts.append("Workspace top level: " + ", ".join(entries))
         return "\n\n".join(parts)
 
-    async def _complete(self, messages, tools, *, fork=False, response_format=None, temperature=0.0):
+    async def _complete(self, messages, tools, *, fork=False, response_format=None, temperature=0.0,
+                        tool_choice=None):
         if self.requests_left is not None:
             if self.requests_left <= (1 if fork else 0):
                 raise TurnLimitError("No model requests remain for this step.")
@@ -310,7 +313,7 @@ class Engine:
             messages = split_text_and_calls(messages)
         return await self.server.complete(self.model, messages, tools, self.max_tokens,
                                           response_format=response_format, temperature=temperature,
-                                          thinking=thinking)
+                                          thinking=thinking, tool_choice=tool_choice)
 
     async def _template_moves_text(self):
         """Check whether the server's chat template renders an assistant's text after its tool results."""
@@ -458,9 +461,10 @@ class Engine:
         try:
             proposal = None
             if role.tools:
-                # One request to gather evidence. A plain answer without tool calls is accepted as is.
+                # One request to gather evidence. Requiring a call keeps a small model from proposing a check
+                # instead of running it. A server that ignores tool_choice can still answer in text.
                 message = await self._complete(context(leaf, REFLECTION_PROMPT), _READ_ONLY_TOOLS, fork=True,
-                                               temperature=role.temperature)
+                                               temperature=role.temperature, tool_choice="required")
                 calls = _tool_calls(message)
                 leaf = self.tree.append(message, parent_id=leaf, branch_type="reflection")
                 if calls:
@@ -653,11 +657,15 @@ class Engine:
                         "Reissue any deferred calls that are still needed."
                     ),
                 })
-            elif (self.forks and calls and self.requests_left >= _REVIEWERS * _REVIEW_REQUESTS + 3
-                  and (stall := self.stalls.stall())):
+            elif (self.forks and self.requests_left >= _REVIEWERS * _REVIEW_REQUESTS + 3
+                  # A final answer while a rerun check still fails is a stall too: the model gave up.
+                  and (stall := self.stalls.stall() if calls else self.stalls.stopped())):
                 self.tree.save()
                 await self._reflect(stall)
                 reflected = True
+                if not calls:
+                    self.tree.save()
+                    continue
             self.tree.save()
             if not claims and not calls:
                 return answer.strip()

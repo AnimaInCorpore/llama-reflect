@@ -18,6 +18,13 @@ Then run the hardest task without thinking. A 27B model stalls on it by itself, 
 python bench/reflection_ab.py --url http://127.0.0.1:8080 --tasks opaque-report --thinking off --max-turns 40 --repeat 3
 ```
 
+A small model such as Gemma 4 E4B also stalls on `shadowed-module`. Run all tasks with thinking off and on, because reflection helped it only with thinking.
+
+```text
+python bench/reflection_ab.py --url http://127.0.0.1:8080 --arms linear reflect --thinking off --max-turns 30 --repeat 3
+python bench/reflection_ab.py --url http://127.0.0.1:8080 --arms linear reflect --thinking auto --max-tokens 8192 --max-turns 30 --repeat 2
+```
+
 ## Check
 
 The summary table lists pass or fail, requests per branch, where the stall detector fired, the reviewer roles, and the number of distinct ideas. For a failed `opaque-report` run, `results.json` says how many report lines still differ. Open a run's session file to read the reflection message, the plan, and the actions that followed.

@@ -6,6 +6,8 @@
 
 The session stores each tool result as JSON. Requests give it to the model as plain text: the output, preceded by an `Error:` or `Exit code:` line when present. In a JSON string, file contents carry escapes such as `\"` and `\n`. A 4B model copied those escapes into `edit_file` arguments, which then did not match the file. With plain-text results, its replayed edits matched the file in 24 of 34 cases instead of 9 of 41.
 
+`edit_file` first looks for a literal match. If there is none, it accepts a unique match that differs only in blank lines and trailing spaces, with indentation unchanged, and says so in its result. The 4B model often copied a block with one blank line where the file had two. Replayed through this fallback, 24 of 34 failed edits from three of its benchmark rounds succeeded. An `old_text` that starts with the line numbers from `read_file` gets an error saying to leave them out.
+
 Some chat templates, such as Gemma 4's, render an assistant's text after the results of its tool calls and close the turn there. The model then reads its stated plan after the result and repeats the call. Before the first request, Reflect renders a short probe conversation through `llama-server`'s `/apply-template` endpoint. If the template moves the text, Reflect sends each reply that has both text and tool calls as two consecutive assistant messages. These templates join them into one model turn in the original order. The saved session keeps the reply as one message. A server without the endpoint gets the messages unchanged.
 
 Reflect builds the system prompt for each request from its current instructions, the project's `REFLECT.md`, and the list of project skills. A resumed session therefore follows the current instructions and the current `--linear`, `--no-verify`, and `--thinking` settings.
@@ -59,7 +61,7 @@ Verification tests can exercise a claim that changes after an edit. Start with `
 
 ## Strategic reflection
 
-Reflect watches the actual main-branch tool results of the current task and starts a reflection batch when it sees one of these patterns. The first four look at the latest four results. The last two look at the whole task.
+Reflect watches the actual main-branch tool results of the current task and starts a reflection batch when it sees one of these patterns. The first four look at the latest four results. The other three look at the whole task.
 
 - Two consecutive failures for the same action, or the same failure from two calls to the same tool.
 - Two writes to the same file that leave its bytes unchanged.
@@ -67,12 +69,13 @@ Reflect watches the actual main-branch tool results of the current task and star
 - Three changes to the same file without a successful Bash result between them.
 - Three identical failures from the same call, even with edits between the runs. Fractional numbers such as test durations are ignored when comparing the results.
 - A Bash command that has run at least four times returns a result it already returned earlier, but not the one just before it. This catches edits that go back and forth. The exit code does not matter, because a command such as `python check.py; cat report.txt` exits successfully even when the check fails. Repeating a passing check returns the same result twice in a row and does not count.
+- The model gives a final answer while the latest Bash command still fails and that command has run at least twice in the task. A small model often stopped this way, announcing a next step it never took. A single failed command does not count, because it can be the answer itself, as in checking whether a tool is installed. Instead of ending the turn, Reflect starts a batch and the main branch continues.
 
 ### Reflection batches
 
 Each batch runs three read-only reviewers with different roles. Three parallel slots let the server work on all three at once. On a single slot they run one after another. Reflect saves their branches and adds their proposals to the main conversation in two groups. Evidence-based ideas come from the grounded roles, which inspect the workspace. Unverified ideas come from the other roles.
 
-The main branch then makes one request without tools to choose an idea. It names the reviewer, the observations the idea explains, and its first step. Reflect keeps that plan in the conversation and asks the main branch to carry it out. The instructions ask it to prefer the evidence-based idea that explains the most of what it observed, to try unverified ideas only when the evidence does not settle the question, and not to return to the edits or commands it repeated before the reflection. Without this step, a model without thinking sometimes started with the cheapest idea and went back to its loop even when a reviewer had named the cause. [Results so far](benchmark-plan.md#results-so-far)
+The main branch then makes one request without tools to choose an idea. It states the observations the idea explains and its first step, and then names the reviewer. Naming the reviewer last keeps the label consistent with the plan. When the reviewer came first, a 4B model sometimes named one reviewer and described another's idea. Reflect keeps that plan in the conversation and asks the main branch to carry it out. The instructions ask it to prefer the evidence-based idea that explains the most of what it observed, to try unverified ideas only when the evidence does not settle the question, and not to return to the edits or commands it repeated before the reflection. Without this step, a model without thinking sometimes started with the cheapest idea and went back to its loop even when a reviewer had named the cause. [Results so far](benchmark-plan.md#results-so-far)
 
 The request limit covers the main loop and its forks. Automatic reflection starts only when the budget can cover the reviewers, the decision request, and at least two main requests. If the turn reaches its last request after reflection, it uses that request for a Bash smoke check and reports the observed result. If the model answers in text instead, Reflect returns that answer.
 
@@ -89,7 +92,7 @@ Reviewers that share the same context, tools, and prompt tend to return the same
 | Grounded | Observe | A value the main branch assumes instead of printing | Conversation, tools |
 | Alternative | Known alternative | An established technique or tool for this kind of problem | Summary, tools |
 | Alternative | Switch tools | The same step with a different tool or language | Summary |
-| Alternative | Shrink the problem | A minimal reproduction, a single case, or a bisection | Summary |
+| Alternative | Shrink the problem | A minimal reproduction in a new file, a single case, or a bisection | Summary |
 | Alternative | Premortem | Why the approach being repeated will fail | Conversation |
 | Lateral | Analogy | A field where a problem with the same structure is solved routinely | Summary |
 | Lateral | Naive shortcut | The simplest thing that might work, without proof | Summary |
@@ -97,7 +100,7 @@ Reviewers that share the same context, tools, and prompt tend to return the same
 | Lateral | Backtrack | The earliest decision that led into the dead end | Conversation |
 | Lateral | Ask the user | The one question whose answer would unblock the task | Summary |
 
-The summary holds the task prompt, the reason for reflecting, the latest six main-branch actions with their results, and the names at the workspace root. Each write or edit in it shows an excerpt of what changed, so a reviewer can tell which fixes were already tried. Roles that see only the summary cost one short request and do not inherit the main branch's framing. Roles with tools get one request to inspect the workspace and a second to answer. Existing patterns joins only when the workspace has project skills or Git history. It gets up to six recent Git commit subjects and opens an explicitly mentioned project skill or the workspace's sole skill as a starting point.
+The summary holds the task prompt, the reason for reflecting, the latest six main-branch actions with their results, and the names at the workspace root. Each write or edit in it shows an excerpt of what changed, so a reviewer can tell which fixes were already tried. Roles that see only the summary cost one short request and do not inherit the main branch's framing. Roles with tools get one request to inspect the workspace and a second to answer. The first request sets `tool_choice` to `required` and asks for a check of something the main branch has not looked at yet. Without that, a 4B model's reviewers proposed checks instead of running them. They made 8 tool calls in 30 reflections, and their ideas repeated the main branch's guesses. With the setting, the Observe reviewer read `report.py` in `opaque-report` and found the capitalization bug that the main branch then fixed. Existing patterns joins only when the workspace has project skills or Git history. It gets up to six recent Git commit subjects and opens an explicitly mentioned project skill or the workspace's sole skill as a starting point.
 
 A reflection temperature sets the mix of groups. It starts at 0 for the first batch in a task and rises by one with each further batch, up to 2. It drops back to 0 when a failing command passes or an unchanged file finally changes, and with each new task. `/reflect` uses temperature 2.
 

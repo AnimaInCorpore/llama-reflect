@@ -69,7 +69,7 @@ You can inspect a saved tree with `refl --resume SESSION_ID "/tree"` while the s
 
 ## Tools
 
-The model works with five tools. `read_file` returns up to 80 numbered lines and says where to continue. `grep_search` returns up to 30 matching lines. `write_file` and `edit_file` change UTF-8 text files under the workspace, and `edit_file` requires a unique literal match and adapts inserted line endings to the file. `bash` starts in the workspace and runs commands with your user permissions. The model receives each result as plain text, with an `Error:` or `Exit code:` line when one applies. The terminal lists each call with its command, path, or search pattern.
+The model works with five tools. `read_file` returns up to 80 numbered lines and says where to continue. `grep_search` returns up to 30 matching lines. `write_file` and `edit_file` change UTF-8 text files under the workspace, and `edit_file` requires a unique match. It also accepts a match that differs only in blank lines and trailing spaces, and it adapts inserted line endings to the file. `bash` starts in the workspace and runs commands with your user permissions. The model receives each result as plain text, with an `Error:` or `Exit code:` line when one applies. The terminal lists each call with its command, path, or search pattern.
 
 The file tools protect existing instruction and configuration files of other coding agents: `AGENTS.md`, `AGENTS.override.md`, `CLAUDE.md`, `CLAUDE.local.md`, and `.mcp.json` anywhere in the workspace, and files under `.agents/`, `.claude/`, `.codex/`, and `.pi/` outside their skill directories. Reflect passes the same rule to the model for Bash commands.
 
@@ -87,7 +87,7 @@ refl "Before editing settings.py, emit <verify>settings.py defines MAX_RETRIES</
 
 ## Strategic reflection
 
-Repeated failures, unchanged results, and edits that go back and forth can start a reflection batch. Three read-only reviewers with different roles look at the stall. The first batch in a task looks for causes and evidence. Further stalls in the same task raise a reflection temperature that brings in alternative and lateral roles, such as switching tools, borrowing a mechanism from another field, or questioning a constraint. Each reviewer returns an idea with its basis, the cost of trying it, and the result that would show it failed.
+Repeated failures, unchanged results, edits that go back and forth, and a final answer while a rerun check still fails can start a reflection batch. Three read-only reviewers with different roles look at the stall. The first batch in a task looks for causes and evidence, and reviewers with workspace access must start with a check. Further stalls in the same task raise a reflection temperature that brings in alternative and lateral roles, such as switching tools, borrowing a mechanism from another field, or questioning a constraint. Each reviewer returns an idea with its basis, the cost of trying it, and the result that would show it failed.
 
 Reflect gives the main branch the ideas in two groups, evidence-based and unverified. The main branch then chooses one idea and states its first step before it acts. The terminal shows **Skills** and **Strategy** updates, and `.refl/strategies/<session-id>.md` records the proposals, the plan, and the attempts that follow. [Strategic reflection](docs/design.md#strategic-reflection)
 
@@ -100,7 +100,7 @@ Reflect discovers reusable Markdown skills under `.refl/skills/` and lists them 
 - Reflect sends the whole active conversation with every request and does not trim it yet, so long sessions need a large context window.
 - The file tools read and write UTF-8 text only. Other encodings need Bash.
 - The `bash` tool runs commands with your user permissions, without a sandbox or confirmation. Use a disposable folder or a container for tasks you do not trust.
-- In tests with 27B models, reflection never started on tasks the model solved directly. It helped on a task where the model went in circles. A 4B model stalled more often but gained nothing from reflection, because its reviewers rarely used their tools and it often stopped right after a failed check. [Results so far](docs/benchmark-plan.md#results-so-far)
+- In tests with 27B models, reflection never started on tasks the model solved directly. It helped on a task where the model went in circles. A 4B model stalls more often. With thinking, reflection solved a task that the model never solved alone. Without thinking, it gained nothing, because the model rarely acted on what the reviewers found. [Results so far](docs/benchmark-plan.md#results-so-far)
 
 ## Development
 

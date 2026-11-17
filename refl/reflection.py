@@ -7,10 +7,11 @@ from dataclasses import dataclass
 
 REFLECTION_PROMPT = (
     "You are a read-only reviewer investigating why a coding task stalled. Use the recent tool results as "
-    "evidence and open relevant project skills with read_file. You can inspect the workspace with read_file "
-    "and grep_search. Check your idea against the task's requirements, such as a spec or tests in the "
-    "workspace, and do not propose anything they rule out. Give one concrete next action, the evidence "
-    "behind it, and a check the main branch can run to see progress. Keep your proposal brief."
+    "evidence and open relevant project skills with read_file. Start with a read_file or grep_search call that "
+    "checks something the main branch has not looked at yet, such as a file that the failing command imports "
+    "or reads, or the value it actually uses. Check your idea against the task's requirements, such as a spec "
+    "or tests in the workspace, and do not propose anything they rule out. Give one concrete next action, the "
+    "evidence behind it, and a check the main branch can run to see progress. Keep your proposal brief."
 )
 
 FAILURE, NO_PROGRESS, MANUAL = "failure", "no progress", "manual"
@@ -55,7 +56,8 @@ ROLES = (
          frozenset({FAILURE}), temperature=0.3),
     Role("Shrink the problem", "alternative",
          "Propose a smaller version of the problem to solve first, such as a minimal reproduction, a single "
-         "case, or a bisection over inputs or commits.",
+         "case, or a bisection over inputs or commits. Put the smaller case in a new file and leave the task's "
+         "inputs unchanged.",
          frozenset({FAILURE, NO_PROGRESS}), temperature=0.3),
     Role("Premortem", "alternative",
          "Assume that the approach the main branch keeps trying will fail. Name the most likely reason and the "
@@ -91,7 +93,7 @@ TEMPERATURE_SLOTS = (
     ("grounded", "alternative", "lateral"),
     ("alternative", "lateral", "lateral"),
 )
-_KINDS = {"failure": FAILURE, "diagnostic": FAILURE, "repeated failure": FAILURE,
+_KINDS = {"failure": FAILURE, "diagnostic": FAILURE, "repeated failure": FAILURE, "stopped": FAILURE,
           "unchanged file": NO_PROGRESS, "unchanged result": NO_PROGRESS, "edits": NO_PROGRESS,
           "cycle": NO_PROGRESS}
 
@@ -149,6 +151,8 @@ class StallDetector:
         self.failures = {}
         # Result signatures of each Bash command in the task, to notice edits that go back and forth.
         self.outputs = {}
+        self.runs = {}  # how often each Bash command ran in the task
+        self.last_bash = None
         self.kind = None  # stall kind of the latest report
         self.batches = 0  # reflection batches since the task started or last made progress
         self.used = set()  # role names used in those batches
@@ -158,6 +162,8 @@ class StallDetector:
         self.reported.clear()
         self.failures.clear()
         self.outputs.clear()
+        self.runs.clear()
+        self.last_bash = None
         self.kind = None
         self.batches = 0
         self.used.clear()
@@ -211,7 +217,17 @@ class StallDetector:
             self.failures.pop(observation.action, None)
         if name == "bash":
             self.outputs.setdefault(observation.action, []).append(signature)
+            self.runs[observation.action] = self.runs.get(observation.action, 0) + 1
+            self.last_bash = observation
         self.recent.append(observation)
+
+    def stopped(self):
+        """Report a final answer given while a command the main branch ran again still fails."""
+        latest = self.last_bash
+        if latest is None or not latest.failed or self.runs.get(latest.action, 0) < 2:
+            return None
+        return self._report(("stopped", latest.action, _result_signature(latest.result)),
+                            f"The main branch gave a final answer while {latest.subject} still fails.")
 
     def stall(self):
         recent = list(self.recent)

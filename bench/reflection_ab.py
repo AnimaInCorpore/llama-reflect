@@ -745,6 +745,12 @@ def analyse(tree):
         if message["role"] == "assistant":
             for call in message.get("tool_calls") or []:
                 calls[call["id"]] = call["function"]
+            text = str(message.get("content") or "")
+            # A text reply other than a plan or a verification request ends the turn, so the stopped rule applies.
+            final = (not message.get("tool_calls") and "<verify>" not in text
+                     and not text.startswith(("Plan: try", "I will follow the reflection results")))
+            if final and first_stall is None and (reason := detector.stopped()):
+                first_stall = {"after_tool_results": results, "reason": reason}
         elif message["role"] == "tool":
             try:
                 result = json.loads(message["content"])

@@ -52,6 +52,7 @@ TOOLS = [
 
 _TYPES = {"string": str, "integer": int}
 _OUTPUT_LIMIT = 12000
+_LINE_NUMBER = re.compile(r"\s*\d+: ")  # the prefix read_file puts on each line
 _OTHER_AGENT_FILES = {"agents.md", "agents.override.md", "claude.md", "claude.local.md", ".mcp.json"}
 _OTHER_AGENT_DIRS = {".agents", ".claude", ".codex", ".pi"}
 
@@ -300,7 +301,17 @@ class WorkspaceTools:
         old_lines = old_text.replace("\r\n", "\n").split("\n")
         pattern = re.compile(r"\r?\n".join(re.escape(line) for line in old_lines))
         match = pattern.search(text)
+        note = ""
         if match is None:
+            # Models often copy a block with a different number of blank lines or trailing spaces. Accept a
+            # unique match that differs only in those. Indentation must still match.
+            lines = [line.rstrip() for line in old_lines if line.strip()]
+            pattern = re.compile(r"[ \t]*\r?\n(?:[ \t]*\r?\n)*".join(re.escape(line) for line in lines))
+            match = pattern.search(text) if lines else None
+            note = " old_text matched after ignoring blank lines and trailing spaces."
+        if match is None:
+            if all(_LINE_NUMBER.match(line) for line in old_lines if line.strip()):
+                raise ValueError("old_text was not found. Leave out the line numbers that read_file adds.")
             raise ValueError("old_text was not found. Read the current file before retrying.")
         if pattern.search(text, match.start() + 1) is not None:
             raise ValueError("old_text matches more than once. Include more surrounding text.")
@@ -311,4 +322,4 @@ class WorkspaceTools:
         if updated == text:
             return {"output": f"No change needed in {path}", "changed": False}
         _replace_file(target, updated.encode("utf-8"), expected=original)
-        return {"output": f"Edited {path}", "changed": True}
+        return {"output": f"Edited {path}.{note}" if note else f"Edited {path}", "changed": True}

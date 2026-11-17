@@ -58,7 +58,7 @@ class LlamaClient:
         return prompt
 
     async def complete(self, model, messages, tools, max_tokens, *, response_format=None, temperature=0.0,
-                       thinking=True):
+                       thinking=True, tool_choice=None):
         payload = {
             "model": model,
             "messages": messages,
@@ -68,6 +68,8 @@ class LlamaClient:
         }
         if response_format is not None:
             payload["response_format"] = response_format
+        if tool_choice is not None:
+            payload["tool_choice"] = tool_choice
         if not thinking:
             # Chat templates with a thinking mode, such as Qwen3's, read this flag. Others ignore it.
             payload["chat_template_kwargs"] = {"enable_thinking": False}

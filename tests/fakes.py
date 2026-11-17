@@ -35,7 +35,7 @@ class FakeServer:
         return "\n".join(parts + after)
 
     async def complete(self, model, messages, tools, max_tokens, *, response_format=None, temperature=0.0,
-                       thinking=True):
+                       thinking=True, tool_choice=None):
         self.requests.append({
             "system": messages[0]["content"],
             "messages": messages,
@@ -43,6 +43,7 @@ class FakeServer:
             "response_format": response_format,
             "temperature": temperature,
             "thinking": thinking,
+            "tool_choice": tool_choice,
         })
         if not self.replies:
             raise AssertionError("Unexpected model request")

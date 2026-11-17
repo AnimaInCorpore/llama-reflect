@@ -96,6 +96,20 @@ class StallDetectorTest(unittest.TestCase):
         self.assertIsNone(self.cycle("1 failed"))
         self.assertIsNone(self.cycle("1 failed"))
 
+    def test_final_answer_while_a_rerun_check_fails(self):
+        self.record("bash", {"command": "pytest"}, {"exit_code": 1, "output": "2 failed"})
+        self.assertIsNone(self.detector.stopped())  # a single failed command may be the answer itself
+        self.assertIsNone(self.cycle("1 failed"))
+        self.assertEqual(self.detector.stopped(), "The main branch gave a final answer while pytest still fails.")
+        self.assertEqual(self.detector.kind, FAILURE)
+        self.assertIsNone(self.detector.stopped())  # reported once
+
+    def test_final_answer_after_the_check_passes(self):
+        self.record("bash", {"command": "pytest"}, {"exit_code": 1, "output": "1 failed"})
+        self.record("bash", {"command": "pytest"}, {"exit_code": 0, "output": "1 passed"})
+        self.record("bash", {"command": "git status"}, {"exit_code": 0, "output": "clean"})
+        self.assertIsNone(self.detector.stopped())
+
 
 if __name__ == "__main__":
     unittest.main()

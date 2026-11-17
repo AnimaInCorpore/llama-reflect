@@ -120,9 +120,12 @@ class EngineTest(unittest.TestCase):
                       "- Switch tools: Edit the bytes with Python. Basis: UTF-8 tools fail. Cost: one command. "
                       "Fails if: the file stays unchanged.", results)
 
+        explore = [request for request in server.requests if request["tools"] == ["read_file", "grep_search"]]
+        self.assertEqual([request["tool_choice"] for request in explore], ["required", "required"])
         choice = next(request for request in server.requests if request["response_format"]
                       and "role" in request["response_format"]["schema"]["properties"])
         self.assertEqual(choice["tools"], [])
+        self.assertEqual(list(choice["response_format"]["schema"]["properties"]), ["reason", "first_step", "role"])
         self.assertEqual(choice["response_format"]["schema"]["properties"]["role"]["enum"],
                          ["Diagnosis", "Observe", "Switch tools"])
         main = [node.message["content"] for node in engine.tree.nodes if node.branch_type == "main"]
@@ -130,6 +133,28 @@ class EngineTest(unittest.TestCase):
                       "First step: Run the check.", main)
         self.assertEqual(main[main.index(next(m for m in main if str(m).startswith("Plan:"))) + 1],
                          "Carry out the plan now, starting with its first step.")
+
+    def test_final_answer_while_the_check_fails_starts_reflection(self):
+        check = "echo FAILED; exit 1"
+        idea = text(json.dumps({"proposal": "Run it with -v", "basis": "more output", "cost": "one command",
+                                "fails_if": "no new output"}))
+        replies = [call("bash", command=check), call("write_file", path="a.txt", content="x"),
+                   call("bash", command=check), text("The environment must be broken."),
+                   text("Read the imported module."), text("Print sys.path."), idea, decision("Diagnosis"),
+                   text("Done.")]
+        engine, server, events = make_engine(self.root, replies, verification=False)
+        self.assertEqual(asyncio.run(engine.respond("Make the check pass.")), "Done.")
+        self.assertFalse(server.replies)
+        main = [str(node.message.get("content")) for node in engine.tree.nodes if node.branch_type == "main"]
+        stop = main.index("The environment must be broken.")
+        self.assertTrue(main[stop + 1].startswith(
+            f"Reflection results\nObserved stall: The main branch gave a final answer while {check} still fails."))
+
+    def test_final_answer_after_one_failed_command_ends_the_turn(self):
+        engine, server, _ = make_engine(self.root, [call("bash", command="command -v nothere"),
+                                                    text("It is not installed.")], verification=False)
+        self.assertEqual(asyncio.run(engine.respond("Is nothere installed?")), "It is not installed.")
+        self.assertEqual(len(server.requests), 2)
 
     def test_unusable_decision_still_continues(self):
         replies = [call("read_file", path="missing.txt"), call("read_file", path="missing.txt")]
