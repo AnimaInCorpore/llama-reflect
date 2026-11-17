@@ -27,6 +27,8 @@ Reflect sends the whole active conversation with every request, so give the serv
 
 A reasoning model can spend several thousand tokens thinking before it answers. If a reply stops with "Completion reached its token limit", raise `--max-tokens` or use `--thinking`.
 
+Some chat templates, such as Gemma 4's, place an assistant's text after the results of its tool calls. Reflect checks the server's template once per session through `/apply-template` and adjusts the messages it sends when needed. [The coding loop](docs/design.md#the-coding-loop)
+
 ## Run
 
 Start Reflect from the root of the project you want to work on. Reflect uses that directory for its tools, sessions, and skills. An empty directory works.
@@ -54,7 +56,7 @@ Omit the prompt for an interactive session, and type `/exit` or send EOF to quit
 
 Set `LLAMA_API_KEY` if the server requires authentication.
 
-`--thinking` sends `chat_template_kwargs` with `enable_thinking`, which Qwen3-style templates read and other templates ignore. Without thinking, a reasoning model answers much faster and uses fewer tokens, but it may plan less carefully. `--thinking main` keeps thinking for the main branch, which decides what to do, and skips it for the forks.
+`--thinking` sends `chat_template_kwargs` with `enable_thinking`, which Qwen3 and Gemma 4 templates read and other templates ignore. Without thinking, a reasoning model answers much faster and uses fewer tokens, but it may plan less carefully. `--thinking main` keeps thinking for the main branch, which decides what to do, and skips it for the forks.
 
 ## Interactive commands
 
@@ -67,7 +69,7 @@ You can inspect a saved tree with `refl --resume SESSION_ID "/tree"` while the s
 
 ## Tools
 
-The model works with five tools. `read_file` returns up to 80 numbered lines and says where to continue. `grep_search` returns up to 30 matching lines. `write_file` and `edit_file` change UTF-8 text files under the workspace, and `edit_file` requires a unique literal match and adapts inserted line endings to the file. `bash` starts in the workspace and runs commands with your user permissions. The terminal lists each call with its command, path, or search pattern.
+The model works with five tools. `read_file` returns up to 80 numbered lines and says where to continue. `grep_search` returns up to 30 matching lines. `write_file` and `edit_file` change UTF-8 text files under the workspace, and `edit_file` requires a unique literal match and adapts inserted line endings to the file. `bash` starts in the workspace and runs commands with your user permissions. The model receives each result as plain text, with an `Error:` or `Exit code:` line when one applies. The terminal lists each call with its command, path, or search pattern.
 
 The file tools protect existing instruction and configuration files of other coding agents: `AGENTS.md`, `AGENTS.override.md`, `CLAUDE.md`, `CLAUDE.local.md`, and `.mcp.json` anywhere in the workspace, and files under `.agents/`, `.claude/`, `.codex/`, and `.pi/` outside their skill directories. Reflect passes the same rule to the model for Bash commands.
 
@@ -98,7 +100,7 @@ Reflect discovers reusable Markdown skills under `.refl/skills/` and lists them 
 - Reflect sends the whole active conversation with every request and does not trim it yet, so long sessions need a large context window.
 - The file tools read and write UTF-8 text only. Other encodings need Bash.
 - The `bash` tool runs commands with your user permissions, without a sandbox or confirmation. Use a disposable folder or a container for tasks you do not trust.
-- In tests with 27B models, reflection never started on tasks the model solved directly. It helped on a task where the model went in circles. [Results so far](docs/benchmark-plan.md#results-so-far)
+- In tests with 27B models, reflection never started on tasks the model solved directly. It helped on a task where the model went in circles. A 4B model stalled more often but gained nothing from reflection, because its reviewers rarely used their tools and it often stopped right after a failed check. [Results so far](docs/benchmark-plan.md#results-so-far)
 
 ## Development
 

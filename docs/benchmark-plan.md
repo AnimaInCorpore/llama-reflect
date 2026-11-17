@@ -57,6 +57,23 @@ These runs used two 27B models on a single-slot `llama-server` at temperature 0 
 
 With thinking enabled, one reply of the same model needed more than 8192 output tokens. Raise `--max-tokens` for reasoning models.
 
+### A 4B model
+
+Gemma 4 E4B (UD-Q8_K_XL) ran all six tasks in natural mode with a budget of 30 requests: three repeats without thinking and two with it. Unlike the 27B models, it stalls by itself on three tasks.
+
+| Version | Thinking | Linear | Reflect |
+| --- | --- | --- | --- |
+| Before the message changes | off | 12/18 | 9/18 |
+| Plain-text tool results and the template check | off | 12/18 | 12/18 |
+| Plain-text tool results and the template check | on | 8/12 | 8/12 |
+
+- **`latin1-config`, `slow-paths`, `invoice-rates`.** Solved in every run of both arms without a stall.
+- **`stale-build`.** Before the message changes, the model repeated each call it had announced in text, and its edits of `build.py` contained `\"` copied from the JSON tool results. In the reflect arm, the first reflection found the cache bug, and the failed edits then started a second reflection that lost the finding. After the changes, every run was solved in 8 to 10 requests without a stall. [The coding loop](design.md#the-coding-loop)
+- **`shadowed-module`.** Never solved. The model rewrote `slugify` correctly several times and concluded that the environment ran a stale file. It never opened `testsupport.py`, which the test imports first. The Diagnosis reviewer suspected that a different `app.py` ran but did not check. In all 30 reflections of these runs, the reviewers made eight tool calls, all reads of the file being edited.
+- **`opaque-report`.** Never solved, but after the changes the report had one or two wrong lines instead of nine or more. The model stopped with a final answer after a failed check instead of going in circles, so few stall rules fired. In one run with thinking, the main branch followed a Shrink the problem idea and replaced `sales.csv`, which the task forbids.
+
+After the changes, 16 of the 20 failed runs ended with a final answer right after a failed tool result. Stall detection does not cover that pattern yet.
+
 ## Larger study
 
 ### Benchmark sequence

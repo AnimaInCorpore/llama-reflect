@@ -4,6 +4,10 @@
 
 `refl` sends the active conversation to the OpenAI-compatible chat endpoint in `llama-server`. The model can inspect UTF-8 files with `read_file` and `grep_search`, run Bash commands with `bash`, and make changes with `write_file` and `edit_file`. Reflect executes calls in the order they appear and returns each observation with the corresponding tool call ID. The terminal lists each call with its command, path, or search pattern. The model continues until it returns a final answer or reaches the request limit.
 
+The session stores each tool result as JSON. Requests give it to the model as plain text: the output, preceded by an `Error:` or `Exit code:` line when present. In a JSON string, file contents carry escapes such as `\"` and `\n`. A 4B model copied those escapes into `edit_file` arguments, which then did not match the file. With plain-text results, its replayed edits matched the file in 24 of 34 cases instead of 9 of 41.
+
+Some chat templates, such as Gemma 4's, render an assistant's text after the results of its tool calls and close the turn there. The model then reads its stated plan after the result and repeats the call. Before the first request, Reflect renders a short probe conversation through `llama-server`'s `/apply-template` endpoint. If the template moves the text, Reflect sends each reply that has both text and tool calls as two consecutive assistant messages. These templates join them into one model turn in the original order. The saved session keeps the reply as one message. A server without the endpoint gets the messages unchanged.
+
 Reflect builds the system prompt for each request from its current instructions, the project's `REFLECT.md`, and the list of project skills. A resumed session therefore follows the current instructions and the current `--linear`, `--no-verify`, and `--thinking` settings.
 
 The CLI and file tools use Python filesystem APIs on all platforms. PowerShell and MSYS2 launch the same CLI. The `bash` tool invokes Bash from the workspace directory. On Windows, Bash can come from MSYS2 or Git for Windows. `rg` is an external executable used by `grep_search` on all four target platforms.

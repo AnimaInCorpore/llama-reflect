@@ -135,7 +135,8 @@ def _call_summary(function):
 
 
 def _excerpt(value, limit):
-    text = json.dumps(str(value or ""), ensure_ascii=False)[1:-1]
+    # Keep quotes and backslashes as they are, so a model that copies the text gets the file's characters.
+    text = str(value or "").replace("\r", "\\r").replace("\n", "\\n")
     return text if len(text) <= limit else text[:limit - 3] + "..."
 
 
@@ -177,6 +178,55 @@ def _tool_calls(message):
     return calls
 
 
+def tool_text(content):
+    """Show a stored JSON tool result to the model as plain text.
+
+    Sessions keep tool results as JSON. In a JSON string, file contents appear with escapes such as \\" and \\n,
+    and models copy those escapes into edits that then do not match the file.
+    """
+    try:
+        result = json.loads(content)
+    except (TypeError, ValueError):
+        return content
+    if not isinstance(result, dict) or not result or not set(result) <= {"output", "error", "exit_code", "changed"}:
+        return content
+    lines = []
+    if "error" in result:
+        lines.append(f"Error: {result['error']}")
+    if "exit_code" in result:
+        lines.append(f"Exit code: {result['exit_code']}")
+    if "output" in result:
+        lines.append(str(result["output"]))
+    return "\n".join(lines)
+
+
+def split_text_and_calls(messages):
+    """Send an assistant's text and its tool calls as two consecutive assistant messages."""
+    split = []
+    for message in messages:
+        if message["role"] == "assistant" and message.get("tool_calls") and str(message.get("content") or "").strip():
+            split.append({key: value for key, value in message.items() if key != "tool_calls"})
+            split.append({"role": "assistant", "content": None, "tool_calls": message["tool_calls"]})
+        else:
+            split.append(message)
+    return split
+
+
+# Some chat templates, such as Gemma 4's, render an assistant's text after the results of its tool calls and then
+# close the turn. The model then sees its plan after the result and repeats the call. Rendering this probe through
+# /apply-template shows whether the server's template does that.
+_PROBE_TEXT = "reflect-probe-text"
+_PROBE_RESULT = "reflect-probe-result"
+_TEMPLATE_PROBE = [
+    {"role": "user", "content": "Read probe.txt."},
+    {"role": "assistant", "content": _PROBE_TEXT, "tool_calls": [{
+        "id": "probe", "type": "function",
+        "function": {"name": "read_file", "arguments": json.dumps({"path": "probe.txt"})},
+    }]},
+    {"role": "tool", "tool_call_id": "probe", "content": _PROBE_RESULT},
+]
+
+
 class Engine:
     def __init__(self, server, model, workspace, tree, max_turns, max_tokens, on_tool, *, forks=True,
                  verification=True, thinking="auto"):
@@ -199,6 +249,8 @@ class Engine:
         self.strategy_path = f".refl/strategies/{tree.path.stem}.md"
         # Verdicts from the current task, reused until a main-branch command or write can change the evidence.
         self.verdicts = {}
+        # Whether the chat template moves an assistant's text after its tool results. Checked on the first request.
+        self.split_text = None
 
     def _messages(self, leaf, *, system_prompt=None):
         messages = self.tree.messages(leaf)
@@ -234,7 +286,7 @@ class Engine:
                 for call in message.get("tool_calls") or []:
                     functions[call["id"]] = call["function"]
             elif message["role"] == "tool" and message.get("tool_call_id") in functions:
-                result = " ".join(str(message.get("content", "")).split())
+                result = " ".join(str(tool_text(message.get("content", ""))).split())
                 actions.append(f"- {_action(functions[message['tool_call_id']])}\n  {result[:300]}")
         parts = [f"Task: {task[:1500]}", f"Reflection reason: {reason}"]
         if actions:
@@ -250,9 +302,24 @@ class Engine:
                 raise TurnLimitError("No model requests remain for this step.")
             self.requests_left -= 1
         thinking = self.thinking == "auto" or (self.thinking == "main" and not fork)
+        if self.split_text is None:
+            self.split_text = await self._template_moves_text()
+        messages = [{**message, "content": tool_text(message.get("content"))} if message["role"] == "tool"
+                    else message for message in messages]
+        if self.split_text:
+            messages = split_text_and_calls(messages)
         return await self.server.complete(self.model, messages, tools, self.max_tokens,
                                           response_format=response_format, temperature=temperature,
                                           thinking=thinking)
+
+    async def _template_moves_text(self):
+        """Check whether the server's chat template renders an assistant's text after its tool results."""
+        try:
+            prompt = await self.server.apply_template(_TEMPLATE_PROBE, TOOLS)
+        except ServerError:
+            return False
+        result = prompt.find(_PROBE_RESULT)
+        return 0 <= result < prompt.find(_PROBE_TEXT)
 
     def _strategy_event(self, text):
         self.strategy_sections.append(text)

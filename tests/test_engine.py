@@ -4,7 +4,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from refl.engine import _call_summary
+from refl.engine import _call_summary, tool_text
 
 from .fakes import call, decision, make_engine, text, verdict
 
@@ -143,13 +143,13 @@ class EngineTest(unittest.TestCase):
     def test_brief_shows_what_writes_changed(self):
         engine, _, _ = make_engine(self.root, [
             call("write_file", path="a.txt", content="alpha\nbeta"),
-            call("edit_file", path="a.txt", old_text="beta", new_text="gamma"),
+            call("edit_file", path="a.txt", old_text="beta", new_text='say("gamma")'),
             text("ok"),
         ])
         asyncio.run(engine.respond("Write a.txt."))
         brief = engine._brief(engine.tree.head, "A reason.")
-        self.assertIn("- write_file a.txt (content: alpha\\nbeta)\n", brief)
-        self.assertIn('- edit_file a.txt (replaced "beta" with "gamma")\n', brief)
+        self.assertIn("- write_file a.txt (content: alpha\\nbeta)\n  Wrote a.txt\n", brief)
+        self.assertIn('- edit_file a.txt (replaced "beta" with "say("gamma")")\n  Edited a.txt', brief)
 
     def test_thinking_modes(self):
         replies = [text(_CLAIM), call("read_file", path="status.txt"), verdict(), text("Done.")]
@@ -166,6 +166,44 @@ class EngineTest(unittest.TestCase):
         strategies = self.root / ".refl" / "strategies"
         self.assertEqual((strategies / ".gitignore").read_text(encoding="utf-8"), "*\n")
         self.assertTrue((self.root / engine.strategy_path).is_file())
+
+    def test_tool_results_reach_the_model_as_plain_text(self):
+        (self.root / "quote.py").write_text('print("hi")\n', encoding="utf-8")
+        engine, server, _ = make_engine(self.root, [
+            call("read_file", path="quote.py"),
+            call("bash", command="exit 3"),
+            text("Done."),
+        ], forks=False)
+        asyncio.run(engine.respond("Read quote.py."))
+        sent = [message["content"] for message in server.requests[-1]["messages"] if message["role"] == "tool"]
+        self.assertEqual(sent[0], '1: print("hi")')
+        self.assertTrue(sent[1].startswith("Exit code: 3"))
+        stored = [node.message["content"] for node in engine.tree.nodes if node.message["role"] == "tool"]
+        self.assertEqual(json.loads(stored[0]), {"output": '1: print("hi")'})
+
+    def test_tool_text(self):
+        self.assertEqual(tool_text(json.dumps({"error": "Bash timed out", "output": "partial"})),
+                         "Error: Bash timed out\npartial")
+        self.assertEqual(tool_text(json.dumps({"output": "Edited a.txt", "changed": True})), "Edited a.txt")
+        unknown = json.dumps({"rows": 3})
+        self.assertEqual(tool_text(unknown), unknown)
+        self.assertEqual(tool_text("plain"), "plain")
+
+    def test_text_and_calls_are_split_only_for_templates_that_move_text(self):
+        planned = {**call("read_file", path="status.txt"), "content": "I will read status.txt."}
+        for moves_text, split in ((True, True), (False, False), (None, False)):
+            engine, server, _ = make_engine(self.root, [dict(planned), text("Done.")], forks=False,
+                                            moves_text=moves_text)
+            asyncio.run(engine.respond("Check the status."))
+            assistant = [message for message in server.requests[-1]["messages"] if message["role"] == "assistant"]
+            if split:
+                self.assertEqual([message["content"] for message in assistant], ["I will read status.txt.", None])
+                self.assertEqual([bool(message.get("tool_calls")) for message in assistant], [False, True])
+            else:
+                self.assertEqual(len(assistant), 1, moves_text)
+            self.assertEqual(server.template_requests, 1)
+            stored = next(node.message for node in engine.tree.nodes if node.message["role"] == "assistant")
+            self.assertEqual((stored["content"], len(stored["tool_calls"])), ("I will read status.txt.", 1))
 
 
 if __name__ == "__main__":

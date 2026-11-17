@@ -48,6 +48,15 @@ class LlamaClient:
             raise ServerError("Unexpected /slots response")
         return len(slots), sum(slot["is_processing"] for slot in slots)
 
+    async def apply_template(self, messages, tools):
+        """Render messages with the server's chat template without running the model."""
+        data = await self._request("POST", "/apply-template", json={"messages": messages, "tools": tools},
+                                   timeout=30)
+        prompt = data.get("prompt") if isinstance(data, dict) else None
+        if not isinstance(prompt, str):
+            raise ServerError("Unexpected /apply-template response")
+        return prompt
+
     async def complete(self, model, messages, tools, max_tokens, *, response_format=None, temperature=0.0,
                        thinking=True):
         payload = {
