@@ -106,7 +106,7 @@ Reflect discovers reusable Markdown skills under `.refl/skills/` and lists them 
 
 Run the offline tests from this checkout with `python -m unittest`. They use a scripted model and need no server.
 
-`python bench/reflection_ab.py` runs paired tasks with and without reflection against a live server. `prototype.py` is an early probe that checks whether the server runs two tool-calling branches at the same time.
+`python bench/reflection_ab.py` runs paired tasks with and without reflection against a live server. `python bench/polyglot.py --polyglot PATH` runs the Python exercises of a local clone of Aider's Polyglot benchmark the same way. `prototype.py` is an early probe that checks whether the server runs two tool-calling branches at the same time.
 
 - [Design](docs/design.md)
 - [Project skills and tool discovery](docs/project-skills.md)

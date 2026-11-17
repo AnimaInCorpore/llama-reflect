@@ -95,6 +95,21 @@ Gemma 4 E4B (UD-Q8_K_XL) ran all six tasks in natural mode with a budget of 30 r
 
 Before the stopped rule, 16 of the 20 failed runs with the message changes ended with a final answer right after a failed tool result. The rule turns that answer into a reflection in the reflect arm.
 
+## Polyglot pilot
+
+`bench/polyglot.py` runs the 34 Python exercises of Aider's Polyglot benchmark from a local clone of [Aider-AI/polyglot-benchmark](https://github.com/Aider-AI/polyglot-benchmark). They need only Python's `unittest`. The other languages need Go, Rust, a C++ toolchain, Gradle, or npm packages. Each run gets a fresh workspace with the exercise's stub, its tests, and its instructions from `.docs/`. The reference solution in `.meta/` and the worked approaches in `.approaches/` stay out. The prompt asks for an implementation that passes the tests, keeps the existing names, uses only the standard library, and leaves the tests unchanged. Grading restores the original test files and runs them once more.
+
+Reflect works as an agent here, so it can read and run the tests within its request budget. Aider's published protocol instead gives the model the instructions and the stub, then one more try with the test output. The scores therefore measure Reflect's own setup and are not comparable to Aider's leaderboard.
+
+```text
+python bench/polyglot.py --polyglot PATH --validate
+python bench/polyglot.py --polyglot PATH --sample 10 --seed 1 --thinking off
+```
+
+`--validate` checks that each stub fails its tests and each reference solution passes them. `--sample` picks a fixed random sample, and `--exercises` names exercises explicitly.
+
+The first pilot ran Qwen3.8-Flash-Next (IQ3_S) on llama.cpp b12465 without thinking, with 30 requests per run, on a sample of ten exercises with seed 1: `bottle-song`, `bowling`, `food-chain`, `grep`, `list-ops`, `paasio`, `phone-number`, `proverb`, `scale-generator`, and `two-bucket`. Both arms solved nine of ten, each in 5 to 12 requests without a stall, and the pilot took 23 minutes. Both arms failed `bowling`, whose strike bonuses in the last frame are the hard part. Without reflection, 8 of 31 tests still failed when the budget ran out. With reflection, the detector noticed that the test command returned to an earlier result. The reviewers proposed running the failing tests one at a time to read their real tracebacks, and the run ended with 4 failing tests. The model had piped the final test run through `tail`, so the smoke check reported exit code 0 although tests still failed. One exercise per arm is too little to compare the arms. The next step is all 34 Python exercises with repeats.
+
 ## Larger study
 
 ### Benchmark sequence
