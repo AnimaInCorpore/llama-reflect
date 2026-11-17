@@ -119,20 +119,26 @@ class StallDetectorTest(unittest.TestCase):
 
     def test_wandering_while_a_check_fails(self):
         self.record("bash", {"command": "python check.py"}, {"exit_code": 1, "output": "FAILED"})
-        reasons = self.explore(14)
-        self.assertEqual(reasons[:-1], [None] * 13)
-        self.assertEqual(reasons[-1], "15 tool calls in a row changed no file while python check.py still fails.")
+        reasons = self.explore(9)
+        self.assertEqual(reasons[:-1], [None] * 8)
+        self.assertEqual(reasons[-1], "10 tool calls in a row changed no file while python check.py still fails.")
         self.assertEqual(self.detector.kind, NO_PROGRESS)
+
+    def test_a_piped_test_run_still_counts_as_failing(self):
+        # `| tail` exits successfully, so the failure shows only in the test runner's summary.
+        command = "python -m unittest pov_test 2>&1 | tail -5"
+        self.record("bash", {"command": command}, {"exit_code": 0, "output": "Ran 15 tests\n\nFAILED (failures=10)\n"})
+        self.assertEqual(self.explore(9)[-1], f"10 tool calls in a row changed no file while {command} still fails.")
 
     def test_exploring_without_a_failure_is_not_a_stall(self):
         self.assertEqual(self.explore(20), [None] * 20)
 
     def test_a_file_change_restarts_the_count(self):
         self.record("bash", {"command": "python check.py"}, {"exit_code": 1, "output": "FAILED"})
-        self.explore(10)
+        self.explore(5)
         self.record("write_file", {"path": "report.py"}, {"output": "Wrote report.py", "changed": True})
-        self.assertEqual(self.explore(14, start=10), [None] * 14)
-        self.assertIsNotNone(self.explore(1, start=24)[0])
+        self.assertEqual(self.explore(9, start=5), [None] * 9)
+        self.assertIsNotNone(self.explore(1, start=14)[0])
 
     def test_final_answer_after_the_check_passes(self):
         self.record("bash", {"command": "pytest"}, {"exit_code": 1, "output": "1 failed"})

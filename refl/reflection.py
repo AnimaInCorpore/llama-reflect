@@ -130,8 +130,14 @@ def choose_roles(level, kind, used=frozenset(), unavailable=frozenset()):
 
 _FILE_WRITES = {"write_file", "edit_file"}
 # Tool results in a row without a file change, while a failing command is unresolved, that count as a stall.
-# Solved runs of the benchmark went at most 10. A run that tried new scripts against a hash went 26.
-_QUIET_LIMIT = 15
+# Replayed over 471 benchmark runs, 10 fired in no solved run and early enough for a reflection in 21 failed
+# ones. 15 caught 9 in time, and 8 also fired in 13 solved runs.
+_QUIET_LIMIT = 10
+# Summaries that test runners and Python print. A piped command such as `pytest | tail` exits successfully
+# even when the tests fail.
+_FAILURE_REPORT = re.compile(
+    r"^FAILED\b|^Traceback \(most recent call last\)|\b[1-9]\d* failed\b|^--- FAIL|^FAIL\s|test result: FAILED",
+    re.MULTILINE)
 _FRACTIONAL = re.compile(r"\d+\.\d+")
 
 
@@ -158,6 +164,12 @@ class _Observation:
     @property
     def failed(self):
         return "error" in self.result or self.result.get("exit_code", 0) != 0
+
+    @property
+    def reports_failure(self):
+        """A failure by exit code, or one that a test runner or Python reports in the output."""
+        output = self.result.get("output")
+        return self.failed or (isinstance(output, str) and bool(_FAILURE_REPORT.search(output)))
 
 
 class StallDetector:
@@ -244,7 +256,7 @@ class StallDetector:
             self.outputs.setdefault(observation.action, []).append(signature)
             self.runs[observation.action] = self.runs.get(observation.action, 0) + 1
             self.last_bash = observation
-            if observation.failed:
+            if observation.reports_failure:
                 self.unresolved = observation
             elif self.unresolved is not None and self.unresolved.action == observation.action:
                 self.unresolved = None
@@ -254,7 +266,7 @@ class StallDetector:
     def stopped(self):
         """Report a final answer given while a command the main branch ran again still fails."""
         latest = self.last_bash
-        if latest is None or not latest.failed or self.runs.get(latest.action, 0) < 2:
+        if latest is None or not latest.reports_failure or self.runs.get(latest.action, 0) < 2:
             return None
         return self._report(("stopped", latest.action, _result_signature(latest.result)),
                             f"The main branch gave a final answer while {latest.subject} still fails.")
