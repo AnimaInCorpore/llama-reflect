@@ -46,6 +46,8 @@ import subprocess
 import sys
 import tempfile
 import time
+import unicodedata
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from decimal import ROUND_HALF_UP, Decimal
@@ -104,6 +106,23 @@ class Task:
     # Main-branch tool calls for --seeded runs, as (tool name, arguments). The last call must trigger
     # the stall detector and no earlier call may.
     stall: list = field(default_factory=list)
+    # Environment variables for the run, such as an output encoding that keeps a trap the same on all platforms.
+    env: dict = field(default_factory=dict)
+
+
+@contextmanager
+def task_env(task):
+    """Set the task's environment variables for the duration of a run. The bash tool inherits them."""
+    saved = {name: os.environ.get(name) for name in task.env}
+    os.environ.update(task.env)
+    try:
+        yield
+    finally:
+        for name, value in saved.items():
+            if value is None:
+                os.environ.pop(name, None)
+            else:
+                os.environ[name] = value
 
 
 # Task 1: the test imports a stale vendored copy, so edits to app.py do not change the failure.
@@ -650,7 +669,575 @@ def _check_report(ws):
     return True, "report.txt follows SPEC.md for both datasets"
 
 
-TASKS = {task.name: task for task in (_SHADOWED, _STALE, _LATIN1, _SLOW, _REPORT, _RATES)}
+# Task 7: an evidence stall. Some names are stored decomposed (NFD) in one file and composed (NFC) in the
+# other, so two names that print identically, even with repr(), do not compare equal. Case and whitespace
+# fixes leave the first failure unchanged. Matching needs Unicode normalization. The hidden dataset has
+# Hangul, which NFD splits into jamo, and two different people named René and Rene, so stripping accents
+# fails.
+
+def _nfd(text):
+    return unicodedata.normalize("NFD", text)
+
+
+def _name_key(name):
+    return unicodedata.normalize("NFC", unicodedata.normalize("NFC", name).casefold()).strip()
+
+
+_CUSTOMERS = (
+    "id,name,city\n"
+    "C01,Anna Berg,Bonn\n"
+    f"C02,{_nfd('Zoë Müller')},Köln\n"
+    f"C03,{_nfd('José Núñez')},Madrid\n"
+    "C04,Lars Strauß,Wien\n"
+    "C05,Chloé Dubois,Lyon\n"
+    f"C06,{_nfd('Ana Lucía Peña')},Lima\n"
+)
+_ORDERS = (
+    "order,customer,amount\n"
+    "1001,Anna Berg,120.00\n"
+    "1002,Zoë Müller,75.50\n"
+    "1003,José Núñez,210.00\n"
+    "1004,LARS STRAUSS,99.90\n"
+    f"1005,{_nfd('Chloé Dubois')},15.00\n"
+    "1006,Ana Lucía Peña,60.00\n"
+    "1007,anna berg,30.00\n"
+    "1008,Zoë Müller,12.25\n"
+)
+_HIDDEN_CUSTOMERS = (
+    "id,name,city\n"
+    f"H01,{_nfd('René Lefèvre')},Paris\n"
+    "H02,Rene Lefevre,Quebec\n"
+    "H03,Björk Guðmundsdóttir,Reykjavik\n"
+    f"H04,{_nfd('김민준')},Seoul\n"
+    f"H05,{_nfd('Mårten Ångström')},Uppsala\n"
+)
+_HIDDEN_ORDERS = (
+    "order,customer,amount\n"
+    "2001,René Lefèvre,10.00\n"
+    "2002,rene lefevre,20.00\n"
+    "2003,BJÖRK GUÐMUNDSDÓTTIR,30.00\n"
+    "2004,김민준,40.00\n"
+    "2005,mårten ångström,50.00\n"
+    "2006,Unknown Person,60.00\n"
+    f"2007,{_nfd('RENÉ LEFÈVRE')},70.00\n"
+)
+
+
+def _render_orders(customers_csv, orders_csv):
+    customers = list(csv.DictReader(io.StringIO(customers_csv)))
+    index = {_name_key(row["name"]): row["id"] for row in customers}
+    lines, totals = [], {}
+    for order in csv.DictReader(io.StringIO(orders_csv)):
+        customer = index.get(_name_key(order["customer"]), "UNMATCHED")
+        lines.append(f"{order['order']} {customer}")
+        count, amount = totals.get(customer, (0, Decimal("0")))
+        totals[customer] = (count + 1, amount + Decimal(order["amount"]))
+    lines.append("")
+    lines += [f"{customer} {count} {amount:.2f}" for customer, (count, amount) in sorted(totals.items())]
+    return "\n".join(lines) + "\n"
+
+
+_ORDERS_SPEC = """# Order report
+
+`python report.py` reads `customers.csv` and `orders.csv` and writes `report.txt`.
+
+An order belongs to the customer whose name matches the order's customer name. Letter case does not
+matter, and spaces around a name do not matter. Names that differ in any letter belong to different
+customers.
+
+`report.txt` first lists each order as `<order> <customer id>` in the order of `orders.csv`, with
+`UNMATCHED` when no customer matches. A blank line follows. Then each customer ID that appears, including
+`UNMATCHED`, gets one line in sorted order: `<id> <number of orders> <total amount with two decimals>`.
+"""
+_ORDERS_PY = '''"""Write report.txt from customers.csv and orders.csv as described in SPEC.md."""
+import csv
+from decimal import Decimal
+from pathlib import Path
+
+ROOT = Path(__file__).parent
+
+
+def read(name):
+    with open(ROOT / name, newline="", encoding="utf-8") as source:
+        return list(csv.DictReader(source))
+
+
+def match_key(name):
+    """The form of a name used to match orders to customers."""
+    return name
+
+
+def main():
+    index = {match_key(row["name"]): row["id"] for row in read("customers.csv")}
+    lines, totals = [], {}
+    for order in read("orders.csv"):
+        customer = index.get(match_key(order["customer"]), "UNMATCHED")
+        lines.append(f"{order['order']} {customer}")
+        count, amount = totals.get(customer, (0, Decimal("0")))
+        totals[customer] = (count + 1, amount + Decimal(order["amount"]))
+    lines.append("")
+    for customer in sorted(totals):
+        count, amount = totals[customer]
+        lines.append(f"{customer} {count} {amount:.2f}")
+    (ROOT / "report.txt").write_bytes(("\\n".join(lines) + "\\n").encode("utf-8"))
+
+
+if __name__ == "__main__":
+    main()
+'''
+_EXPECTED_MATCHES = {line.split()[0]: line.split()[1]
+                     for line in _render_orders(_CUSTOMERS, _ORDERS).splitlines() if line[:1].isdigit()}
+_CHECK_ORDERS = (
+    "import csv\nimport hashlib\nimport subprocess\nimport sys\nfrom pathlib import Path\n\n"
+    f"EXPECTED = {_EXPECTED_MATCHES!r}\n"
+    f"REPORT = \"{hashlib.sha256(_render_orders(_CUSTOMERS, _ORDERS).encode('utf-8')).hexdigest()}\"\n\n\n"
+    "def rows(name, key, value):\n"
+    "    with open(name, newline=\"\", encoding=\"utf-8\") as source:\n"
+    "        return {row[key]: row[value] for row in csv.DictReader(source)}\n\n\n"
+    "result = subprocess.run([sys.executable, \"report.py\"], capture_output=True, text=True)\n"
+    "if result.returncode:\n"
+    "    raise SystemExit(\"FAILED: report.py exited with an error:\\n\" + result.stderr[-500:])\n"
+    "customers = rows(\"customers.csv\", \"id\", \"name\")\n"
+    "orders = rows(\"orders.csv\", \"order\", \"customer\")\n"
+    "lines = Path(\"report.txt\").read_text(encoding=\"utf-8\").splitlines()\n"
+    "matched = dict(line.split(\" \", 1) for line in lines if line.split(\" \", 1)[0] in EXPECTED)\n"
+    "for order, expected in EXPECTED.items():\n"
+    "    if matched.get(order) != expected:\n"
+    "        raise SystemExit(f\"FAILED: order {order} ({orders[order]}) was matched to {matched.get(order)}, \"\n"
+    "                         f\"expected {expected} ({customers.get(expected, expected)}).\")\n"
+    "if hashlib.sha256(Path(\"report.txt\").read_bytes()).hexdigest() != REPORT:\n"
+    "    raise SystemExit(\"FAILED: report.txt does not match the expected report.\")\n"
+    "print(\"OK\")\n"
+)
+_NAMES = Task(
+    name="invisible-names",
+    trap=("Some names are stored decomposed (NFD) in one file and composed (NFC) in the other, so names that "
+          "print identically do not match. Case and whitespace fixes leave the first failure unchanged."),
+    prompt=("`python check.py` fails because some orders are not matched to their customers. Fix report.py so "
+            "that report.txt follows SPEC.md and the check prints OK. Do not modify check.py, SPEC.md, or the "
+            "CSV files."),
+    files={"SPEC.md": _ORDERS_SPEC, "customers.csv": _CUSTOMERS, "orders.csv": _ORDERS, "report.py": _ORDERS_PY,
+           "check.py": _CHECK_ORDERS},
+    check=lambda ws: _check_names(ws),
+    reference=lambda ws: (ws / "report.py").write_text(
+        _ORDERS_PY.replace('import csv\n', 'import csv\nimport unicodedata\n').replace(
+            "    return name\n",
+            '    return unicodedata.normalize("NFC", unicodedata.normalize("NFC", name).casefold()).strip()\n'),
+        encoding="utf-8"),
+    # Whitespace and case fixes, each followed by the same failure for the first decomposed name.
+    stall=[
+        ("read_file", {"path": "report.py"}),
+        ("bash", {"command": "python check.py"}),
+        ("edit_file", {"path": "report.py", "old_text": "    return name\n",
+                       "new_text": "    return name.strip().lower()\n"}),
+        ("bash", {"command": "python check.py"}),
+        ("edit_file", {"path": "report.py", "old_text": "    return name.strip().lower()\n",
+                       "new_text": "    return \" \".join(name.split()).casefold()\n"}),
+        ("bash", {"command": "python check.py"}),
+    ],
+    # Python writes piped output in the locale encoding on Windows, where printing a combining mark fails
+    # with an error that names it. UTF-8 output keeps the names invisible there too, as on Linux and macOS.
+    env={"PYTHONIOENCODING": "utf-8"},
+)
+
+
+def _check_names(ws):
+    for name in ("check.py", "SPEC.md", "customers.csv", "orders.csv"):
+        if not _unchanged(ws, _NAMES, name):
+            return False, f"{name} was modified"
+    passed, output = _passes(ws, "check.py")
+    if not passed:
+        report = ws / "report.txt"
+        actual = report.read_text(encoding="utf-8", errors="replace").splitlines() if report.is_file() else []
+        matched = {line.split(" ", 1)[0]: line.split(" ", 1)[1] for line in actual if " " in line}
+        wrong = sum(matched.get(order) != customer for order, customer in _EXPECTED_MATCHES.items())
+        return False, f"{wrong} of {len(_EXPECTED_MATCHES)} orders are matched wrongly. {output}"
+    with tempfile.TemporaryDirectory() as directory:
+        hidden = Path(directory)
+        for script in ws.glob("*.py"):
+            if script.name != "check.py":
+                shutil.copy(script, hidden / script.name)
+        (hidden / "customers.csv").write_bytes(_HIDDEN_CUSTOMERS.encode("utf-8"))
+        (hidden / "orders.csv").write_bytes(_HIDDEN_ORDERS.encode("utf-8"))
+        _python(hidden, "report.py")
+        actual = (hidden / "report.txt").read_bytes() if (hidden / "report.txt").is_file() else b""
+    if actual != _render_orders(_HIDDEN_CUSTOMERS, _HIDDEN_ORDERS).encode("utf-8"):
+        return False, "the check passes, but report.py matches the hidden dataset wrongly"
+    return True, "every order is matched, including the hidden dataset"
+
+
+# Task 8: a breadth stall. A longer spec with many interacting rules behind a hash-only check, so a single
+# missed rule leaves the same failure and the check does not say which rule is wrong. Rules include a
+# reporting period from a comment line, two date formats, currency codes and decimal commas in prices,
+# composed and decomposed names, display width for East Asian characters, and a total rounded once.
+
+_LEDGER_RATES = {"EUR": Decimal("1"), "USD": Decimal("0.92"), "GBP": Decimal("1.15")}
+_NBSP = " "
+
+
+def _ledger_rows(text):
+    lines = text.splitlines(keepends=True)
+    comments = []
+    while lines and lines[0].startswith("#"):
+        comments.append(lines.pop(0))
+    period = next(line.split(":", 1)[1].strip() for line in comments if line.startswith("# period:"))
+    return period, list(csv.DictReader(lines))
+
+
+def _ledger_month(raw):
+    raw = raw.strip()
+    if re.fullmatch(r"\d{4}-\d{2}-\d{2}", raw):
+        return raw[:7]
+    day, month, year = raw.split(".")
+    return f"{year}-{month}"
+
+
+def _ledger_price(raw):
+    match = re.fullmatch(r"([A-Z]{3}) (.+)|(.+) ([A-Z]{3})", raw.strip())
+    currency, amount = ((match.group(1) or match.group(4)), (match.group(2) or match.group(3))) if match else (
+        "EUR", raw.strip())
+    return Decimal(amount.replace(",", ".")) * _LEDGER_RATES[currency]
+
+
+def _ledger_name(raw):
+    return _region_name(unicodedata.normalize("NFC", raw))
+
+
+def _columns(text):
+    return sum(2 if unicodedata.east_asian_width(char) in ("W", "F") else 1 for char in text)
+
+
+def _ledger_label(name):
+    if _columns(name) > 12:
+        shown = ""
+        for char in name:
+            if _columns(shown + char) > 11:
+                break
+            shown += char
+        name = shown + "~"
+    return name + " " * (12 - _columns(name))
+
+
+def _render_ledger(text):
+    """The report that the ledger SPEC.md describes, for checking the task's results."""
+    period, rows = _ledger_rows(text)
+    regions = {}
+    for row in rows:
+        if _ledger_month(row["date"]) != period:
+            continue
+        entry = regions.setdefault(_ledger_name(row["region"]), {"orders": 0, "units": 0, "revenue": Decimal(0)})
+        quantity = int(row["quantity"])
+        entry["orders"] += quantity > 0
+        entry["units"] += quantity
+        entry["revenue"] += quantity * _ledger_price(row["unit_price"])
+
+    def money(value):
+        return f"{value.quantize(Decimal('0.01'), rounding=ROUND_HALF_UP):,.2f}"
+
+    def row_text(label, orders, units, revenue):
+        return f"{label}{orders:>8}{units:>8}{revenue:>13}"
+
+    lines = [f"Sales report {period}", row_text(_ledger_label("Region"), "Orders", "Units", "Revenue")]
+    for name in sorted(regions, key=lambda name: (-regions[name]["revenue"], name)):
+        entry = regions[name]
+        lines.append(row_text(_ledger_label(name), entry["orders"], entry["units"], money(entry["revenue"])))
+    totals = {key: sum(entry[key] for entry in regions.values()) for key in ("orders", "units", "revenue")}
+    lines.append(row_text(_ledger_label("Total"), totals["orders"], totals["units"], money(totals["revenue"])))
+    return "\n".join(lines) + "\n"
+
+
+_LEDGER = f"""# exported 2026-11-02 08:15 by ledger-export
+# period: 2026-10
+date,region,product,quantity,unit_price
+2026-10-01,North,"Widget, large",3,12.995
+02.10.2026, north,Gadget,10,"4,125"
+2026-10-03,south,Nut,40,0.875
+2026-09-30,North,Gadget,5,4.125
+2026-10-04,{_ZWSP}East,"Bolt, M4",120,USD 0.36
+2026-10-05,NORTH{_NBSP},Gadget,-2,"4,125"
+06.10.2026,king's lynn,"Widget, large",1,2.675
+2026-10-07,東京,Nut,25,0.875
+2026-10-08,King's Lynn,Gadget,4,3.60 GBP
+2026-10-09,south,"Bolt, M4",200,0.335
+2026-10-10,東京 ,"Widget, large",2,12.995
+11.10.2026,KING'S LYNN,Nut,-1,0.875
+2026-10-12,North,"Bolt, M4",15,0.335
+2026-10-13,NORTH-EAST,Gadget,6,4.125
+01.11.2026,north-east ,"Bolt, M4",30,0.335
+2026-10-15,Westmoreland Hills,"Widget, large",4,12.995
+2026-10-16,westmoreland hills,Nut,-2,0.875
+2026-10-17,大阪府堺市南区,Nut,3,0.875
+2026-10-18,{_nfd('Zoë-Ann Hill')},Gadget,1,4.125
+2026-10-19,zoë-ann hill,"Bolt, M4",3,USD 0.335
+"""
+_HIDDEN_LEDGER = f"""# exported 2026-12-01 07:00 by ledger-export
+# note: November close
+# period: 2026-11
+date,region,product,quantity,unit_price
+2026-11-01,Central,"Cable, 2 m",7,3.145
+02.11.2026, central,Plug,30,"1,005"
+2026-10-31,Central,Plug,100,1.005
+2026-11-03,bishop's stortford,"Cable, 2 m",-3,GBP 2.735
+2026-11-04,Bishop's Stortford ,Switch,12,8.335
+05.11.2026,{_ZWSP}west-end,Plug,9,USD 1.095
+2026-11-06,WEST-END{_NBSP},"Fuse, 5 A",100,0.125
+2026-11-07,ｶﾀｶﾅ通り,Plug,4,1.005
+2026-11-08,ＡＢＣ Hall,Switch,1,8.335
+01.12.2026,central,Switch,5,8.335
+2026-11-09,서울특별시 강남구,"Cable, 2 m",2,3.145
+2026-11-10,{_nfd('Ångström Park')},Plug,5,"1,005"
+2026-11-11,ångström park,Plug,-1,1.005
+"""
+_LEDGER_SPEC = f"""# Sales report
+
+`python report.py` reads `sales.csv` and writes `report.txt`.
+
+## Input
+
+- `sales.csv` is UTF-8. Lines before the header that start with `#` are comments. The comment
+  `# period: YYYY-MM` names the reporting month. Only rows dated in that month count. Ignore all other rows.
+- The header is `date,region,product,quantity,unit_price`. Product names may be quoted and contain commas.
+- Dates are written as `YYYY-MM-DD` or `DD.MM.YYYY`.
+- A negative quantity is a refund.
+- A unit price is a decimal number with up to three decimal places. It is in EUR unless a currency code
+  stands before or after it, separated by a space, such as `USD 0.36` or `3.60 GBP`. Prices may use a decimal
+  comma, such as `4,125`. Convert other currencies to EUR per unit with these exact rates before multiplying
+  by the quantity: 1 USD = 0.92 EUR, 1 GBP = 1.15 EUR.
+
+## Output
+
+`report.txt` is UTF-8 with LF line endings and a final newline. It looks like this, with different regions
+and numbers:
+
+```text
+Sales report 2026-01
+{_ledger_label("Region")}  Orders   Units      Revenue
+{_ledger_label("North")}       3      12     1,234.50
+{_ledger_label("King's Lynn")}       2       9       310.25
+{_ledger_label("Stratford-U~")}       1       5        98.00
+{_ledger_label("Total")}       6      26     1,642.75
+```
+
+- The first line is `Sales report` and the reporting month, separated by a space. The column header follows.
+- Each region gets one row. Before grouping, remove spaces, non-breaking spaces, and zero-width spaces
+  (U+200B) from the start and end of the name. Region names are case-insensitive, and a name written with
+  composed or decomposed accents (Unicode NFC or NFD) is the same region.
+- Show each region name in composed form (NFC) with every word capitalized: the first letter in upper case
+  and the rest in lower case. Words are separated by spaces or hyphens. An apostrophe does not start a new
+  word, so `king's lynn` is shown as `King's Lynn` and `NORTH-EAST` as `North-East`.
+- Widths are display columns. An East Asian wide or fullwidth character takes two columns, and any other
+  character one. The region name is left-aligned in 12 columns and padded with spaces. Orders and Units are
+  right-aligned in 8 columns each, and Revenue in 13.
+- A name wider than 12 columns is shown as the longest start of the name that fits in 11 columns, followed
+  by `~` and padded with spaces to 12 columns. So `stratford-upon-avon` is shown as `Stratford-U~`. Sorting
+  uses the full name.
+- Orders counts the rows with a positive quantity. Refunds are not orders.
+- Units is the sum of all quantities, refunds included.
+- Revenue is the sum of quantity times the unit price in EUR, refunds included. Compute it exactly in decimal
+  arithmetic and round half up to two decimals only when formatting, with a comma as the thousands separator.
+- Regions are sorted by revenue, highest first. Regions with equal revenue are sorted by their shown full name.
+- The last row, `Total`, sums the orders and units of all regions. Its revenue is the exact sum of the
+  regions' revenues, rounded once.
+"""
+_LEDGER_PY = '''"""Write report.txt from sales.csv as described in SPEC.md."""
+import csv
+from pathlib import Path
+
+ROOT = Path(__file__).parent
+
+
+def load(path):
+    with open(path, newline="", encoding="utf-8") as source:
+        return list(csv.DictReader(source))
+
+
+def price(raw):
+    return float(raw)
+
+
+def summarize(rows):
+    regions = {}
+    for row in rows:
+        name = row["region"].strip().title()
+        entry = regions.setdefault(name, {"orders": 0, "units": 0, "revenue": 0.0})
+        quantity = int(row["quantity"])
+        entry["orders"] += 1
+        entry["units"] += quantity
+        entry["revenue"] += quantity * price(row["unit_price"])
+    return regions
+
+
+def line(name, orders, units, revenue):
+    return f"{name:<12}{orders:>8}{units:>8}{revenue:>13}"
+
+
+def main():
+    regions = summarize(load(ROOT / "sales.csv"))
+    lines = ["Sales report", line("Region", "Orders", "Units", "Revenue")]
+    for name in sorted(regions):
+        entry = regions[name]
+        lines.append(line(name[:12], entry["orders"], entry["units"], f"{entry['revenue']:,.2f}"))
+    orders = sum(entry["orders"] for entry in regions.values())
+    units = sum(entry["units"] for entry in regions.values())
+    revenue = sum(round(entry["revenue"], 2) for entry in regions.values())
+    lines.append(line("Total", orders, units, f"{revenue:,.2f}"))
+    (ROOT / "report.txt").write_bytes(("\\n".join(lines) + "\\n").encode("utf-8"))
+
+
+if __name__ == "__main__":
+    main()
+'''
+_LEDGER_FIXED_PY = r'''"""Write report.txt from sales.csv as described in SPEC.md."""
+import csv
+import re
+import unicodedata
+from decimal import ROUND_HALF_UP, Decimal
+from pathlib import Path
+
+ROOT = Path(__file__).parent
+RATES = {"EUR": Decimal("1"), "USD": Decimal("0.92"), "GBP": Decimal("1.15")}
+
+
+def load(path):
+    with open(path, newline="", encoding="utf-8") as source:
+        lines = source.readlines()
+    period = None
+    while lines and lines[0].startswith("#"):
+        comment = lines.pop(0)
+        if comment.startswith("# period:"):
+            period = comment.split(":", 1)[1].strip()
+    return period, list(csv.DictReader(lines))
+
+
+def month(raw):
+    raw = raw.strip()
+    if re.fullmatch(r"\d{4}-\d{2}-\d{2}", raw):
+        return raw[:7]
+    day, number, year = raw.split(".")
+    return f"{year}-{number}"
+
+
+def price(raw):
+    match = re.fullmatch(r"([A-Z]{3}) (.+)|(.+) ([A-Z]{3})", raw.strip())
+    currency, amount = (match.group(1) or match.group(4), match.group(2) or match.group(3)) if match else (
+        "EUR", raw.strip())
+    return Decimal(amount.replace(",", ".")) * RATES[currency]
+
+
+def region_name(raw):
+    trimmed = re.sub(r"^[\s​]+|[\s​]+$", "", unicodedata.normalize("NFC", raw)).casefold()
+    return re.sub(r"[^\s-]+", lambda word: word.group(0)[:1].upper() + word.group(0)[1:], trimmed)
+
+
+def columns(text):
+    return sum(2 if unicodedata.east_asian_width(char) in ("W", "F") else 1 for char in text)
+
+
+def label(name):
+    if columns(name) > 12:
+        shown = ""
+        for char in name:
+            if columns(shown + char) > 11:
+                break
+            shown += char
+        name = shown + "~"
+    return name + " " * (12 - columns(name))
+
+
+def money(value):
+    return f"{value.quantize(Decimal('0.01'), rounding=ROUND_HALF_UP):,.2f}"
+
+
+def line(name, orders, units, revenue):
+    return f"{label(name)}{orders:>8}{units:>8}{revenue:>13}"
+
+
+def main():
+    period, rows = load(ROOT / "sales.csv")
+    regions = {}
+    for row in rows:
+        if month(row["date"]) != period:
+            continue
+        entry = regions.setdefault(region_name(row["region"]), {"orders": 0, "units": 0, "revenue": Decimal(0)})
+        quantity = int(row["quantity"])
+        entry["orders"] += quantity > 0
+        entry["units"] += quantity
+        entry["revenue"] += quantity * price(row["unit_price"])
+    lines = [f"Sales report {period}", line("Region", "Orders", "Units", "Revenue")]
+    for name in sorted(regions, key=lambda name: (-regions[name]["revenue"], name)):
+        entry = regions[name]
+        lines.append(line(name, entry["orders"], entry["units"], money(entry["revenue"])))
+    totals = {key: sum(entry[key] for entry in regions.values()) for key in ("orders", "units", "revenue")}
+    lines.append(line("Total", totals["orders"], totals["units"], money(totals["revenue"])))
+    (ROOT / "report.txt").write_bytes(("\n".join(lines) + "\n").encode("utf-8"))
+
+
+if __name__ == "__main__":
+    main()
+'''
+_CHECK_LEDGER = (
+    "import hashlib\nimport subprocess\nimport sys\nfrom pathlib import Path\n\n"
+    f"EXPECTED = \"{hashlib.sha256(_render_ledger(_LEDGER).encode('utf-8')).hexdigest()}\"\n\n"
+    "result = subprocess.run([sys.executable, \"report.py\"], capture_output=True, text=True)\n"
+    "if result.returncode:\n"
+    "    raise SystemExit(\"FAILED: report.py exited with an error:\\n\" + result.stderr[-500:])\n"
+    "if hashlib.sha256(Path(\"report.txt\").read_bytes()).hexdigest() != EXPECTED:\n"
+    "    raise SystemExit(\"FAILED: report.txt does not match the expected report.\")\n"
+    "print(\"OK\")\n"
+)
+_LEDGER_TASK = Task(
+    name="ledger-report",
+    trap=("A long spec with many interacting rules behind a hash-only check. Missing any one rule leaves the "
+          "same failure, and the check does not say which rule is wrong."),
+    prompt=("`python check.py` fails. Fix report.py so that report.txt follows SPEC.md exactly and the check "
+            "prints OK. Do not modify check.py, sales.csv, or SPEC.md."),
+    files={"SPEC.md": _LEDGER_SPEC, "sales.csv": _LEDGER, "report.py": _LEDGER_PY, "check.py": _CHECK_LEDGER},
+    check=lambda ws: _check_ledger(ws),
+    reference=lambda ws: (ws / "report.py").write_text(_LEDGER_FIXED_PY, encoding="utf-8"),
+    # Skipping the comments exposes the currency codes. Two more correct fixes leave that crash unchanged.
+    stall=[
+        ("read_file", {"path": "report.py"}),
+        ("bash", {"command": "python check.py"}),
+        ("edit_file", {"path": "report.py", "old_text": "        return list(csv.DictReader(source))\n",
+                       "new_text": "        return list(csv.DictReader(line for line in source if not line.startswith(\"#\")))\n"}),
+        ("bash", {"command": "python check.py"}),
+        ("edit_file", {"path": "report.py", "old_text": "        entry[\"orders\"] += 1\n",
+                       "new_text": "        entry[\"orders\"] += quantity > 0\n"}),
+        ("bash", {"command": "python check.py"}),
+        ("edit_file", {"path": "report.py", "old_text": "    for name in sorted(regions):\n",
+                       "new_text": "    for name in sorted(regions, key=lambda name: -regions[name][\"revenue\"]):\n"}),
+        ("bash", {"command": "python check.py"}),
+    ],
+    env={"PYTHONIOENCODING": "utf-8"},
+)
+
+
+def _check_ledger(ws):
+    for name in ("check.py", "sales.csv", "SPEC.md"):
+        if not _unchanged(ws, _LEDGER_TASK, name):
+            return False, f"{name} was modified"
+    passed, output = _passes(ws, "check.py")
+    if not passed:
+        expected = _render_ledger(_LEDGER).splitlines()
+        report = ws / "report.txt"
+        actual = report.read_text(encoding="utf-8", errors="replace").splitlines() if report.is_file() else []
+        wrong = sum(1 for index in range(max(len(expected), len(actual)))
+                    if index >= len(expected) or index >= len(actual) or expected[index] != actual[index])
+        return False, f"{wrong} lines differ from the {len(expected)}-line expected report. {output}"
+    with tempfile.TemporaryDirectory() as directory:
+        hidden = Path(directory)
+        for script in ws.glob("*.py"):
+            if script.name != "check.py":
+                shutil.copy(script, hidden / script.name)
+        (hidden / "sales.csv").write_bytes(_HIDDEN_LEDGER.encode("utf-8"))
+        _python(hidden, "report.py")
+        actual = (hidden / "report.txt").read_bytes() if (hidden / "report.txt").is_file() else b""
+    if actual != _render_ledger(_HIDDEN_LEDGER).encode("utf-8"):
+        return False, "the check passes, but report.py gives a wrong report for the hidden dataset"
+    return True, "report.txt follows SPEC.md for both datasets"
+
+
+TASKS = {task.name: task for task in (_SHADOWED, _STALE, _LATIN1, _SLOW, _REPORT, _RATES, _NAMES, _LEDGER_TASK)}
 
 
 def materialize(task, workspace):
@@ -810,7 +1397,7 @@ async def seed_stall(engine, task):
     return reason, fired_at
 
 
-async def respond_after_stall(engine, task, max_turns, heat=0):
+async def respond_after_stall(engine, task, max_turns, heat=0, roles=None):
     reason, _ = await seed_stall(engine, task)
     engine.tree.save()
     engine.requests_left = max_turns
@@ -818,6 +1405,18 @@ async def respond_after_stall(engine, task, max_turns, heat=0):
         if engine.forks and reason:
             # Treat the seeded stall as the task's heat-th reflection, which raises the temperature.
             engine.stalls.batches = heat
+            if roles:
+                # Use the requested reviewers for the seeded reflection instead of the usual choice.
+                chosen = [next(role for role in ROLES if role.name == name) for name in roles]
+                plan = engine.stalls.plan
+
+                def pinned(kind, **options):
+                    engine.stalls.plan = plan
+                    engine.stalls.batches += 1
+                    engine.stalls.used.update(role.name for role in chosen)
+                    return heat, chosen
+
+                engine.stalls.plan = pinned
             await engine._reflect(reason)
         return await engine._respond()
     except (ServerError, TurnLimitError) as error:
@@ -863,7 +1462,7 @@ async def run_arm(task, arm, workspace, args):
                         lambda text: events.append([round(time.monotonic() - started, 1), text]), **ARMS[arm],
                         thinking=args.thinking)
         answer = None
-        work = (respond_after_stall(engine, task, args.max_turns, args.heat) if args.seeded
+        work = (respond_after_stall(engine, task, args.max_turns, args.heat, args.roles) if args.seeded
                 else engine.respond(task.prompt))
         try:
             answer = await asyncio.wait_for(work, args.deadline)
@@ -953,7 +1552,8 @@ async def run(args):
             for arm in arms:
                 workspace = out / "workspaces" / f"{name}-{arm}-{repeat + 1}"
                 print(f"Running {name} with {arm} (repeat {repeat + 1})", flush=True)
-                result = await run_arm(TASKS[name], arm, workspace, args)
+                with task_env(TASKS[name]):
+                    result = await run_arm(TASKS[name], arm, workspace, args)
                 result["repeat"] = repeat + 1
                 results.append(result)
                 print(f"  {'PASS' if result['passed'] else 'FAIL'} {result['outcome'][:80]} "
@@ -987,31 +1587,35 @@ def validate():
     """Check that each fixture fails as written and passes with its reference fix."""
     ok = True
     for task in TASKS.values():
-        with tempfile.TemporaryDirectory() as directory:
-            workspace = Path(directory)
-            materialize(task, workspace)
-            before, detail_before = task.check(workspace)
-            task.reference(workspace)
-            after, detail_after = task.check(workspace)
-        status = "ok" if not before and after else "BROKEN"
-        ok &= status == "ok"
-        print(f"{task.name}: {status}\n  before: {detail_before}\n  after:  {detail_after}")
-        if task.stall:
+        with task_env(task):
             with tempfile.TemporaryDirectory() as directory:
                 workspace = Path(directory)
                 materialize(task, workspace)
-                tree = ConversationTree(workspace / ".refl" / "sessions", SYSTEM_PROMPT, persist=False)
-                engine = Engine(None, "model", WorkspaceTools(workspace), tree, 20, 256, lambda text: None,
-                                **ARMS["reflect"])
-                reason, fired_at = asyncio.run(seed_stall(engine, task))
-                still_failing = not task.check(workspace)[0]
-            seeded = bool(reason) and fired_at == len(task.stall) - 1 and still_failing
-            ok &= seeded
-            print(f"  seeded stall: {'ok' if seeded else 'BROKEN'} at step {fired_at}: {reason}")
+                before, detail_before = task.check(workspace)
+                task.reference(workspace)
+                after, detail_after = task.check(workspace)
+            status = "ok" if not before and after else "BROKEN"
+            ok &= status == "ok"
+            print(f"{task.name}: {status}\n  before: {detail_before}\n  after:  {detail_after}")
+            if task.stall:
+                with tempfile.TemporaryDirectory() as directory:
+                    workspace = Path(directory)
+                    materialize(task, workspace)
+                    tree = ConversationTree(workspace / ".refl" / "sessions", SYSTEM_PROMPT, persist=False)
+                    engine = Engine(None, "model", WorkspaceTools(workspace), tree, 20, 256, lambda text: None,
+                                    **ARMS["reflect"])
+                    reason, fired_at = asyncio.run(seed_stall(engine, task))
+                    still_failing = not task.check(workspace)[0]
+                seeded = bool(reason) and fired_at == len(task.stall) - 1 and still_failing
+                ok &= seeded
+                print(f"  seeded stall: {'ok' if seeded else 'BROKEN'} at step {fired_at}: {reason}")
     return 0 if ok else 1
 
 
 def main():
+    # Task details can contain characters the console encoding lacks, such as combining marks.
+    for stream in (sys.stdout, sys.stderr):
+        stream.reconfigure(errors="backslashreplace")
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--url", default=os.environ.get("LLAMA_BASE_URL", "http://127.0.0.1:8080"))
     parser.add_argument("--model", help="model ID (default: first ID from /v1/models)")
@@ -1027,12 +1631,17 @@ def main():
                         help="start each run from the task's scripted stall (tasks without one are skipped)")
     parser.add_argument("--heat", type=int, choices=range(3), default=0,
                         help="with --seeded, reflection temperature for the seeded stall (default: 0)")
+    parser.add_argument("--roles", nargs="+", choices=[role.name for role in ROLES], metavar="ROLE",
+                        help="with --seeded, use these reviewer roles for the seeded reflection, such as "
+                             "Prerequisites or \"Rebuild and swap\"")
     parser.add_argument("--thinking", choices=THINKING_MODES, default="auto",
                         help="thinking mode as in refl --thinking (default: auto)")
     parser.add_argument("--validate", action="store_true", help="check the fixtures and reference fixes only")
     parser.add_argument("--judge", metavar="RESULTS_DIR",
                         help="count distinct ideas in the reflections of an earlier run and exit")
     args = parser.parse_args()
+    if args.roles and not args.seeded:
+        parser.error("--roles applies to the seeded reflection, so it needs --seeded")
     if args.validate:
         return validate()
     if args.judge:

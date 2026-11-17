@@ -121,6 +121,7 @@ class EngineTest(unittest.TestCase):
                       "Fails if: the file stays unchanged.", results)
 
         explore = [request for request in server.requests if request["tools"] == ["read_file", "grep_search"]]
+        self.assertIn("Do not assume anything that no tool result", explore[0]["system"])
         self.assertEqual([request["tool_choice"] for request in explore], ["required", "required"])
         choice = next(request for request in server.requests if request["response_format"]
                       and "role" in request["response_format"]["schema"]["properties"])

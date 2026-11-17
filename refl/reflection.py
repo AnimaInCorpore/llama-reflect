@@ -7,15 +7,19 @@ from dataclasses import dataclass
 
 REFLECTION_PROMPT = (
     "You are a read-only reviewer investigating why a coding task stalled. Use the recent tool results as "
-    "evidence and open relevant project skills with read_file. Start with a read_file or grep_search call that "
+    "evidence and open relevant project skills with read_file. Do not assume anything that no tool result in "
+    "the conversation shows, including what the main branch believes about the files, the tools, and the "
+    "environment. Start with a read_file or grep_search call that "
     "checks something the main branch has not looked at yet, such as a file that the failing command imports "
     "or reads, or the value it actually uses. Check your idea against the task's requirements, such as a spec "
     "or tests in the workspace, and do not propose anything they rule out. Give one concrete next action, the "
     "evidence behind it, and a check the main branch can run to see progress. Keep your proposal brief."
 )
 
-FAILURE, NO_PROGRESS, MANUAL = "failure", "no progress", "manual"
-_ANY = frozenset({FAILURE, NO_PROGRESS, MANUAL})
+# A failure is an action that fails repeatedly, usually a tool or usage problem. An unfixed failure is a check
+# that keeps failing the same way although the code changed between runs, or a final answer while it fails.
+FAILURE, UNFIXED, NO_PROGRESS, MANUAL = "failure", "unfixed failure", "no progress", "manual"
+_ANY = frozenset({FAILURE, UNFIXED, NO_PROGRESS, MANUAL})
 PROPOSAL_FIELDS = ("proposal", "basis", "cost", "fails_if")
 
 
@@ -40,12 +44,26 @@ ROLES = (
          tools=True, brief=False),
     Role("Diagnosis", "grounded",
          "Name two or three competing causes for the stall, the evidence for each, and one cheap check whose "
-         "result tells them apart. Propose running that check first.",
-         frozenset({FAILURE, NO_PROGRESS}), tools=True, brief=False),
+         "result tells them apart. Consider causes outside the code being edited too. Propose running that "
+         "check first.",
+         frozenset({FAILURE, UNFIXED, NO_PROGRESS}), tools=True, brief=False),
     Role("Observe", "grounded",
          "Find a value or state that the main branch assumes instead of observing. Propose the smallest command "
          "that prints it.",
-         frozenset({FAILURE, NO_PROGRESS}), tools=True, brief=False),
+         frozenset({FAILURE, UNFIXED, NO_PROGRESS}), tools=True, brief=False),
+    Role("Prerequisites", "grounded",
+         "Check that the prerequisites of the failing step are in place and working instead of assuming them: "
+         "the interpreter or tool and its version, the dependencies, the file or module that is actually loaded, "
+         "and the configuration and environment variables in effect. Propose the commands that confirm each one, "
+         "starting with the one most likely to be wrong.",
+         frozenset({FAILURE, UNFIXED, NO_PROGRESS}), tools=True, brief=False),
+    Role("Rebuild and swap", "alternative",
+         "Locate the fault by rebuilding parts of the code. Propose rewriting one part, such as a single "
+         "function, from the spec or its intended behavior without copying the original, swapping it in, and "
+         "rerunning the check, one part at a time. Or run the old and the rebuilt part on the same inputs and "
+         "compare. A part whose replacement changes the result holds the fault. Name the parts in the order to "
+         "try and the command that shows the difference.",
+         frozenset({UNFIXED, NO_PROGRESS}), tools=True, temperature=0.3),
     Role("Known alternative", "alternative",
          "Name an established technique or tool that solves this kind of problem differently from the current "
          "approach. Say where it is standard, how to apply it here, and how to check that it is available.",
@@ -58,11 +76,11 @@ ROLES = (
          "Propose a smaller version of the problem to solve first, such as a minimal reproduction, a single "
          "case, or a bisection over inputs or commits. Put the smaller case in a new file and leave the task's "
          "inputs unchanged.",
-         frozenset({FAILURE, NO_PROGRESS}), temperature=0.3),
+         frozenset({FAILURE, UNFIXED, NO_PROGRESS}), temperature=0.3),
     Role("Premortem", "alternative",
          "Assume that the approach the main branch keeps trying will fail. Name the most likely reason and the "
          "change that avoids it.",
-         frozenset({NO_PROGRESS, MANUAL}), brief=False, temperature=0.3),
+         frozenset({UNFIXED, NO_PROGRESS, MANUAL}), brief=False, temperature=0.3),
     Role("Analogy", "lateral",
          "First restate the stalled problem in abstraction without words from this project's domain: the parts "
          "involved, how they relate, the goal, and what blocks it. Then name a field of engineering or science "
@@ -80,7 +98,7 @@ ROLES = (
     Role("Backtrack", "lateral",
          "Find the earliest decision that led into this dead end. Propose a different route from that point "
          "and the changes to undo.",
-         frozenset({FAILURE, NO_PROGRESS}), brief=False, temperature=0.8),
+         frozenset({FAILURE, UNFIXED, NO_PROGRESS}), brief=False, temperature=0.8),
     Role("Ask the user", "lateral",
          "Name the one question for the user whose answer would unblock the task, and what to do for each "
          "likely answer.",
@@ -93,7 +111,7 @@ TEMPERATURE_SLOTS = (
     ("grounded", "alternative", "lateral"),
     ("alternative", "lateral", "lateral"),
 )
-_KINDS = {"failure": FAILURE, "diagnostic": FAILURE, "repeated failure": FAILURE, "stopped": FAILURE,
+_KINDS = {"failure": FAILURE, "diagnostic": FAILURE, "repeated failure": UNFIXED, "stopped": UNFIXED,
           "unchanged file": NO_PROGRESS, "unchanged result": NO_PROGRESS, "edits": NO_PROGRESS,
           "cycle": NO_PROGRESS}
 

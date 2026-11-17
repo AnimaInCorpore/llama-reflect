@@ -14,6 +14,10 @@ Use paired evaluations to measure whether verification and strategic reflection 
 | `slow-paths` | An exponential recursion that tuning cannot make fast enough. The cause is known, but the chosen route is a dead end. |
 | `opaque-report` | `report.py` breaks several rules of `SPEC.md`, some of which defeat the obvious standard-library calls, and the check only compares a hash. Fixing some rules leaves the failure message unchanged. A hidden second dataset catches a hard-coded report, and the grader reports how many lines still differ. |
 | `invoice-rates` | A control task without a trap. |
+| `invisible-names` | Some customer names are stored decomposed (NFD) in one file and composed (NFC) in the other, so names that print identically, even with `repr()`, do not match. Case and whitespace fixes leave the first failure unchanged. The hidden dataset has Hangul and two different people named René and Rene, so stripping accents fails. |
+| `ledger-report` | A longer spec with about a dozen interacting rules behind a hash-only check: a reporting period from a comment line, two date formats, currency codes and decimal commas in prices, composed and decomposed names, display width for East Asian characters, and a total rounded once. Missing any one rule leaves the same failure. |
+
+`invisible-names` and `ledger-report` set `PYTHONIOENCODING=utf-8` for the run. On Windows, Python otherwise writes piped output in the locale encoding, and printing a combining mark fails with an error that names it, which would give the trap away there but not on Linux or macOS.
 
 | Arm | Configuration |
 | --- | --- |
@@ -23,7 +27,7 @@ Use paired evaluations to measure whether verification and strategic reflection 
 
 The `linear` and `reflect` arms share the system prompt, tools, task prompt, and request budget, so they differ only in whether stall detection can start reflection batches. The server does not repeat a trajectory exactly, even at temperature 0, because prompt-cache reuse changes the numerics. Use `--repeat` and compare counts rather than single pairs. The script alternates the arm order across tasks because the prompt cache also speeds up whichever arm runs second.
 
-A capable model may never stall on a task, so reflection never starts and the run measures only its idle cost. `--seeded` starts each run from a scripted stall on the main branch, such as two correct edits to `app.py` followed by the same test failure three times. The tool results in the stall are real. The reflect arm then starts a reflection batch, and the linear arm continues without one. `--heat` sets the reflection temperature for the seeded stall, so a single stall can exercise the lateral roles. `--thinking` and `--max-turns` work as in `refl`.
+A capable model may never stall on a task, so reflection never starts and the run measures only its idle cost. `--seeded` starts each run from a scripted stall on the main branch, such as two correct edits to `app.py` followed by the same test failure three times. The tool results in the stall are real. The reflect arm then starts a reflection batch, and the linear arm continues without one. `--heat` sets the reflection temperature for the seeded stall, so a single stall can exercise the lateral roles. `--roles` names the reviewers for the seeded reflection, which tests a role that would otherwise join only in a later batch, such as Prerequisites. `--thinking` and `--max-turns` work as in `refl`.
 
 The script records requests per branch, prompt tokens the server processed, completion tokens, and wall-clock time. It replays the stall detector over each main branch to show where the linear arm would have reflected. After each reflection it asks the model to group proposals that recommend the same next action and records the number of distinct ideas. A word-overlap score rated three reworded copies of one idea as fairly diverse, so the count comes from the model. Those judge requests stay out of the totals. `--judge RESULTS_DIR` adds the count to an earlier run.
 
@@ -32,6 +36,7 @@ python bench/reflection_ab.py --validate
 python bench/reflection_ab.py --url http://127.0.0.1:8080 --repeat 2
 python bench/reflection_ab.py --tasks opaque-report --thinking off --max-turns 40 --repeat 3
 python bench/reflection_ab.py --seeded --heat 2 --thinking main --arms reflect
+python bench/reflection_ab.py --seeded --roles Diagnosis Observe Prerequisites --arms reflect --thinking off
 ```
 
 `--validate` needs no server. It confirms that each task fails as written, passes with its reference fix, and that each scripted stall triggers the detector on its last step. [Benchmark reflection against llama-server](../.refl/skills/benchmark-reflection.md)
@@ -58,6 +63,15 @@ These runs used two 27B models on a single-slot `llama-server` at temperature 0 
 With thinking enabled, one reply of the same model needed more than 8192 output tokens. Raise `--max-tokens` for reasoning models.
 
 These `opaque-report` runs used llama.cpp build b12434. After the message and reflection changes for the 4B model, the second model ran again on build b12465 without thinking. All six tasks were solved in every run of both arms, two repeats each, without a stall, so reflection never started. `opaque-report` took 6 requests. In three more runs without reflection at 40 requests, it was solved every time as well. The model read the spec, the check, the code, and the data in one round, rebuilt the report in an inline script until its hash matched the check, and then rewrote `report.py`. Reflect code from before the changes also solved it on this build in 7 requests in each of three runs, so the change came from the server, not from Reflect. The changes added no cost for this model. The task no longer makes this model stall on this build, so a 27B comparison needs a harder task.
+
+Two harder tasks followed on the same build, without thinking:
+
+- **`invisible-names`.** Solved in all four runs of both arms in 9 requests, without a stall. After the first failure, the model listed the code points of each name, found the combining marks, and normalized the names.
+- **`ledger-report`.** No arm solved it reliably. An early version of the spec did not say which Unicode form to show a name in, and a decomposed name then counts 13 columns under the width rule. With that spec, one of three runs without reflection was solved at 30 and at 40 requests, and none with reflection. At 40 requests, all five failed runs differed from the expected report only in that line, so these rounds do not count. With the spec stating the composed form, both arms failed all three runs at 40 requests. Without reflection, every run ended with 4 wrong lines: it padded East Asian names by characters instead of display columns and capitalized `King'S lynn`. With reflection, every run ended with 2 wrong lines: the reflection led to the capitalization fix, and the padding stayed wrong. One run without reflection repeated the same diagnostic command more than 20 times until the budget ran out, which the stall detector would have stopped after three.
+
+In one reflect run, the model rebuilt the revenue sums in an inline script to check `report.py`, left out a row, and then chased a bug in date parsing that did not exist. A rebuilt part needs the same scrutiny as the original.
+
+The Prerequisites role joins only in a later batch, so seeded runs pinned it next to Diagnosis and Observe with `--roles` on the three tasks whose cause lies outside the edited code. The model solved all six runs, two per task. In `shadowed-module`, Prerequisites proposed `python -c "import app; print(app.__file__)"` to confirm which `app.py` is loaded, and Diagnosis and Observe proposed printing the loaded `slugify` source. In `latin1-config`, the main branch chose Prerequisites' byte-level edit and finished in four requests. In `stale-build`, all three proposed the `--force` workaround. With three grounded roles reading the same file, this model's ideas largely coincided. The 4B model, whose reviewers never looked beyond `app.py` in `shadowed-module`, has not been tested with the new role yet.
 
 ### A 4B model
 

@@ -1,7 +1,7 @@
 import json
 import unittest
 
-from refl.reflection import FAILURE, MANUAL, NO_PROGRESS, StallDetector, choose_roles
+from refl.reflection import FAILURE, MANUAL, NO_PROGRESS, UNFIXED, StallDetector, choose_roles
 
 
 def names(roles):
@@ -12,7 +12,9 @@ class RoleTest(unittest.TestCase):
     def test_first_reflection_is_grounded(self):
         self.assertEqual(names(choose_roles(0, FAILURE, unavailable={"Existing patterns"})),
                          ["Diagnosis", "Observe", "Switch tools"])
-        self.assertEqual(names(choose_roles(0, NO_PROGRESS)), ["Existing patterns", "Diagnosis", "Known alternative"])
+        self.assertEqual(names(choose_roles(0, NO_PROGRESS)), ["Existing patterns", "Diagnosis", "Rebuild and swap"])
+        self.assertEqual(names(choose_roles(0, UNFIXED, unavailable={"Existing patterns"})),
+                         ["Diagnosis", "Observe", "Rebuild and swap"])
 
     def test_manual_reflection_uses_the_idea_roles(self):
         self.assertEqual(names(choose_roles(2, MANUAL)), ["Known alternative", "Analogy", "Naive shortcut"])
@@ -21,8 +23,8 @@ class RoleTest(unittest.TestCase):
         detector = StallDetector({"delay": 0, "remaining": 0})
         batches = [detector.plan(FAILURE, unavailable={"Existing patterns"}) for _ in range(3)]
         self.assertEqual([level for level, _ in batches], [0, 1, 2])
-        self.assertEqual(names(batches[1][1]), ["Diagnosis", "Shrink the problem", "Analogy"])
-        self.assertEqual(names(batches[2][1]), ["Known alternative", "Naive shortcut", "Inversion"])
+        self.assertEqual(names(batches[1][1]), ["Prerequisites", "Shrink the problem", "Analogy"])
+        self.assertEqual(names(batches[2][1]), ["Rebuild and swap", "Naive shortcut", "Inversion"])
 
     def test_progress_cools_down(self):
         detector = StallDetector({"delay": 0, "remaining": 0})
@@ -53,7 +55,7 @@ class StallDetectorTest(unittest.TestCase):
         self.assertIsNone(self.record("bash", {"command": "pytest"}, {"exit_code": 1, "output": "1 failed in 0.05s"}))
         self.assertIsNone(self.cycle("1 failed in 0.07s"))
         self.assertEqual(self.cycle("1 failed in 0.04s"), "pytest failed the same way three times.")
-        self.assertEqual(self.detector.kind, FAILURE)
+        self.assertEqual(self.detector.kind, UNFIXED)
 
     def test_results_that_cycle_back(self):
         check = "python check.py; cat report.txt"
@@ -101,7 +103,7 @@ class StallDetectorTest(unittest.TestCase):
         self.assertIsNone(self.detector.stopped())  # a single failed command may be the answer itself
         self.assertIsNone(self.cycle("1 failed"))
         self.assertEqual(self.detector.stopped(), "The main branch gave a final answer while pytest still fails.")
-        self.assertEqual(self.detector.kind, FAILURE)
+        self.assertEqual(self.detector.kind, UNFIXED)
         self.assertIsNone(self.detector.stopped())  # reported once
 
     def test_final_answer_after_the_check_passes(self):
