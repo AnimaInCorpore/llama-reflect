@@ -100,7 +100,7 @@ Reflect discovers reusable Markdown skills under `.refl/skills/` and lists them 
 - Reflect sends the whole active conversation with every request and does not trim it yet, so long sessions need a large context window.
 - The file tools read and write UTF-8 text only. Other encodings need Bash.
 - The `bash` tool runs commands with your user permissions, without a sandbox or confirmation. Use a disposable folder or a container for tasks you do not trust.
-- In tests with 27B models, reflection never started on tasks the model solved directly. It helped on a task where the model went in circles. A 4B model stalls more often. With thinking, reflection solved a task that the model never solved alone. Without thinking, it gained nothing, because the model rarely acted on what the reviewers found. [Results so far](docs/benchmark-plan.md#results-so-far)
+- In tests with 27B models, reflection never started on tasks the model solved directly. It helped on a task where the model went in circles, until a newer llama.cpp build let the model solve that task directly. A 4B model stalls more often. With thinking, reflection solved a task that the model never solved alone. Without thinking, it gained nothing, because the model rarely acted on what the reviewers found. [Results so far](docs/benchmark-plan.md#results-so-far)
 
 ## Development
 

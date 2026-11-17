@@ -57,6 +57,8 @@ These runs used two 27B models on a single-slot `llama-server` at temperature 0 
 
 With thinking enabled, one reply of the same model needed more than 8192 output tokens. Raise `--max-tokens` for reasoning models.
 
+These `opaque-report` runs used llama.cpp build b12434. After the message and reflection changes for the 4B model, the second model ran again on build b12465 without thinking. All six tasks were solved in every run of both arms, two repeats each, without a stall, so reflection never started. `opaque-report` took 6 requests. In three more runs without reflection at 40 requests, it was solved every time as well. The model read the spec, the check, the code, and the data in one round, rebuilt the report in an inline script until its hash matched the check, and then rewrote `report.py`. Reflect code from before the changes also solved it on this build in 7 requests in each of three runs, so the change came from the server, not from Reflect. The changes added no cost for this model. The task no longer makes this model stall on this build, so a 27B comparison needs a harder task.
+
 ### A 4B model
 
 Gemma 4 E4B (UD-Q8_K_XL) ran all six tasks in natural mode with a budget of 30 requests: three repeats without thinking and two with it. Unlike the 27B models, it stalls by itself on three tasks. Each row adds one change to the version above it.

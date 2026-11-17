@@ -12,7 +12,7 @@ python bench/reflection_ab.py --validate
 
 Every task must report `ok`: it fails as written, passes with its reference fix, and its scripted stall triggers the detector on the last step.
 
-Then run the hardest task without thinking. A 27B model stalls on it by itself, so the arms can differ.
+Then run the hardest task without thinking. A 27B model stalled on it by itself with llama.cpp b12434 but solved it directly with b12465, so record the llama.cpp build with each result.
 
 ```text
 python bench/reflection_ab.py --url http://127.0.0.1:8080 --tasks opaque-report --thinking off --max-turns 40 --repeat 3
