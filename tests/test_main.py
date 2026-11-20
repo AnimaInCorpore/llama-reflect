@@ -1,7 +1,11 @@
 import contextlib
 import io
+import os
+import subprocess
+import sys
 import tempfile
 import unittest
+from pathlib import Path
 
 from refl.client import ServerProperties
 from refl.main import _check_command, _check_fork_effort, _tolerant_output, main
@@ -46,6 +50,18 @@ class MainTest(unittest.TestCase):
         code, errors = self.run_main("C:/Program Files/Git/checkout 5")
         self.assertEqual(code, 2)
         self.assertIn("looks like /checkout", errors)
+
+    def test_project_files_do_not_replace_standard_modules(self):
+        # python -m refl starts in the project folder, which could hold a file named like a standard module that
+        # Reflect imports. Modules that Python itself needs to run -m, such as types, stay out of reach.
+        for name in ("dis", "inspect", "json", "socket"):
+            Path(self.directory.name, f"{name}.py").write_text(f"raise SystemExit('{name}.py was imported')",
+                                                               encoding="utf-8")
+        environment = {**os.environ, "PYTHONPATH": str(Path(__file__).resolve().parent.parent)}
+        result = subprocess.run([sys.executable, "-m", "refl", "--help"], cwd=self.directory.name, env=environment,
+                                capture_output=True, encoding="utf-8", errors="replace", timeout=60)
+        self.assertEqual((result.returncode, result.stderr), (0, ""))
+        self.assertTrue(result.stdout.startswith("usage: refl"))
 
     def test_tasks_that_start_with_a_path_still_run(self):
         _check_command("/tmp", "is full, clean it")

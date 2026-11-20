@@ -4,16 +4,52 @@
 
 ## Install
 
-Install from this directory using Python 3.9 or newer. Reflect uses only Python's standard library, so the install adds no other packages. Use `python3` if that is how your system names Python.
+Reflect needs Python 3.9 or newer and nothing beyond its standard library. Install it from this directory. Use `python3` if that is how your system names Python.
 
 ```text
 python -m pip install -e .
 refl --help
 ```
 
-You can also run `python -m refl` from this checkout.
+To build the package, pip downloads `setuptools`. Without internet access, add `--no-build-isolation`, which uses the `setuptools` of your Python installation if it has one. You can also skip the install and run `python -m refl` from this checkout.
 
-The `grep_search` tool uses `rg` (ripgrep) when it is on `PATH`. Without it, Reflect searches with a built-in Python search that finds the same lines but is slower in large projects. On Linux and macOS, the `bash` tool uses Bash from `PATH`. On Windows, Reflect looks for Bash from MSYS2 or Git for Windows. Pass `--bash` with the executable path to choose a specific installation.
+The `grep_search` tool uses `rg` (ripgrep) when it is on `PATH`. Without it, Reflect uses a built-in Python search that finds the same lines but is slower in large projects. On Linux and macOS, the `bash` tool uses Bash from `PATH`. Pass `--bash` with the executable path to choose a specific installation.
+
+### Windows
+
+In PowerShell, install Reflect from this directory and call it through Python:
+
+```powershell
+python -m pip install -e .
+python -m refl --help
+```
+
+pip often puts `refl.exe` in a `Scripts` folder that is not on `PATH`, for example with Python from the Microsoft Store, and names that folder in a warning. After the install, `python -m refl` works from any directory, so use it wherever this README calls `refl`. Python looks for the modules it needs to start `-m` in the current folder first, so a project file such as `types.py` stops it with "Could not import runpy module". Start Reflect from another folder with `--workspace` in that case.
+
+The `bash` tool needs Bash from MSYS2 or Git for Windows. Reflect finds `C:\msys64\usr\bin\bash.exe` and the Bash that comes with Git for Windows on its own. It skips the `bash.exe` in the Windows folder, which starts WSL.
+
+ripgrep is optional. winget installs it and adds it to `PATH` for new PowerShell windows:
+
+```powershell
+winget install --id BurntSushi.ripgrep.MSVC --exact
+```
+
+The ripgrep of MSYS2 in `C:\msys64\ucrt64\bin` works too. Add that folder to the end of `PATH`, because it also contains a `python.exe` that would otherwise take the place of your usual Python.
+
+Start `llama-server` in its own PowerShell window with the call operator `&`, and quote paths that contain spaces. If another program already uses port 8080, choose another port:
+
+```powershell
+& 'C:\path\to\llama-server.exe' -m 'C:\path\to\model.gguf' --jinja -c 32768 --port 8091
+```
+
+Then start Reflect in the project folder with the same address:
+
+```powershell
+cd C:\path\to\project
+python -m refl --url http://127.0.0.1:8091
+```
+
+PowerShell sets environment variables such as `LLAMA_API_KEY` and `LLAMA_BASE_URL` with `$env:`, for example `$env:LLAMA_BASE_URL = "http://127.0.0.1:8091"`. The setting lasts until the window closes.
 
 ## Start a server
 
