@@ -1419,7 +1419,9 @@ async def respond_after_stall(engine, task, max_turns, heat=0, roles=None):
             await engine._reflect(reason)
         return await engine._respond()
     except (ServerError, TurnLimitError) as error:
-        engine.tree.append({"role": "assistant", "content": f"[Turn stopped] {error}"})
+        note = f"[Turn stopped] {error}"
+        report = getattr(error, "report", None)
+        engine.tree.append({"role": "assistant", "content": f"{report}\n\n{note}" if report else note})
         raise
     finally:
         engine.track_strategy = False

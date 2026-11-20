@@ -133,6 +133,22 @@ class StallDetectorTest(unittest.TestCase):
     def test_exploring_without_a_failure_is_not_a_stall(self):
         self.assertEqual(self.explore(20), [None] * 20)
 
+    def test_a_search_without_matches_is_not_a_failing_check(self):
+        # grep exits with 1 when nothing matches, which during an investigation is the answer itself.
+        self.explore(8)
+        self.record("bash", {"command": "ls games | grep -iE 'geebee|bombbee'"}, {"exit_code": 1, "output": ""})
+        self.assertEqual(self.explore(12, start=8), [None] * 12)
+
+    def test_a_timeout_counts_as_failing(self):
+        self.record("bash", {"command": "mame bombbee"}, {"error": "Bash timed out after 180 seconds", "output": ""})
+        self.assertEqual(self.explore(9)[-1], "10 tool calls in a row changed no file while mame bombbee still fails.")
+
+    def test_a_plain_failure_keeps_the_reported_one(self):
+        self.record("bash", {"command": "python check.py"}, {"exit_code": 1, "output": "FAILED"})
+        self.record("bash", {"command": "test -f out.txt"}, {"exit_code": 1, "output": ""})
+        reasons = self.explore(8)
+        self.assertEqual(reasons[-1], "10 tool calls in a row changed no file while python check.py still fails.")
+
     def test_a_file_change_restarts_the_count(self):
         self.record("bash", {"command": "python check.py"}, {"exit_code": 1, "output": "FAILED"})
         self.explore(5)

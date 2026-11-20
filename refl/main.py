@@ -105,7 +105,12 @@ async def _submit(engine, prompt):
     elif command == "/exit":
         raise ValueError("Usage: /exit")
     else:
-        print(await engine.respond(prompt), flush=True)
+        try:
+            print(await engine.respond(prompt), flush=True)
+        except TurnLimitError as error:
+            if error.report:
+                print(error.report, flush=True)
+            raise
 
 
 async def _run(args):

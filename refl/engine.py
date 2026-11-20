@@ -34,7 +34,13 @@ _BASH_TOOLS = [tool for tool in TOOLS if tool["function"]["name"] == "bash"]
 _REVIEWERS = len(TEMPERATURE_SLOTS[0])
 _REVIEW_REQUESTS = 2  # at most, for a role with tools
 _ENGINE_PROMPTS = ("Verification results", "Reflection results", "Run the smoke check now.",
-                   "Carry out the plan now", "Your last reply reached the limit", "This is the final request")
+                   "Carry out the plan now", "Your last reply reached the limit", "This is the final request",
+                   "The request limit of this turn is reached")
+# One request beyond the limit, so that a turn that ran out of requests still says where the task stands.
+_LIMIT_REPORT_PROMPT = (
+    "The request limit of this turn is reached, and no tools remain. Report where the task stands: what is done, "
+    "what you found, what is still open, and the next step. The user can continue the task from your report."
+)
 # The last request after a reflection in a task that changed no file, such as a question.
 _FINAL_ANSWER_PROMPT = (
     "This is the final request, and no tools remain. Answer the task now from what you found so far, and say "
@@ -132,7 +138,12 @@ def default_thinking_budget(max_tokens):
 
 
 class TurnLimitError(RuntimeError):
-    """The turn used all of its allotted model requests."""
+    """The turn used all of its allotted model requests. `report` holds the model's account of where the task
+    stands, from one more request without tools, when that request succeeded."""
+
+    def __init__(self, message, report=None):
+        super().__init__(message)
+        self.report = report
 
 
 def _call_summary(function):
@@ -696,7 +707,10 @@ class Engine:
         try:
             return await self._respond()
         except (ServerError, TurnLimitError) as error:
-            self.tree.append({"role": "assistant", "content": f"[Turn stopped] {error}"})
+            note = f"[Turn stopped] {error}"
+            # The report and the note form one reply, so the conversation keeps alternating between roles.
+            report = getattr(error, "report", None)
+            self.tree.append({"role": "assistant", "content": f"{report}\n\n{note}" if report else note})
             self.tree.save()
             raise
         finally:
@@ -720,8 +734,9 @@ class Engine:
             "role": "user",
             "content": (
                 "Run the smoke check now. Use one bash call with the command that reproduced the failure "
-                "or the applicable check from the reflection findings. This is the final request. "
-                "If there is no applicable smoke check, say so."
+                "or the applicable check from the reflection findings. Run only the check: change no files, "
+                "and put no other command after it, so that the call's exit code is the check's. This is the "
+                "final request. If there is no applicable smoke check, say so."
             ),
         })
         message = await self._complete(self._messages(self.tree.head), _BASH_TOOLS)
@@ -805,4 +820,22 @@ class Engine:
             if not claims and not calls:
                 return answer.strip()
 
-        raise TurnLimitError(f"Reached the {self.max_turns}-request limit before a final answer. Increase --max-turns.")
+        raise TurnLimitError(f"Reached the {self.max_turns}-request limit before a final answer. Send a follow-up "
+                             "such as \"continue\" to go on, or raise --max-turns.", report=await self._limit_report())
+
+    async def _limit_report(self):
+        """Ask once more, without tools, where the task stands. The request comes on top of the limit, so the work
+        keeps all of its requests. Without a usable reply the turn stops without a report."""
+        self.tree.append({"role": "user", "content": _LIMIT_REPORT_PROMPT})
+        self.tree.save()
+        self.requests_left = 1
+        try:
+            message = await self._complete(self._messages(self.tree.head), [])
+        except ServerError:
+            return None
+        finally:
+            self.requests_left = 0
+        answer = message.get("content")
+        if _tool_calls(message) or not isinstance(answer, str) or not answer.strip():
+            return None
+        return answer.strip()

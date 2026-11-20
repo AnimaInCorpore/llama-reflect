@@ -131,7 +131,10 @@ def choose_roles(level, kind, used=frozenset(), unavailable=frozenset()):
 _FILE_WRITES = {"write_file", "edit_file"}
 # Tool results in a row without a file change, while a failing command is unresolved, that count as a stall.
 # Replayed over 471 benchmark runs, 10 fired in no solved run and early enough for a reflection in 21 failed
-# ones. 15 caught 9 in time, and 8 also fired in 13 solved runs.
+# ones. 15 caught 9 in time, and 8 also fired in 13 solved runs. Only a failure that a check reports, or a
+# timeout, counts: replayed over 477 runs, the rule fired in the same 23 failed runs as before, 21 in time, and
+# in no solved one, and it no longer fired in two real sessions on a grep without a match or an ls of a
+# missing folder.
 _QUIET_LIMIT = 10
 # Summaries that test runners and Python print. A piped command such as `pytest | tail` exits successfully
 # even when the tests fail.
@@ -171,6 +174,13 @@ class _Observation:
         output = self.result.get("output")
         return self.failed or (isinstance(output, str) and bool(_FAILURE_REPORT.search(output)))
 
+    @property
+    def reports_check_failure(self):
+        """A failure that a test runner or Python reports in the output, or a call that ended in an error, such as
+        a timeout. A command that only exits nonzero, such as grep without a match, can be the answer itself."""
+        output = self.result.get("output")
+        return "error" in self.result or (isinstance(output, str) and bool(_FAILURE_REPORT.search(output)))
+
 
 class StallDetector:
     """Track a bounded window of real main-branch tool results."""
@@ -187,7 +197,9 @@ class StallDetector:
         self.runs = {}  # how often each Bash command ran in the task
         self.last_bash = None
         self.quiet = 0  # tool results in a row that changed no file
-        self.unresolved = None  # the latest failed Bash command that has not passed since
+        # The latest Bash command whose output reported a failure, or that ended in an error, and that has not
+        # passed since.
+        self.unresolved = None
         self.kind = None  # stall kind of the latest report
         self.batches = 0  # reflection batches since the task started or last made progress
         self.used = set()  # role names used in those batches
@@ -256,9 +268,10 @@ class StallDetector:
             self.outputs.setdefault(observation.action, []).append(signature)
             self.runs[observation.action] = self.runs.get(observation.action, 0) + 1
             self.last_bash = observation
-            if observation.reports_failure:
+            if observation.reports_check_failure:
                 self.unresolved = observation
-            elif self.unresolved is not None and self.unresolved.action == observation.action:
+            elif (self.unresolved is not None and self.unresolved.action == observation.action
+                  and not observation.reports_failure):
                 self.unresolved = None
         self.quiet = 0 if changed else self.quiet + 1
         self.recent.append(observation)

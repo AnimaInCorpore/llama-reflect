@@ -169,6 +169,13 @@ def _tail(stream):
     return prefix + stream.read().decode("utf-8", errors="replace")
 
 
+# Bash reads each command from a file instead of a -c argument. On Windows, MSYS2 and Git Bash parse their
+# command line with rules of their own that turn \\ into \, so a Python heredoc that wrote "\\n" put a line
+# break into a Lua string. The command line also holds 32 KB at most. eval keeps the messages that -c gives,
+# such as "bash: line 3: ...", so they do not name the file, and "set --" clears the file's path from $1.
+_RUN_SCRIPT = 'eval "set --; $(< "$1")"'
+
+
 def _descendants(pid):
     """The process IDs started under pid, from the parent IDs that ps lists, or none if ps is unavailable."""
     try:
@@ -448,20 +455,30 @@ class WorkspaceTools:
                 if utilities.is_dir() and utilities not in map(Path, search_path):
                     search_path.insert(0, str(utilities))
             env["PATH"] = os.pathsep.join(search_path)
-        with tempfile.TemporaryFile() as output:
-            process = subprocess.Popen(
-                [self.bash_executable, "--noprofile", "--norc", "-c", command],
-                cwd=self.root, env=env, stdin=subprocess.DEVNULL, stdout=output, stderr=subprocess.STDOUT,
-            )
+        script = tempfile.NamedTemporaryFile(prefix="refl-command-", suffix=".sh", delete=False)
+        try:
+            with script:
+                script.write(command.encode("utf-8"))
+            with tempfile.TemporaryFile() as output:
+                process = subprocess.Popen(
+                    [self.bash_executable, "--noprofile", "--norc", "-c", _RUN_SCRIPT, "bash",
+                     Path(script.name).as_posix()],
+                    cwd=self.root, env=env, stdin=subprocess.DEVNULL, stdout=output, stderr=subprocess.STDOUT,
+                )
+                try:
+                    exit_code = process.wait(timeout=timeout_seconds)
+                except subprocess.TimeoutExpired:
+                    _end_process_tree(process)
+                    return {"error": f"Bash timed out after {timeout_seconds} seconds", "output": _tail(output)}
+                except BaseException:
+                    _end_process_tree(process)
+                    raise
+                return {"exit_code": exit_code, "output": _tail(output)}
+        finally:
             try:
-                exit_code = process.wait(timeout=timeout_seconds)
-            except subprocess.TimeoutExpired:
-                _end_process_tree(process)
-                return {"error": f"Bash timed out after {timeout_seconds} seconds", "output": _tail(output)}
-            except BaseException:
-                _end_process_tree(process)
-                raise
-            return {"exit_code": exit_code, "output": _tail(output)}
+                os.unlink(script.name)
+            except OSError:
+                pass
 
     def write_file(self, path, content):
         target = self._write_target(path)

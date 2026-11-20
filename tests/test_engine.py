@@ -5,7 +5,7 @@ import unittest
 from pathlib import Path
 
 from refl.client import THINKING_BUDGET_MESSAGE, ContextLimitError, ServerError, TokenLimitError
-from refl.engine import _call_summary, attach_images, default_thinking_budget, tool_text
+from refl.engine import TurnLimitError, _call_summary, attach_images, default_thinking_budget, tool_text
 
 from .test_tools import png
 
@@ -59,6 +59,7 @@ class EngineTest(unittest.TestCase):
         self.assertEqual(asyncio.run(engine.respond("Fix it.")), "All checks pass.")
         self.assertTrue(any(event.startswith("Strategy\nReflecting") for event in events))
         self.assertEqual(server.requests[-1]["tools"], ["bash"])
+        self.assertIn("Run only the check: change no files", server.requests[-1]["messages"][-1]["content"])
 
     def test_a_task_without_changes_gets_its_answer_on_the_last_request(self):
         # A question that stalled must not end with a smoke check in place of its answer.
@@ -76,6 +77,27 @@ class EngineTest(unittest.TestCase):
         engine, _, _ = make_engine(self.root, replies, max_turns=11)
         with self.assertRaisesRegex(ServerError, "Expected a text answer on the final request"):
             asyncio.run(engine.respond("What is in a.txt?"))
+
+    def test_a_turn_that_runs_out_reports_where_it_stands(self):
+        (self.root / "a.txt").write_text("a\n", encoding="utf-8")
+        reads = [call("read_file", path="a.txt", start_line=1, end_line=line) for line in range(1, 5)]
+        engine, server, _ = make_engine(self.root, reads + [text("Read a.txt. Next: port the input map.")],
+                                        max_turns=4)
+        with self.assertRaises(TurnLimitError) as raised:
+            asyncio.run(engine.respond("Port it."))
+        self.assertEqual(raised.exception.report, "Read a.txt. Next: port the input map.")
+        self.assertIn('Send a follow-up such as "continue"', str(raised.exception))
+        # The report comes on top of the limit, without tools, so the work kept all four requests.
+        self.assertEqual((len(server.requests), server.requests[-1]["tools"]), (5, []))
+        self.assertTrue(server.requests[-1]["messages"][-1]["content"].startswith("The request limit of this turn"))
+        last = engine.tree.nodes[engine.tree.head].message
+        self.assertEqual(last["role"], "assistant")
+        self.assertTrue(last["content"].startswith("Read a.txt. Next: port the input map.\n\n[Turn stopped] Reached"))
+
+        engine, _, _ = make_engine(self.root, reads + [ServerError("HTTP 500")], max_turns=4)
+        with self.assertRaises(TurnLimitError) as raised:
+            asyncio.run(engine.respond("Port it."))
+        self.assertIsNone(raised.exception.report)
 
     def test_terminal_shows_the_tool_target(self):
         engine, _, events = make_engine(self.root, [call("read_file", path="status.txt"), text("ok")])

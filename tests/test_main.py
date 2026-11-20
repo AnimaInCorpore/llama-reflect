@@ -1,3 +1,4 @@
+import asyncio
 import contextlib
 import io
 import os
@@ -9,7 +10,8 @@ from pathlib import Path
 from unittest import mock
 
 from refl.client import ServerProperties
-from refl.main import _check_command, _check_fork_effort, _tolerant_output, main
+from refl.engine import TurnLimitError
+from refl.main import _check_command, _check_fork_effort, _submit, _tolerant_output, main
 
 # Nothing listens on the discard port, so a test that reaches the server fails.
 _NO_SERVER = "http://127.0.0.1:9"
@@ -77,6 +79,16 @@ class MainTest(unittest.TestCase):
                 main([*argv, "--workspace", self.directory.name, "--url", _NO_SERVER])
             self.assertIn("--thinking", errors.getvalue())
         self.assertIn("--thinking off, the default", errors.getvalue())
+
+    def test_the_report_is_shown_when_a_turn_runs_out(self):
+        class Engine:
+            async def respond(self, prompt):
+                raise TurnLimitError("Reached the 20-request limit before a final answer.", report="Done: A. Open: B.")
+
+        output = io.StringIO()
+        with contextlib.redirect_stdout(output), self.assertRaises(TurnLimitError):
+            asyncio.run(_submit(Engine(), "Port it."))
+        self.assertEqual(output.getvalue(), "Done: A. Open: B.\n")
 
     def test_thinking_is_off_by_default(self):
         seen = []

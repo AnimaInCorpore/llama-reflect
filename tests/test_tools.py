@@ -251,6 +251,22 @@ class BashTest(unittest.TestCase):
     def test_exit_code_and_output(self):
         self.assertEqual(self.tools.bash("echo hi; exit 3"), {"exit_code": 3, "output": "hi\n"})
 
+    def test_backslashes_reach_bash_unchanged(self):
+        # As a -c argument on Windows, the backslashes were halved: a Python heredoc saw "a\nb", not "a\\nb".
+        python = Path(sys.executable).as_posix()
+        command = f"printf '%s\\n' 'a\\\\b'; \"{python}\" - <<'EOF'\nprint(len(\"a\\\\nb\"), end=\"\")\nEOF"
+        self.assertEqual(self.tools.bash(command), {"exit_code": 0, "output": "a\\\\b\n4"})
+
+    def test_a_command_longer_than_the_windows_command_line(self):
+        command = "cat <<'EOF' | wc -c\n" + "x" * 40000 + "\nEOF"
+        self.assertEqual(self.tools.bash(command)["output"].strip(), "40001")
+
+    def test_messages_do_not_name_the_command_file(self):
+        output = self.tools.bash("echo $0 $#\nnothere_cmd")["output"]
+        self.assertEqual(output.splitlines()[0], "bash 0")
+        self.assertIn("line 2: nothere_cmd: command not found", output)
+        self.assertNotIn("refl-command", output)
+
     def test_a_timeout_also_stops_the_programs_bash_started(self):
         # A program behind a pipe, such as an emulator piped through tail, used to outlive Bash.
         python = Path(sys.executable).as_posix()

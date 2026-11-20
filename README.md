@@ -111,7 +111,7 @@ Omit the prompt for an interactive session, and type `/exit` or send EOF to quit
 | `--no-verify` | Off | Keep strategic reflection and skip verification forks |
 | `--thinking off\|auto\|main` | `off` | No thinking step, one when the chat template decides so, or one on the main branch only |
 | `--fork-effort LEVEL` | Template default | Reasoning effort for verifier and reviewer requests, such as `low` |
-| `--max-turns N` | 20 | Model requests per prompt, counted across all branches |
+| `--max-turns N` | 20 | Model requests per prompt, counted across all branches. When they run out, one more request without tools reports where the task stands, and a follow-up such as `continue` goes on from there |
 | `--max-tokens N` | 16384 | Output tokens per request |
 | `--thinking-budget N` | Half of `--max-tokens` | Thinking tokens per request before the server ends the thinking block. `-1` sets no limit |
 | `--timeout SECONDS` | 600 | Time per model request, including any wait for a free slot |
