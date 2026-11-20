@@ -51,6 +51,30 @@ python -m refl --url http://127.0.0.1:8091
 
 PowerShell sets environment variables such as `LLAMA_API_KEY` and `LLAMA_BASE_URL` with `$env:`, for example `$env:LLAMA_BASE_URL = "http://127.0.0.1:8091"`. The setting lasts until the window closes.
 
+### MSYS2
+
+Reflect also runs in the MSYS2 UCRT64 shell with MSYS2's own Python, straight from the checkout and without an install. Open "MSYS2 UCRT64" from the Start menu. Reflect has not been tested with the Python of the plain MSYS shell. Install Python in UCRT64 if it is missing, and ripgrep if you want faster searches:
+
+```bash
+pacman -S mingw-w64-ucrt-x86_64-python mingw-w64-ucrt-x86_64-ripgrep
+```
+
+This Python has no pip and is managed by pacman, which does not matter, because Reflect needs no packages. Add a `refl` function to `~/.bashrc` that runs Reflect from the checkout, then load it:
+
+```bash
+echo 'refl() { PYTHONPATH=/c/path/to/llama-reflect python -m refl "$@"; }' >> ~/.bashrc
+source ~/.bashrc
+```
+
+If `llama-server` uses a port other than 8080, add its address to `~/.bashrc` as well, for example `export LLAMA_BASE_URL=http://127.0.0.1:8091`. MSYS2 converts paths such as `/c/models/model.gguf` for Windows programs, so you can start `llama-server.exe` from the same shell. Then start Reflect in the project folder:
+
+```bash
+cd /c/path/to/project
+refl
+```
+
+Because Reflect runs from the checkout, a `git pull` there takes effect the next time you start it. Windows programs do not always see the MSYS2 window as a terminal. If Reflect shows no `refl>` prompt there, install the `winpty` package and put `winpty` before `python` in the function. Single tasks passed as an argument work either way. Slash commands passed as an argument need the prefix described under [Interactive commands](#interactive-commands).
+
 ## Start a server
 
 Start `llama-server` with a GGUF and a chat template that support tool calling. Port 8080 is Reflect's default.
