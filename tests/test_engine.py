@@ -4,8 +4,10 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from refl.client import THINKING_BUDGET_MESSAGE, ContextLimitError
-from refl.engine import _call_summary, default_thinking_budget, tool_text
+from refl.client import THINKING_BUDGET_MESSAGE, ContextLimitError, ServerError, TokenLimitError
+from refl.engine import _call_summary, attach_images, default_thinking_budget, tool_text
+
+from .test_tools import png
 
 from .fakes import call, decision, make_engine, text, verdict
 
@@ -50,13 +52,30 @@ class EngineTest(unittest.TestCase):
     def test_smoke_check_request_answered_in_text(self):
         (self.root / "a.txt").write_text("a\n", encoding="utf-8")
         replies = [call("read_file", path="missing.txt"), call("read_file", path="missing.txt")]
-        replies += [text("Read a.txt first.")] * 3 + [decision()]
-        replies += [call("read_file", path="a.txt", start_line=1, end_line=line) for line in range(1, 5)]
+        replies += [text("Read a.txt first.")] * 3 + [decision(), call("write_file", path="a.txt", content="b\n")]
+        replies += [call("read_file", path="a.txt", start_line=1, end_line=line) for line in range(1, 4)]
         replies += [text("All checks pass.")]
         engine, server, events = make_engine(self.root, replies, max_turns=11)
         self.assertEqual(asyncio.run(engine.respond("Fix it.")), "All checks pass.")
         self.assertTrue(any(event.startswith("Strategy\nReflecting") for event in events))
         self.assertEqual(server.requests[-1]["tools"], ["bash"])
+
+    def test_a_task_without_changes_gets_its_answer_on_the_last_request(self):
+        # A question that stalled must not end with a smoke check in place of its answer.
+        (self.root / "a.txt").write_text("a\n", encoding="utf-8")
+        replies = [call("read_file", path="missing.txt"), call("read_file", path="missing.txt")]
+        replies += [text("Read a.txt first.")] * 3 + [decision()]
+        replies += [call("read_file", path="a.txt", start_line=1, end_line=line) for line in range(1, 5)]
+        replies += [text("a.txt holds one line, a.")]
+        engine, server, _ = make_engine(self.root, replies, max_turns=11)
+        self.assertEqual(asyncio.run(engine.respond("What is in a.txt?")), "a.txt holds one line, a.")
+        self.assertEqual(server.requests[-1]["tools"], [])
+        self.assertTrue(server.requests[-1]["messages"][-1]["content"].startswith("This is the final request"))
+
+        replies[-1] = call("bash", command="cat a.txt")
+        engine, _, _ = make_engine(self.root, replies, max_turns=11)
+        with self.assertRaisesRegex(ServerError, "Expected a text answer on the final request"):
+            asyncio.run(engine.respond("What is in a.txt?"))
 
     def test_terminal_shows_the_tool_target(self):
         engine, _, events = make_engine(self.root, [call("read_file", path="status.txt"), text("ok")])
@@ -258,9 +277,27 @@ class EngineTest(unittest.TestCase):
         self.assertEqual(engine.tree.messages(engine.tree.head)[-1]["content"], f"[Turn stopped] {message}")
 
 
-    def test_default_thinking_budget_leaves_room_for_the_answer(self):
-        self.assertEqual([default_thinking_budget(tokens) for tokens in (256, 2048, 4096, 16384)],
-                         [128, 1024, 3072, 15360])
+    def test_default_thinking_budget_leaves_half_for_the_answer(self):
+        self.assertEqual([default_thinking_budget(tokens) for tokens in (256, 2048, 8192)], [128, 1024, 4096])
+
+    def test_a_cut_off_reply_is_retried_once_with_a_note(self):
+        engine, server, events = make_engine(self.root, [
+            TokenLimitError("Completion reached its token limit. Increase --max-tokens."),
+            call("write_file", path="a.svg", content="<svg/>"),
+            text("Done."),
+        ], forks=False)
+        self.assertEqual(asyncio.run(engine.respond("Draw a pelican.")), "Done.")
+        note = server.requests[1]["messages"][-1]
+        self.assertEqual(note["role"], "user")
+        self.assertTrue(note["content"].startswith("Your last reply reached the limit of 256 output tokens"))
+        self.assertIn("The reply reached the 256-token limit. Asking for a shorter one.", events)
+        self.assertEqual((self.root / "a.svg").read_text(encoding="utf-8"), "<svg/>")
+
+    def test_a_second_cut_off_reply_stops_the_turn(self):
+        limit = TokenLimitError("Completion reached its token limit. Increase --max-tokens.")
+        engine, _, _ = make_engine(self.root, [limit, limit], forks=False)
+        with self.assertRaises(TokenLimitError):
+            asyncio.run(engine.respond("Draw a pelican."))
 
     def test_thinking_budget_reaches_the_server(self):
         engine, server, _ = make_engine(self.root, [text("Done.")], forks=False)
@@ -285,6 +322,42 @@ class EngineTest(unittest.TestCase):
         ], fork_effort="low")
         asyncio.run(engine.respond("Check the status."))
         self.assertEqual([request["reasoning_effort"] for request in server.requests], [None, "low", "low", None])
+
+    def test_view_image_shows_the_image_after_the_tool_result(self):
+        (self.root / "square.png").write_bytes(png(8, 8))
+        engine, server, _ = make_engine(self.root, [call("view_image", path="square.png"), text("It is red.")],
+                                        forks=False, vision=True)
+        self.assertEqual(asyncio.run(engine.respond("What colour is square.png?")), "It is red.")
+        self.assertIn("view_image", server.requests[0]["tools"])
+        tool, image = server.requests[1]["messages"][-2:]
+        self.assertEqual(tool["role"], "tool")
+        self.assertTrue(tool["content"].startswith("Showing square.png (PNG, 8 x 8 pixels,"))
+        self.assertEqual(image["role"], "user")
+        self.assertEqual(image["content"][0], {"type": "text", "text": "The image from the view_image call above."})
+        self.assertTrue(image["content"][1]["image_url"]["url"].startswith("data:image/png;base64,"))
+
+    def test_without_image_input_the_tool_is_not_offered(self):
+        engine, server, _ = make_engine(self.root, [text("Done.")], forks=False)
+        asyncio.run(engine.respond("hi"))
+        self.assertNotIn("view_image", server.requests[0]["tools"])
+        self.assertIn("read_file", server.requests[0]["tools"])
+
+    def test_images_follow_the_last_tool_result_of_a_reply(self):
+        image = json.dumps({"output": "Showing a.png", "image": "data:image/png;base64,AAAA"})
+        messages = [
+            {"role": "assistant", "content": None, "tool_calls": []},
+            {"role": "tool", "tool_call_id": "1", "content": image},
+            {"role": "tool", "tool_call_id": "2", "content": image},
+            {"role": "user", "content": "Next."},
+        ]
+        shown = attach_images(messages, vision=True)
+        self.assertEqual([message["role"] for message in shown], ["assistant", "tool", "tool", "user", "user"])
+        self.assertEqual(shown[1]["content"], "Showing a.png")
+        self.assertEqual(shown[3]["content"][0]["text"], "The 2 images from the view_image calls above, in order.")
+        self.assertEqual(len(shown[3]["content"]), 3)
+        hidden = attach_images(messages, vision=False)
+        self.assertEqual(hidden[3]["content"],
+                         "The server has no image input, so the images from view_image are not shown.")
 
 if __name__ == "__main__":
     unittest.main()

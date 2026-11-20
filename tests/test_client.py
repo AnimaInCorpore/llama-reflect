@@ -71,11 +71,12 @@ class ClientTest(unittest.TestCase):
                 "default_generation_settings": {"n_ctx": 32768}, "build_info": "b12560-6aee50801",
                 "chat_template_caps": {"reasoning_effort_levels": ["low", "medium", "xhigh"],
                                        "reasoning_effort_rejected": ["minimal", "max"]},
+                "modalities": {"vision": True, "audio": False},
             }
 
         result = serve(handler, lambda client: client.properties("qwen"))
         self.assertEqual(result, ServerProperties(32768, "b12560-6aee50801", ["low", "medium", "xhigh"],
-                                                  ["minimal", "max"]))
+                                                  ["minimal", "max"], vision=True))
         self.assertEqual(seen, [("/props", "qwen")])
 
     def test_a_router_without_the_model_reports_no_context_size(self):
@@ -164,7 +165,7 @@ class TransportTest(unittest.TestCase):
             time.sleep(1.5)
             return 200, _REPLY
 
-        with self.assertRaisesRegex(ServerError, "no reply within 0.3 s"):
+        with self.assertRaisesRegex(ServerError, "^llama-server did not finish its reply within 0.3 s. Raise --timeout"):
             serve(handler, lambda client: client.complete("qwen", [], [], 16), timeout=0.3)
 
     def test_a_cancelled_request_stops_waiting_for_the_reply(self):

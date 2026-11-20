@@ -2,7 +2,7 @@ import asyncio
 import json
 import re
 
-from .client import THINKING_BUDGET_MESSAGE, ContextLimitError, ServerError
+from .client import THINKING_BUDGET_MESSAGE, ContextLimitError, ServerError, TokenLimitError
 from .reflection import MANUAL, REFLECTION_PROMPT, TEMPERATURE_SLOTS, StallDetector
 from .tools import TOOLS
 from .tree import ensure_git_ignored
@@ -28,13 +28,23 @@ SYSTEM_PROMPT = _PROMPT_START + _VERIFICATION_INSTRUCTION + _PROMPT_END
 _NO_VERIFY_PROMPT = _PROMPT_START + _PROMPT_END
 
 _VERIFY_TAG = re.compile(r"<verify>(.*?)</verify>", re.DOTALL | re.IGNORECASE)
-_READ_ONLY_NAMES = {"read_file", "grep_search"}
+_READ_ONLY_NAMES = {"read_file", "grep_search", "view_image"}
 _READ_ONLY_TOOLS = [tool for tool in TOOLS if tool["function"]["name"] in _READ_ONLY_NAMES]
 _BASH_TOOLS = [tool for tool in TOOLS if tool["function"]["name"] == "bash"]
 _REVIEWERS = len(TEMPERATURE_SLOTS[0])
 _REVIEW_REQUESTS = 2  # at most, for a role with tools
 _ENGINE_PROMPTS = ("Verification results", "Reflection results", "Run the smoke check now.",
-                   "Carry out the plan now")
+                   "Carry out the plan now", "Your last reply reached the limit", "This is the final request")
+# The last request after a reflection in a task that changed no file, such as a question.
+_FINAL_ANSWER_PROMPT = (
+    "This is the final request, and no tools remain. Answer the task now from what you found so far, and say "
+    "what is still open."
+)
+# Sent once per task when a main-branch reply is cut off at --max-tokens. The cut-off reply is discarded.
+_CUT_OFF_PROMPT = (
+    "Your last reply reached the limit of {limit:,} output tokens before it was complete, so it was discarded. "
+    "Think more briefly before you act, and split a large file into several smaller writes."
+)
 _PROJECT_WRITE_RULE = (
     "Preserve existing AGENTS.md, AGENTS.override.md, CLAUDE.md, CLAUDE.local.md, .mcp.json, and configuration "
     "under .agents/, .claude/, .codex/, and .pi/ when using tools, including Bash. Project skill files can be "
@@ -113,13 +123,12 @@ def _format_proposal(answer):
 # auto leaves thinking to the chat template, off disables it for every request, and main keeps it
 # only for main-branch requests.
 THINKING_MODES = ("auto", "off", "main")
-# Output tokens that the default thinking budget leaves for the answer, at most half of --max-tokens.
-_ANSWER_ROOM = 1024
-
-
 def default_thinking_budget(max_tokens):
-    """Thinking tokens per request that leave room for the answer within the output limit."""
-    return max_tokens - min(max_tokens // 2, _ANSWER_ROOM)
+    """Give half of the output limit to thinking, so the answer keeps the other half.
+
+    An answer can be long: writing a 5 KB SVG file took a 27B model about 2,600 tokens.
+    """
+    return max_tokens // 2
 
 
 class TurnLimitError(RuntimeError):
@@ -197,7 +206,8 @@ def tool_text(content):
         result = json.loads(content)
     except (TypeError, ValueError):
         return content
-    if not isinstance(result, dict) or not result or not set(result) <= {"output", "error", "exit_code", "changed"}:
+    if not isinstance(result, dict) or not result or not set(result) <= {"output", "error", "exit_code", "changed",
+                                                                          "image"}:
         return content
     lines = []
     if "error" in result:
@@ -207,6 +217,52 @@ def tool_text(content):
     if "output" in result:
         lines.append(str(result["output"]))
     return "\n".join(lines)
+
+
+def tool_image(content):
+    """Return the data URL of the image in a stored view_image result, or None."""
+    try:
+        result = json.loads(content)
+    except (TypeError, ValueError):
+        return None
+    image = result.get("image") if isinstance(result, dict) else None
+    return image if isinstance(image, str) and image.startswith("data:image/") else None
+
+
+def attach_images(messages, vision):
+    """Show each tool result as text, and the images from view_image in a user message after the results.
+
+    Every chat template with image input accepts images in a user message, while not every one renders them in
+    a tool result. Without image input, a note replaces the images.
+    """
+    converted, images = [], []
+
+    def flush():
+        if not images:
+            return
+        if not vision:
+            converted.append({"role": "user", "content": "The server has no image input, so the images from "
+                                                          "view_image are not shown."})
+        else:
+            caption = ("The image from the view_image call above." if len(images) == 1 else
+                       f"The {len(images)} images from the view_image calls above, in order.")
+            converted.append({"role": "user", "content": [
+                {"type": "text", "text": caption},
+                *({"type": "image_url", "image_url": {"url": image}} for image in images),
+            ]})
+        images.clear()
+
+    for message in messages:
+        if message["role"] == "tool":
+            content = message.get("content")
+            converted.append({**message, "content": tool_text(content)})
+            if image := tool_image(content):
+                images.append(image)
+            continue
+        flush()
+        converted.append(message)
+    flush()
+    return converted
 
 
 def split_text_and_calls(messages):
@@ -242,7 +298,8 @@ _CONTEXT_WARNINGS = (0.75, 0.9)
 
 class Engine:
     def __init__(self, server, model, workspace, tree, max_turns, max_tokens, on_tool, *, forks=True,
-                 verification=True, thinking="auto", thinking_budget=None, fork_effort=None, context_size=None):
+                 verification=True, thinking="auto", thinking_budget=None, fork_effort=None, context_size=None,
+                 vision=False):
         self.server = server
         self.model = model
         self.workspace = workspace
@@ -269,11 +326,16 @@ class Engine:
         self.strategy_path = f".refl/strategies/{tree.path.stem}.md"
         # Verdicts from the current task, reused until a main-branch command or write can change the evidence.
         self.verdicts = {}
+        # Whether a main-branch tool changed a file in the current task. A task without changes, such as a
+        # question, uses its last request after a reflection for the answer instead of a smoke check.
+        self.wrote_files = False
         # Whether the chat template moves an assistant's text after its tool results. Checked on the first request.
         self.split_text = None
         # Tokens of context per server slot, if the server reports it, and how many warnings were shown.
         self.context_size = context_size
         self.context_warnings = 0
+        # Whether the server takes image input. Without it the model does not get the view_image tool.
+        self.vision = vision
 
     def _messages(self, leaf, *, system_prompt=None):
         messages = self.tree.messages(leaf)
@@ -328,8 +390,9 @@ class Engine:
         thinking = self.thinking == "auto" or (self.thinking == "main" and not fork)
         if self.split_text is None:
             self.split_text = await self._template_moves_text()
-        messages = [{**message, "content": tool_text(message.get("content"))} if message["role"] == "tool"
-                    else message for message in messages]
+        messages = attach_images(messages, self.vision)
+        if not self.vision:
+            tools = [tool for tool in tools if tool["function"]["name"] != "view_image"]
         if self.split_text:
             messages = split_text_and_calls(messages)
         try:
@@ -400,6 +463,8 @@ class Engine:
                 result = await asyncio.to_thread(self.workspace.execute, function)
                 if not read_only and (name == "bash" or result.get("changed") is True):
                     self.verdicts.clear()
+                if not read_only and result.get("changed") is True:
+                    self.wrote_files = True
                 if tracking:
                     observation = json.dumps(result, ensure_ascii=False) if "output" in result or "error" in result else str(result)
                     self._strategy_event(f"Result\n\n    {observation[:600]}")
@@ -623,6 +688,7 @@ class Engine:
     async def respond(self, prompt):
         self.stalls.start_turn()
         self.verdicts = {}
+        self.wrote_files = False
         self._close_unfinished_round()
         self.tree.append({"role": "user", "content": prompt})
         self.tree.save()
@@ -636,6 +702,18 @@ class Engine:
         finally:
             self.track_strategy = False
             self.requests_left = None
+
+    async def _final_answer(self):
+        """Ask for the answer on the last request of a task that changed no file, where a smoke check has nothing to
+        check and would replace the answer to a question with a command's output."""
+        self.tree.append({"role": "user", "content": _FINAL_ANSWER_PROMPT})
+        message = await self._complete(self._messages(self.tree.head), [])
+        answer = message.get("content")
+        if _tool_calls(message) or not isinstance(answer, str) or not answer.strip():
+            raise ServerError("Expected a text answer on the final request.")
+        self.tree.append(message)
+        self.tree.save()
+        return answer.strip()
 
     async def _smoke_check(self):
         self.tree.append({
@@ -669,10 +747,21 @@ class Engine:
 
     async def _respond(self):
         reflected = False
+        cut_off = False
         while self.requests_left:
             if reflected and self.requests_left == 1:
-                return await self._smoke_check()
-            message = await self._complete(self._messages(self.tree.head), TOOLS)
+                return await (self._smoke_check() if self.wrote_files else self._final_answer())
+            try:
+                message = await self._complete(self._messages(self.tree.head), TOOLS)
+            except TokenLimitError:
+                # A reply cut off mid-way, often while writing a large file, is lost. Ask once for a shorter one.
+                if cut_off:
+                    raise
+                cut_off = True
+                self.on_tool(f"The reply reached the {self.max_tokens:,}-token limit. Asking for a shorter one.")
+                self.tree.append({"role": "user", "content": _CUT_OFF_PROMPT.format(limit=self.max_tokens)})
+                self.tree.save()
+                continue
             calls = _tool_calls(message)
             answer = message.get("content")
             if answer is not None and not isinstance(answer, str):

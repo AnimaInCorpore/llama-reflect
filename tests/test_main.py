@@ -6,6 +6,7 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 from refl.client import ServerProperties
 from refl.main import _check_command, _check_fork_effort, _tolerant_output, main
@@ -69,11 +70,24 @@ class MainTest(unittest.TestCase):
 
 
     def test_fork_effort_needs_thinking_in_the_forks(self):
-        for argv in (["hi", "--fork-effort", "none"], ["hi", "--fork-effort", "low", "--thinking", "main"]):
+        for argv in (["hi", "--fork-effort", "none"], ["hi", "--fork-effort", "low", "--thinking", "main"],
+                     ["hi", "--fork-effort", "low"]):
             errors = io.StringIO()
             with contextlib.redirect_stderr(errors), self.assertRaises(SystemExit):
                 main([*argv, "--workspace", self.directory.name, "--url", _NO_SERVER])
             self.assertIn("--thinking", errors.getvalue())
+        self.assertIn("--thinking off, the default", errors.getvalue())
+
+    def test_thinking_is_off_by_default(self):
+        seen = []
+
+        async def run(args):
+            seen.append(args.thinking)
+
+        with mock.patch("refl.main._run", run):
+            self.assertEqual(main(["hi"]), 0)
+            self.assertEqual(main(["hi", "--thinking", "auto", "--fork-effort", "low"]), 0)
+        self.assertEqual(seen, ["off", "auto"])
 
     def test_fork_effort_is_checked_against_the_template(self):
         properties = ServerProperties(effort_levels=["low", "medium", "xhigh"], rejected_efforts=["minimal", "max"])

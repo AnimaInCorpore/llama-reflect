@@ -152,13 +152,15 @@ async def _run(args):
         _status(f"Server build: {properties.build}")
     if properties.effort_levels:
         _status(f"Reasoning effort levels: {', '.join(properties.effort_levels)}")
+    if properties.vision:
+        _status("Image input: the model can look at images with view_image")
     _check_fork_effort(args.fork_effort, properties)
 
     tree = _open_tree(root, args.resume)
     engine = Engine(server, model, workspace, tree, args.max_turns, args.max_tokens, _status,
                     forks=not args.linear, verification=not args.no_verify, thinking=args.thinking,
                     thinking_budget=args.thinking_budget, fork_effort=args.fork_effort,
-                    context_size=properties.context_size)
+                    context_size=properties.context_size, vision=properties.vision is True)
     if args.prompt is not None:
         await _submit(engine, args.prompt)
         return
@@ -194,26 +196,27 @@ def main(argv=None):
     parser.add_argument("--linear", action="store_true", help="run the main tool loop with both kinds of forks disabled")
     parser.add_argument("--no-verify", action="store_true",
                         help="disable verification forks and keep strategic reflection")
-    parser.add_argument("--thinking", choices=THINKING_MODES, default="auto",
-                        help="auto: the chat template decides; off: ask it to skip thinking for every request; "
-                             "main: think on the main branch only (default: auto)")
+    parser.add_argument("--thinking", choices=THINKING_MODES, default="off",
+                        help="off: ask the chat template to skip thinking for every request; auto: the chat template "
+                             "decides; main: think on the main branch only (default: off)")
     parser.add_argument("--fork-effort", metavar="LEVEL",
                         help="reasoning effort for verifier and reviewer requests, such as low; the chat template "
                              "lists its levels at startup (default: the template's default)")
     parser.add_argument("--max-turns", type=_positive_int, default=20,
                         help="model requests per prompt across all branches (default: 20)")
-    parser.add_argument("--max-tokens", type=_positive_int, default=2048, help="output tokens per completion (default: 2048)")
+    parser.add_argument("--max-tokens", type=_positive_int, default=16384, help="output tokens per completion (default: 16384)")
     parser.add_argument("--thinking-budget", type=_thinking_budget, metavar="N",
                         help="thinking tokens per request before the server ends the thinking block; -1 sets no "
-                             "limit (default: --max-tokens minus room for the answer)")
-    parser.add_argument("--timeout", type=_positive_int, default=180, help="model request timeout in seconds (default: 180)")
+                             "limit (default: half of --max-tokens)")
+    parser.add_argument("--timeout", type=_positive_int, default=600, help="model request timeout in seconds (default: 600)")
     args = parser.parse_args(argv)
     if args.prompt is not None and not args.prompt.strip():
         parser.error("prompt must be nonempty")
     if args.fork_effort == "none":
         parser.error("use --thinking main to skip thinking in the forks")
     if args.fork_effort is not None and args.thinking != "auto":
-        parser.error(f"--fork-effort needs --thinking auto, because the forks skip thinking with --thinking {args.thinking}")
+        parser.error(f"--fork-effort needs --thinking auto, because the forks skip thinking with --thinking "
+                     f"{args.thinking}{', the default' if args.thinking == 'off' else ''}")
     if args.prompt is not None and (mangled := _MSYS_COMMAND.fullmatch(args.prompt.strip())):
         parser.error(
             f"the prompt looks like /{mangled[1]} rewritten as a Windows path by MSYS2. Set "

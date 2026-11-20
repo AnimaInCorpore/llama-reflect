@@ -13,6 +13,14 @@ class TransportError(Exception):
     """A request that did not get an HTTP response: no connection, a timeout, or a broken reply."""
 
 
+class ReplyTimeout(TransportError):
+    """A server that accepted the request but sent no complete reply in time."""
+
+    def __init__(self, seconds):
+        super().__init__(f"no reply within {seconds} s")
+        self.seconds = seconds
+
+
 @dataclass
 class Response:
     status: int
@@ -148,8 +156,9 @@ class HttpClient:
             data = reply.read()
             return Response(reply.status, reply.reason, data, time.monotonic() - started)
         except socket.timeout as error:
-            raise TransportError(f"no reply within {timeout} s" if connection.sock else
-                                 f"no connection within {self.connect_timeout} s") from error
+            if connection.sock:
+                raise ReplyTimeout(timeout) from error
+            raise TransportError(f"no connection within {connect_timeout} s") from error
         except (OSError, http.client.HTTPException) as error:
             raise TransportError(str(error) or type(error).__name__) from error
         finally:

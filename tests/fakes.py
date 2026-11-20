@@ -79,11 +79,11 @@ def decision(role="Diagnosis", reason="It explains the failures.", first_step="R
 
 
 def make_engine(root, replies, *, max_turns=20, forks=True, verification=True, thinking="auto", moves_text=False,
-                tokens=None, context_size=None, thinking_budget=None, fork_effort=None):
+                tokens=None, context_size=None, thinking_budget=None, fork_effort=None, vision=False):
     events = []
     tree = ConversationTree(Path(root) / ".refl" / "sessions", SYSTEM_PROMPT)
     server = FakeServer(replies, moves_text=moves_text, tokens=tokens)
     engine = Engine(server, "model", WorkspaceTools(root), tree, max_turns, 256, events.append,
                     forks=forks, verification=verification, thinking=thinking, context_size=context_size,
-                    thinking_budget=thinking_budget, fork_effort=fork_effort)
+                    thinking_budget=thinking_budget, fork_effort=fork_effort, vision=vision)
     return engine, server, events

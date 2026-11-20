@@ -85,7 +85,7 @@ llama-server -m model.gguf --jinja -c 32768
 
 Reflect sends the whole active conversation with every request, so give the server a context size that fits your longest sessions. At startup Reflect shows the context size per slot and the server build from `/props`. It warns when the main conversation fills 75% and 90% of the context, and it explains how to continue when a request no longer fits. With `-np 3`, the three reviewers of a reflection batch run at the same time. With one slot they run one after another. Depending on the llama.cpp build, slots can share the context size.
 
-A reasoning model can spend several thousand tokens thinking before it answers. Reflect therefore gives each request a thinking budget. When the thinking reaches it, `llama-server` ends the thinking block, and the model answers within the rest of `--max-tokens`. The terminal then shows "Thinking stopped at its budget". If a reply still stops with "Completion reached its token limit", the answer itself was too long, so raise `--max-tokens`. Builds of `llama-server` from before July 2026 ignore the budget.
+With `--thinking auto` or `main`, a reasoning model can spend several thousand tokens thinking before it answers. Reflect therefore gives each request a thinking budget. When the thinking reaches it, `llama-server` ends the thinking block, and the model answers within the rest of `--max-tokens`. The terminal then shows "Thinking stopped at its budget". If the answer itself still does not fit, which can happen while the model writes a large file, Reflect discards the cut-off reply and asks once for a shorter one. When that one is cut off too, the turn stops with "Completion reached its token limit", so raise `--max-tokens`. The limit reserves no memory in `llama-server`, but a long reply takes time: at about 45 tokens per second, 16,384 tokens take about six minutes, within the default `--timeout` of 600 seconds. On a slower machine, lower `--max-tokens` or raise `--timeout`. Builds of `llama-server` from before July 2026 ignore the budget.
 
 Some chat templates, such as Gemma 4's, place an assistant's text after the results of its tool calls. Reflect checks the server's template once per session through `/apply-template` and adjusts the messages it sends when needed. [The coding loop](docs/design.md#the-coding-loop)
 
@@ -109,16 +109,16 @@ Omit the prompt for an interactive session, and type `/exit` or send EOF to quit
 | `--bash PATH` | Detected | Bash executable for the `bash` tool |
 | `--linear` | Off | Run the main loop without verification or reflection forks |
 | `--no-verify` | Off | Keep strategic reflection and skip verification forks |
-| `--thinking auto\|off\|main` | `auto` | Thinking step for every request, none, or the main branch only |
+| `--thinking off\|auto\|main` | `off` | No thinking step, one when the chat template decides so, or one on the main branch only |
 | `--fork-effort LEVEL` | Template default | Reasoning effort for verifier and reviewer requests, such as `low` |
 | `--max-turns N` | 20 | Model requests per prompt, counted across all branches |
-| `--max-tokens N` | 2048 | Output tokens per request |
-| `--thinking-budget N` | `--max-tokens` minus room for the answer | Thinking tokens per request before the server ends the thinking block. `-1` sets no limit |
-| `--timeout SECONDS` | 180 | Time per model request, including any wait for a free slot |
+| `--max-tokens N` | 16384 | Output tokens per request |
+| `--thinking-budget N` | Half of `--max-tokens` | Thinking tokens per request before the server ends the thinking block. `-1` sets no limit |
+| `--timeout SECONDS` | 600 | Time per model request, including any wait for a free slot |
 
 Set `LLAMA_API_KEY` if the server requires authentication.
 
-`--thinking` sends `chat_template_kwargs` with `enable_thinking`, which Qwen3 and Gemma 4 templates read and other templates ignore. Without thinking, a reasoning model answers much faster and uses fewer tokens, but it may plan less carefully. `--thinking main` keeps thinking for the main branch, which decides what to do, and skips it for the forks. `--fork-effort` keeps thinking in the forks at a lower or higher effort, for chat templates with effort levels, such as Qwen3.8's. At startup Reflect lists the template's levels and stops on a level the template rejects. The default budget leaves 1,024 tokens for the answer, or half of `--max-tokens` if that is less, so 1,024 of the default 2,048 tokens go to thinking.
+Thinking is off by default. `--thinking` sends `chat_template_kwargs` with `enable_thinking`, which Qwen3 and Gemma 4 templates read and other templates ignore, so a model with another template may think anyway. Without thinking, a reasoning model answers much faster and uses fewer tokens, but it may plan less carefully. At about 45 tokens per second, a request that thinks through the default budget of 8,192 tokens waits about three minutes before it acts. In the benchmark's natural runs, two 27B models solved every run with and without thinking. [Results so far](docs/benchmark-plan.md#results-so-far) `--thinking auto` lets the chat template decide, and Qwen3.8's template then thinks. `--thinking main` keeps thinking for the main branch, which decides what to do, and skips it for the forks. `--fork-effort` keeps thinking in the forks at a lower or higher effort, for chat templates with effort levels, such as Qwen3.8's, and needs `--thinking auto`. At startup Reflect lists the template's levels and stops on a level the template rejects. The default budget is half of `--max-tokens`, so with thinking, 8,192 of the default 16,384 tokens go to thinking and the rest stays for the answer.
 
 ## Interactive commands
 
@@ -131,7 +131,7 @@ You can inspect a saved tree with `refl --resume SESSION_ID "/tree"` while the s
 
 ## Tools
 
-The model works with five tools. `read_file` returns up to 80 numbered lines and says where to continue. `grep_search` returns up to 30 matching lines. `write_file` and `edit_file` change UTF-8 text files under the workspace, and `edit_file` requires a unique match. It also accepts a match that differs only in blank lines and trailing spaces, and it adapts inserted line endings to the file. `bash` starts in the workspace and runs commands with your user permissions. The model receives each result as plain text, with an `Error:` or `Exit code:` line when one applies. The terminal lists each call with its command, path, or search pattern.
+The model works with five tools, and a sixth when the server takes images. `read_file` returns up to 80 numbered lines and says where to continue. `grep_search` returns up to 30 matching lines. `write_file` and `edit_file` change UTF-8 text files under the workspace, and `edit_file` requires a unique match. It also accepts a match that differs only in blank lines and trailing spaces, and it adapts inserted line endings to the file. `bash` starts in the workspace and runs commands with your user permissions. The model receives each result as plain text, with an `Error:` or `Exit code:` line when one applies. When `llama-server` runs a vision model with its `--mmproj` file, Reflect shows "Image input" at startup and adds `view_image`, which shows the model a PNG, JPEG, GIF, or BMP file of up to 5 MB from the workspace. The model can then check a screenshot, a plot, or its own drawing. It converts other formats, such as SVG, to PNG with Bash first, for example with `rsvg-convert`, which MSYS2 provides. The terminal lists each call with its command, path, or search pattern.
 
 The file tools protect existing instruction and configuration files of other coding agents: `AGENTS.md`, `AGENTS.override.md`, `CLAUDE.md`, `CLAUDE.local.md`, and `.mcp.json` anywhere in the workspace, and files under `.agents/`, `.claude/`, `.codex/`, and `.pi/` outside their skill directories. Reflect passes the same rule to the model for Bash commands.
 
@@ -141,7 +141,7 @@ Reflect saves the main conversation and its forks in `.refl/sessions/<session-id
 
 ## Verification
 
-When a completed model reply contains `<verify>specific claim</verify>`, Reflect starts a verifier with the conversation up to that point. Each verifier has up to three model requests and can use `read_file` and `grep_search`. Distinct claims in the same reply run concurrently. Tool calls in that reply are deferred so the main branch can act on the verdicts. A claim checked earlier in the same task keeps its verdict until a Bash command or file change.
+When a completed model reply contains `<verify>specific claim</verify>`, Reflect starts a verifier with the conversation up to that point. Each verifier has up to three model requests and can use `read_file`, `grep_search`, and `view_image` when the server takes images. Distinct claims in the same reply run concurrently. Tool calls in that reply are deferred so the main branch can act on the verdicts. A claim checked earlier in the same task keeps its verdict until a Bash command or file change.
 
 ```text
 refl "Before editing settings.py, emit <verify>settings.py defines MAX_RETRIES</verify>. Use the verdict to decide what to edit."

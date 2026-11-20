@@ -1,7 +1,13 @@
+import base64
+import json
 import shutil
+import struct
 import subprocess
+import sys
 import tempfile
+import time
 import unittest
+import zlib
 from pathlib import Path
 from unittest import mock
 
@@ -169,3 +175,87 @@ class GrepSearchTest(unittest.TestCase):
                         expected = self.tools.grep_search(path, pattern)["output"]
                         actual = self.search(path, pattern)["output"]
                         self.assertEqual(sorted(actual.splitlines()), _ripgrep_lines(expected))
+
+
+def png(width, height, pixel=(220, 30, 30)):
+    """A solid-colour RGB PNG."""
+    def chunk(kind, data):
+        return struct.pack(">I", len(data)) + kind + data + struct.pack(">I", zlib.crc32(kind + data) & 0xFFFFFFFF)
+
+    rows = (b"\x00" + bytes(pixel) * width) * height
+    header = struct.pack(">IIBBBBB", width, height, 8, 2, 0, 0, 0)
+    return b"\x89PNG\r\n\x1a\n" + chunk(b"IHDR", header) + chunk(b"IDAT", zlib.compress(rows)) + chunk(b"IEND", b"")
+
+
+# The start of a JPEG file: SOI, a JFIF APP0 segment, and a baseline frame header for 640 x 480 pixels.
+_JPEG = (b"\xff\xd8" + b"\xff\xe0\x00\x10JFIF\x00\x01\x01\x00\x00\x01\x00\x01\x00\x00"
+         + b"\xff\xc0\x00\x11\x08" + struct.pack(">HH", 480, 640) + b"\x03\x01\x22\x00\x02\x11\x01\x03\x11\x01"
+         + b"\xff\xd9")
+
+
+class ViewImageTest(unittest.TestCase):
+    def setUp(self):
+        self.directory = tempfile.TemporaryDirectory()
+        self.root = Path(self.directory.name)
+        self.tools = WorkspaceTools(self.root)
+
+    def tearDown(self):
+        self.directory.cleanup()
+
+    def view(self, name, data):
+        (self.root / name).parent.mkdir(parents=True, exist_ok=True)
+        (self.root / name).write_bytes(data)
+        return self.tools.execute({"name": "view_image", "arguments": json.dumps({"path": name})})
+
+    def test_a_png_is_returned_as_a_data_url_with_its_size(self):
+        data = png(64, 32)
+        result = self.view("img/square.png", data)
+        self.assertEqual(result["output"],
+                         f"Showing img/square.png (PNG, 64 x 32 pixels, {len(data):,} bytes). The image follows.")
+        self.assertEqual(result["image"], "data:image/png;base64," + base64.b64encode(data).decode())
+
+    def test_jpeg_and_gif_sizes_come_from_their_headers(self):
+        self.assertIn("(JPEG, 640 x 480 pixels,", self.view("photo.jpg", _JPEG)["output"])
+        self.assertTrue(self.view("photo.jpg", _JPEG)["image"].startswith("data:image/jpeg;base64,"))
+        gif = b"GIF89a" + struct.pack("<HH", 300, 200) + b"\x00" * 8
+        self.assertIn("(GIF, 300 x 200 pixels,", self.view("anim.gif", gif)["output"])
+
+    def test_other_formats_ask_for_a_conversion(self):
+        result = self.view("logo.svg", b"<svg xmlns='http://www.w3.org/2000/svg'/>")
+        self.assertEqual(set(result), {"error"})
+        self.assertIn("not a PNG, JPEG, GIF, or BMP image. Convert it to PNG with bash first", result["error"])
+
+    def test_large_images_are_refused(self):
+        with mock.patch("refl.tools._IMAGE_LIMIT", 100):
+            result = self.view("big.png", png(64, 64))
+        self.assertTrue(result["error"].endswith("Scale it down with bash first."))
+
+    def test_paths_outside_the_workspace_are_refused(self):
+        result = self.tools.execute({"name": "view_image", "arguments": json.dumps({"path": "../outside.png"})})
+        self.assertEqual(result, {"error": "Path must stay inside the workspace"})
+
+
+_BASH = WorkspaceTools(tempfile.gettempdir()).bash_executable
+
+
+@unittest.skipUnless(_BASH, "needs Bash")
+class BashTest(unittest.TestCase):
+    def setUp(self):
+        self.directory = tempfile.TemporaryDirectory()
+        self.root = Path(self.directory.name)
+        self.tools = WorkspaceTools(self.root)
+
+    def tearDown(self):
+        self.directory.cleanup()
+
+    def test_exit_code_and_output(self):
+        self.assertEqual(self.tools.bash("echo hi; exit 3"), {"exit_code": 3, "output": "hi\n"})
+
+    def test_a_timeout_also_stops_the_programs_bash_started(self):
+        # A program behind a pipe, such as an emulator piped through tail, used to outlive Bash.
+        python = Path(sys.executable).as_posix()
+        command = f'"{python}" -c "import time; time.sleep(2); open(\'late.txt\', \'w\').close()" | cat'
+        result = self.tools.bash(command, timeout_seconds=1)
+        self.assertEqual(result["error"], "Bash timed out after 1 seconds")
+        time.sleep(2.5)
+        self.assertFalse((self.root / "late.txt").exists())

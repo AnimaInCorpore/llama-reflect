@@ -1,7 +1,9 @@
+import base64
 import json
 import os
 import re
 import shutil
+import signal
 import stat
 import subprocess
 import tempfile
@@ -18,6 +20,11 @@ _SPECS = {
     "grep_search": (
         "Find up to 30 matching lines for a regex in a workspace file or directory.",
         {"pattern": "string", "path": "string"}, ["pattern", "path"],
+    ),
+    "view_image": (
+        "Look at a PNG, JPEG, GIF, or BMP image in the workspace. The image follows the tool result. Convert other "
+        "formats, such as SVG, to PNG with bash first.",
+        {"path": "string"}, ["path"],
     ),
     "bash": (
         "Run a Bash command from the workspace root and return its exit code and output. Defaults to a 60-second timeout.",
@@ -59,6 +66,44 @@ _MATCH_LIMIT = 30
 _COLUMN_LIMIT = 300
 _SEARCH_SECONDS = 15
 _MORE_MATCHES = "\n[More matches omitted. Narrow the search to continue.]"
+# view_image sends at most this many bytes of image data. The session keeps each viewed image.
+_IMAGE_LIMIT = 5 * 1024 * 1024
+# JPEG markers that start a frame and carry the image size: SOF0 to SOF15 without DHT, JPG, and DAC.
+_JPEG_FRAMES = set(range(0xC0, 0xD0)) - {0xC4, 0xC8, 0xCC}
+
+
+def _image_info(data):
+    """Return the format name, MIME type, width, and height of a PNG, JPEG, GIF, or BMP image, or None.
+
+    llama-server decodes images with stb_image, which reads these formats but not WebP or SVG. The size is None
+    when the header does not give it.
+    """
+    if data.startswith(b"\x89PNG\r\n\x1a\n") and len(data) >= 24:
+        return "PNG", "image/png", int.from_bytes(data[16:20], "big"), int.from_bytes(data[20:24], "big")
+    if data[:6] in (b"GIF87a", b"GIF89a") and len(data) >= 10:
+        return "GIF", "image/gif", int.from_bytes(data[6:8], "little"), int.from_bytes(data[8:10], "little")
+    if data.startswith(b"BM") and len(data) >= 26:
+        width = int.from_bytes(data[18:22], "little", signed=True)
+        height = int.from_bytes(data[22:26], "little", signed=True)
+        return "BMP", "image/bmp", abs(width), abs(height)
+    if data.startswith(b"\xff\xd8\xff"):
+        index = 2
+        while index + 4 <= len(data) and data[index] == 0xFF:
+            marker = data[index + 1]
+            if marker == 0xFF:  # a fill byte before the marker
+                index += 1
+                continue
+            if marker == 0x01 or 0xD0 <= marker <= 0xD8:  # markers without a length
+                index += 2
+                continue
+            length = int.from_bytes(data[index + 2:index + 4], "big")
+            if marker in _JPEG_FRAMES and index + 9 <= len(data):
+                height = int.from_bytes(data[index + 5:index + 7], "big")
+                width = int.from_bytes(data[index + 7:index + 9], "big")
+                return "JPEG", "image/jpeg", width, height
+            index += 2 + length
+        return "JPEG", "image/jpeg", None, None
+    return None
 _LINE_NUMBER = re.compile(r"\s*\d+: ")  # the prefix read_file puts on each line
 _OTHER_AGENT_FILES = {"agents.md", "agents.override.md", "claude.md", "claude.local.md", ".mcp.json"}
 _OTHER_AGENT_DIRS = {".agents", ".claude", ".codex", ".pi"}
@@ -122,6 +167,46 @@ def _tail(stream):
     stream.seek(max(0, size - _OUTPUT_LIMIT))
     prefix = "[Earlier output truncated]\n" if size > _OUTPUT_LIMIT else ""
     return prefix + stream.read().decode("utf-8", errors="replace")
+
+
+def _descendants(pid):
+    """The process IDs started under pid, from the parent IDs that ps lists, or none if ps is unavailable."""
+    try:
+        listing = subprocess.run(["ps", "-A", "-o", "pid=", "-o", "ppid="], stdin=subprocess.DEVNULL,
+                                 capture_output=True, text=True, timeout=10).stdout
+    except (OSError, subprocess.SubprocessError):
+        return []
+    children = {}
+    for line in listing.splitlines():
+        fields = line.split()
+        if len(fields) == 2 and all(field.isdigit() for field in fields):
+            children.setdefault(int(fields[1]), []).append(int(fields[0]))
+    found, pending = [], [pid]
+    while pending:
+        for child in children.get(pending.pop(), []):
+            found.append(child)
+            pending.append(child)
+    return found
+
+
+def _end_process_tree(process):
+    """Stop Bash with the programs it started. Ending Bash alone leaves them running, such as an emulator."""
+    if os.name == "nt":
+        # taskkill follows parent process IDs, so it has to run while Bash is still alive.
+        taskkill = Path(os.environ.get("SystemRoot", r"C:\Windows"), "System32", "taskkill.exe")
+        try:
+            subprocess.run([str(taskkill), "/F", "/T", "/PID", str(process.pid)], stdin=subprocess.DEVNULL,
+                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=30)
+        except (OSError, subprocess.SubprocessError):
+            pass
+    else:
+        for pid in _descendants(process.pid):
+            try:
+                os.kill(pid, signal.SIGKILL)
+            except OSError:
+                pass
+    process.kill()
+    process.wait()
 
 
 class WorkspaceTools:
@@ -329,6 +414,26 @@ class WorkspaceTools:
         # The same order as git ls-files gives.
         return sorted(files, key=lambda file: file.relative_to(directory).as_posix())
 
+    def view_image(self, path):
+        """Return a description for the model and the image as a data URL, which the engine attaches."""
+        target = self._file(path)
+        size = target.stat().st_size
+        if size > _IMAGE_LIMIT:
+            raise ValueError(f"{path} has {size:,} bytes, more than the {_IMAGE_LIMIT // (1024 * 1024)} MB that "
+                             f"view_image sends. Scale it down with bash first.")
+        data = target.read_bytes()
+        info = _image_info(data)
+        if info is None:
+            raise ValueError(f"{path} is not a PNG, JPEG, GIF, or BMP image. Convert it to PNG with bash first, "
+                             f"for example an SVG with rsvg-convert or ImageMagick if one is installed.")
+        kind, mime, width, height = info
+        dimensions = f"{width} x {height} pixels, " if width and height else ""
+        relative = target.relative_to(self.root).as_posix()
+        return {
+            "output": f"Showing {relative} ({kind}, {dimensions}{size:,} bytes). The image follows.",
+            "image": f"data:{mime};base64,{base64.b64encode(data).decode('ascii')}",
+        }
+
     def bash(self, command, timeout_seconds=60):
         if not self.bash_executable:
             raise ValueError("Bash was not found. Add it to PATH or pass --bash with its executable path.")
@@ -344,15 +449,19 @@ class WorkspaceTools:
                     search_path.insert(0, str(utilities))
             env["PATH"] = os.pathsep.join(search_path)
         with tempfile.TemporaryFile() as output:
+            process = subprocess.Popen(
+                [self.bash_executable, "--noprofile", "--norc", "-c", command],
+                cwd=self.root, env=env, stdin=subprocess.DEVNULL, stdout=output, stderr=subprocess.STDOUT,
+            )
             try:
-                result = subprocess.run(
-                    [self.bash_executable, "--noprofile", "--norc", "-c", command],
-                    cwd=self.root, env=env, stdin=subprocess.DEVNULL, stdout=output,
-                    stderr=subprocess.STDOUT, timeout=timeout_seconds,
-                )
+                exit_code = process.wait(timeout=timeout_seconds)
             except subprocess.TimeoutExpired:
+                _end_process_tree(process)
                 return {"error": f"Bash timed out after {timeout_seconds} seconds", "output": _tail(output)}
-            return {"exit_code": result.returncode, "output": _tail(output)}
+            except BaseException:
+                _end_process_tree(process)
+                raise
+            return {"exit_code": exit_code, "output": _tail(output)}
 
     def write_file(self, path, content):
         target = self._write_target(path)

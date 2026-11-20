@@ -1,6 +1,6 @@
 from dataclasses import dataclass
 
-from .transport import TransportError
+from .transport import ReplyTimeout, TransportError
 
 
 # Text that llama-server writes at the end of a thinking block that used up its budget.
@@ -9,6 +9,10 @@ THINKING_BUDGET_MESSAGE = "Thinking budget reached. I will act on the best plan 
 
 class ServerError(RuntimeError):
     """An unavailable llama-server or an invalid completion response."""
+
+
+class TokenLimitError(ServerError):
+    """A reply that reached the output token limit before it was complete."""
 
 
 class ContextLimitError(ServerError):
@@ -32,6 +36,8 @@ class ServerProperties:
     # error for.
     effort_levels: list = None
     rejected_efforts: list = None
+    # Whether the server takes images, which needs a vision model and its --mmproj file.
+    vision: bool = None
 
 
 def _strings(value):
@@ -45,6 +51,9 @@ class LlamaClient:
     async def _request(self, method, path, **kwargs):
         try:
             response = await self.http.request(method, path, **kwargs)
+        except ReplyTimeout as error:
+            raise ServerError(f"llama-server did not finish its reply within {error.seconds} s. Raise --timeout, "
+                              f"or lower --max-tokens.") from error
         except TransportError as error:
             raise ServerError(f"Could not reach llama-server at {self.http.base_url}: {error}") from error
         try:
@@ -88,11 +97,14 @@ class LlamaClient:
         build = data.get("build_info")
         caps = data.get("chat_template_caps")
         caps = caps if isinstance(caps, dict) else {}
+        modalities = data.get("modalities")
+        modalities = modalities if isinstance(modalities, dict) else {}
         return ServerProperties(
             context_size=n_ctx if isinstance(n_ctx, int) and n_ctx > 0 else None,
             build=build if isinstance(build, str) and build else None,
             effort_levels=_strings(caps.get("reasoning_effort_levels")),
             rejected_efforts=_strings(caps.get("reasoning_effort_rejected")),
+            vision=vision if isinstance(vision := modalities.get("vision"), bool) else None,
         )
 
     async def slots(self):
@@ -145,7 +157,7 @@ class LlamaClient:
         except (KeyError, IndexError, TypeError) as error:
             raise ServerError("Invalid chat completion response") from error
         if choice.get("finish_reason") == "length":
-            raise ServerError("Completion reached its token limit. Increase --max-tokens.")
+            raise TokenLimitError("Completion reached its token limit. Increase --max-tokens.")
         if not isinstance(message, dict) or message.get("role") != "assistant":
             raise ServerError("Expected an assistant message in the chat completion")
         usage = data.get("usage")
