@@ -20,7 +20,7 @@ The forks can think at a different effort from the main branch. With `--fork-eff
 
 Reflect builds the system prompt for each request from its current instructions, the project's `REFLECT.md`, and the list of project skills. A resumed session therefore follows the current instructions and the current `--linear`, `--no-verify`, and `--thinking` settings.
 
-The CLI and file tools use Python filesystem APIs on all platforms. PowerShell and MSYS2 launch the same CLI. The `bash` tool invokes Bash from the workspace directory. On Windows, Bash can come from MSYS2 or Git for Windows. `rg` is an external executable used by `grep_search` on all four target platforms.
+The CLI and file tools use Python filesystem APIs on all platforms. PowerShell and MSYS2 launch the same CLI. The `bash` tool invokes Bash from the workspace directory. On Windows, Bash can come from MSYS2 or Git for Windows. `grep_search` runs `rg` when it is on `PATH`. Otherwise a Python search follows the same rules: it skips hidden and binary files, takes the file list from `git ls-files` so that `.gitignore` applies inside a Git repository, cuts lines at 300 characters, and returns up to 30 matches. Its patterns use Python's regex syntax, which agrees with ripgrep's for common patterns, but not for every pattern. A test compares both searches when ripgrep is installed.
 
 The launch directory is the workspace unless `--workspace` selects one explicitly. An empty workspace can start a session. The file tools preserve existing instructions and configuration from other coding agents, and allow writes in their skill directories. Bash runs with the launching user's permissions and receives the project's preservation rule as model guidance.
 

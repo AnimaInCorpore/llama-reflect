@@ -13,7 +13,7 @@ refl --help
 
 You can also run `python -m refl` from this checkout.
 
-Put `rg` (ripgrep) on `PATH` for the `grep_search` tool. On Linux and macOS, the `bash` tool uses Bash from `PATH`. On Windows, Reflect looks for Bash from MSYS2 or Git for Windows. Pass `--bash` with the executable path to choose a specific installation.
+The `grep_search` tool uses `rg` (ripgrep) when it is on `PATH`. Without it, Reflect searches with a built-in Python search that finds the same lines but is slower in large projects. On Linux and macOS, the `bash` tool uses Bash from `PATH`. On Windows, Reflect looks for Bash from MSYS2 or Git for Windows. Pass `--bash` with the executable path to choose a specific installation.
 
 ## Start a server
 

@@ -5,6 +5,7 @@ import shutil
 import stat
 import subprocess
 import tempfile
+import time
 from itertools import islice
 from pathlib import Path
 
@@ -52,6 +53,12 @@ TOOLS = [
 
 _TYPES = {"string": str, "integer": int}
 _OUTPUT_LIMIT = 12000
+# grep_search shows up to this many matching lines, each cut at this many characters, and stops after this
+# many seconds.
+_MATCH_LIMIT = 30
+_COLUMN_LIMIT = 300
+_SEARCH_SECONDS = 15
+_MORE_MATCHES = "\n[More matches omitted. Narrow the search to continue.]"
 _LINE_NUMBER = re.compile(r"\s*\d+: ")  # the prefix read_file puts on each line
 _OTHER_AGENT_FILES = {"agents.md", "agents.override.md", "claude.md", "claude.local.md", ".mcp.json"}
 _OTHER_AGENT_DIRS = {".agents", ".claude", ".codex", ".pi"}
@@ -235,7 +242,7 @@ class WorkspaceTools:
             raise ValueError(f"Expected a file or directory at {path}")
         rg = shutil.which("rg")
         if not rg:
-            raise ValueError("ripgrep (rg) is required for grep_search. Add it to PATH.")
+            return self._python_search(target, pattern)
         relative = "./" + target.relative_to(self.root).as_posix()
         with tempfile.TemporaryFile() as output, tempfile.TemporaryFile() as errors:
             result = subprocess.run(
@@ -251,8 +258,76 @@ class WorkspaceTools:
             matches = list(islice(output, 31))
         text = b"".join(matches[:30]).decode("utf-8", errors="replace").rstrip("\r\n")
         if len(matches) > 30:
-            text += "\n[More matches omitted. Narrow the search to continue.]"
+            text += _MORE_MATCHES
         return {"output": text}
+
+    def _python_search(self, target, pattern):
+        """Search like the ripgrep call above, for workspaces where ripgrep is not installed.
+
+        It skips hidden and binary files, and it leaves out files that .gitignore excludes when the target is in
+        a Git repository. The pattern uses Python's regex syntax, which agrees with ripgrep's for common patterns.
+        """
+        try:
+            regex = re.compile(pattern)
+        except re.error as error:
+            return {"error": f"regex parse error: {error}"}
+        deadline = time.monotonic() + _SEARCH_SECONDS
+        if target.is_file():
+            files, prefix = [target], None
+        else:
+            files, prefix = self._search_files(target), True
+        lines = []
+        for file in files:
+            if time.monotonic() > deadline:
+                text = "\n".join(lines[:_MATCH_LIMIT])
+                return {"output": (text + "\n" if text else "") + f"[Search stopped after {_SEARCH_SECONDS} "
+                                  f"seconds. Narrow the search to continue.]"}
+            try:
+                data = file.read_bytes()
+            except OSError:
+                continue
+            name = file.relative_to(self.root).as_posix() + ":" if prefix else ""
+            if b"\0" in data:
+                # Like ripgrep, report a matching binary file only when it is the search target.
+                if not prefix and regex.search(data.decode("utf-8", errors="replace")):
+                    return {"output": f'binary file matches (found "\\0" byte around offset {data.index(0)})'}
+                continue
+            text = data.decode("utf-8", errors="replace").removeprefix("﻿")
+            for number, line in enumerate(text.split("\n"), 1):
+                line = line.removesuffix("\r")
+                if regex.search(line):
+                    if len(line) > _COLUMN_LIMIT:
+                        line = line[:_COLUMN_LIMIT] + " [... omitted end of long line]"
+                    lines.append(f"{name}{number}:{line}")
+                    if len(lines) > _MATCH_LIMIT:
+                        return {"output": "\n".join(lines[:_MATCH_LIMIT]) + _MORE_MATCHES}
+        return {"output": "\n".join(lines) if lines else "No matches."}
+
+    def _search_files(self, directory):
+        """List the files a ripgrep search of the directory would read, in path order."""
+        git = shutil.which("git")
+        if git:
+            try:
+                result = subprocess.run(
+                    [git, "ls-files", "-z", "--cached", "--others", "--exclude-standard"],
+                    cwd=directory, stdin=subprocess.DEVNULL, capture_output=True, timeout=_SEARCH_SECONDS,
+                )
+            except (OSError, subprocess.SubprocessError):
+                result = None
+            # Outside a Git repository, git exits with an error, and the directory walk below takes over.
+            if result is not None and result.returncode == 0:
+                names = sorted(set(result.stdout.decode("utf-8", errors="replace").split("\0")) - {""})
+                return [directory / name for name in names
+                        if not any(part.startswith(".") for part in Path(name).parts)
+                        and (directory / name).is_file() and not (directory / name).is_symlink()]
+        files = []
+        for current, folders, names in os.walk(directory):
+            folders[:] = [folder for folder in folders
+                          if not folder.startswith(".") and not os.path.islink(os.path.join(current, folder))]
+            files.extend(Path(current) / name for name in names
+                         if not name.startswith(".") and not os.path.islink(os.path.join(current, name)))
+        # The same order as git ls-files gives.
+        return sorted(files, key=lambda file: file.relative_to(directory).as_posix())
 
     def bash(self, command, timeout_seconds=60):
         if not self.bash_executable:
