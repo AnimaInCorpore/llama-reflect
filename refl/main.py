@@ -27,6 +27,13 @@ def _positive_int(value):
     return number
 
 
+def _thinking_budget(value):
+    number = int(value)
+    if number < -1:
+        raise argparse.ArgumentTypeError("expected -1 or a token count of 0 or more")
+    return number
+
+
 def _status(message):
     print(message, file=sys.stderr, flush=True)
 
@@ -121,10 +128,20 @@ async def _run(args):
             _status(f"Slots: {busy}/{slots} busy")
         except ServerError as error:
             _status(f"Slot status unavailable ({error})")
+        try:
+            context_size, build = await server.properties(model)
+        except ServerError as error:
+            context_size, build = None, None
+            _status(f"Server properties unavailable ({error})")
+        else:
+            _status(f"Context: {context_size:,} tokens per slot" if context_size else "Context size unavailable")
+        if build:
+            _status(f"Server build: {build}")
 
         tree = _open_tree(root, args.resume)
         engine = Engine(server, model, workspace, tree, args.max_turns, args.max_tokens, _status,
-                        forks=not args.linear, verification=not args.no_verify, thinking=args.thinking)
+                        forks=not args.linear, verification=not args.no_verify, thinking=args.thinking,
+                        thinking_budget=args.thinking_budget, context_size=context_size)
         if args.prompt is not None:
             await _submit(engine, args.prompt)
             return
@@ -166,6 +183,9 @@ def main(argv=None):
     parser.add_argument("--max-turns", type=_positive_int, default=20,
                         help="model requests per prompt across all branches (default: 20)")
     parser.add_argument("--max-tokens", type=_positive_int, default=2048, help="output tokens per completion (default: 2048)")
+    parser.add_argument("--thinking-budget", type=_thinking_budget, metavar="N",
+                        help="thinking tokens per request before the server ends the thinking block; -1 sets no "
+                             "limit (default: --max-tokens minus room for the answer)")
     parser.add_argument("--timeout", type=_positive_int, default=180, help="model request timeout in seconds (default: 180)")
     args = parser.parse_args(argv)
     if args.prompt is not None and not args.prompt.strip():

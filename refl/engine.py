@@ -2,7 +2,7 @@ import asyncio
 import json
 import re
 
-from .client import ServerError
+from .client import THINKING_BUDGET_MESSAGE, ContextLimitError, ServerError
 from .reflection import MANUAL, REFLECTION_PROMPT, TEMPERATURE_SLOTS, StallDetector
 from .tools import TOOLS
 from .tree import ensure_git_ignored
@@ -113,6 +113,13 @@ def _format_proposal(answer):
 # auto leaves thinking to the chat template, off disables it for every request, and main keeps it
 # only for main-branch requests.
 THINKING_MODES = ("auto", "off", "main")
+# Output tokens that the default thinking budget leaves for the answer, at most half of --max-tokens.
+_ANSWER_ROOM = 1024
+
+
+def default_thinking_budget(max_tokens):
+    """Thinking tokens per request that leave room for the answer within the output limit."""
+    return max_tokens - min(max_tokens // 2, _ANSWER_ROOM)
 
 
 class TurnLimitError(RuntimeError):
@@ -229,9 +236,13 @@ _TEMPLATE_PROBE = [
 ]
 
 
+# Shares of the server's context at which the main conversation triggers a warning.
+_CONTEXT_WARNINGS = (0.75, 0.9)
+
+
 class Engine:
     def __init__(self, server, model, workspace, tree, max_turns, max_tokens, on_tool, *, forks=True,
-                 verification=True, thinking="auto"):
+                 verification=True, thinking="auto", thinking_budget=None, context_size=None):
         self.server = server
         self.model = model
         self.workspace = workspace
@@ -246,6 +257,10 @@ class Engine:
         if thinking not in THINKING_MODES:
             raise ValueError(f"Unknown thinking mode {thinking!r}")
         self.thinking = thinking
+        # Thinking tokens per request before the server ends the thinking block. -1 sets no limit.
+        if thinking_budget is None:
+            thinking_budget = default_thinking_budget(max_tokens)
+        self.thinking_budget = thinking_budget if thinking_budget >= 0 else None
         self.strategy_sections = []
         self.track_strategy = False
         self.strategy_path = f".refl/strategies/{tree.path.stem}.md"
@@ -253,6 +268,9 @@ class Engine:
         self.verdicts = {}
         # Whether the chat template moves an assistant's text after its tool results. Checked on the first request.
         self.split_text = None
+        # Tokens of context per server slot, if the server reports it, and how many warnings were shown.
+        self.context_size = context_size
+        self.context_warnings = 0
 
     def _messages(self, leaf, *, system_prompt=None):
         messages = self.tree.messages(leaf)
@@ -311,9 +329,33 @@ class Engine:
                     else message for message in messages]
         if self.split_text:
             messages = split_text_and_calls(messages)
-        return await self.server.complete(self.model, messages, tools, self.max_tokens,
-                                          response_format=response_format, temperature=temperature,
-                                          thinking=thinking, tool_choice=tool_choice)
+        try:
+            message, tokens = await self.server.complete(self.model, messages, tools, self.max_tokens,
+                                                         response_format=response_format, temperature=temperature,
+                                                         thinking=thinking, tool_choice=tool_choice,
+                                                         thinking_budget=self.thinking_budget)
+        except ContextLimitError as error:
+            raise ContextLimitError(error.tokens, error.n_ctx, self._context_advice()) from None
+        reasoning = message.get("reasoning_content")
+        if thinking and isinstance(reasoning, str) and reasoning.rstrip().endswith(THINKING_BUDGET_MESSAGE):
+            self.on_tool(f"Thinking stopped at its budget of {self.thinking_budget:,} tokens")
+        if not fork and tokens and self.context_size:
+            self._check_context(tokens)
+        return message
+
+    def _context_advice(self):
+        return (f"Reflect does not shorten conversations yet. For more room, restart llama-server with more "
+                f"context per slot, such as a larger -c or a smaller -np, and continue with "
+                f"--resume {self.tree.path.stem}.")
+
+    def _check_context(self, tokens):
+        """Warn once as the main conversation passes each share of the server's context."""
+        share = tokens / self.context_size
+        reached = sum(share >= limit for limit in _CONTEXT_WARNINGS)
+        if reached > self.context_warnings:
+            self.context_warnings = reached
+            self.on_tool(f"Context: {tokens:,} of {self.context_size:,} tokens in use ({share:.0%}). "
+                         f"{self._context_advice()}")
 
     async def _template_moves_text(self):
         """Check whether the server's chat template renders an assistant's text after its tool results."""

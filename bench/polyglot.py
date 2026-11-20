@@ -170,6 +170,8 @@ def main():
     parser.add_argument("--deadline", type=int, default=900, help="seconds per run (default: 900)")
     parser.add_argument("--thinking", choices=THINKING_MODES, default="auto",
                         help="thinking mode as in refl --thinking (default: auto)")
+    parser.add_argument("--thinking-budget", type=int, metavar="N",
+                        help="thinking tokens per request as in refl --thinking-budget (default: as in refl)")
     parser.add_argument("--out", help="results directory (default: a new folder under the system temp directory)")
     parser.add_argument("--validate", action="store_true", help="check the stubs and reference solutions only")
     args = parser.parse_args()

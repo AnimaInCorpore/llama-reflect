@@ -13,8 +13,10 @@ _ids = itertools.count()
 class FakeServer:
     """Return scripted assistant messages in request order and record each request."""
 
-    def __init__(self, replies, *, moves_text=False):
+    def __init__(self, replies, *, moves_text=False, tokens=None):
+        # A reply that is an exception is raised instead. `tokens` lists the context tokens each request reports.
         self.replies = list(replies)
+        self.tokens = list(tokens or [])
         self.requests = []
         # True renders an assistant's text after its tool results, like Gemma 4's template. None has no
         # /apply-template endpoint.
@@ -35,7 +37,7 @@ class FakeServer:
         return "\n".join(parts + after)
 
     async def complete(self, model, messages, tools, max_tokens, *, response_format=None, temperature=0.0,
-                       thinking=True, tool_choice=None):
+                       thinking=True, tool_choice=None, thinking_budget=None):
         self.requests.append({
             "system": messages[0]["content"],
             "messages": messages,
@@ -44,10 +46,15 @@ class FakeServer:
             "temperature": temperature,
             "thinking": thinking,
             "tool_choice": tool_choice,
+            "thinking_budget": thinking_budget,
         })
         if not self.replies:
             raise AssertionError("Unexpected model request")
-        return self.replies.pop(0)
+        reply = self.replies.pop(0)
+        tokens = self.tokens.pop(0) if self.tokens else None
+        if isinstance(reply, Exception):
+            raise reply
+        return reply, tokens
 
 
 def text(content):
@@ -70,10 +77,12 @@ def decision(role="Diagnosis", reason="It explains the failures.", first_step="R
     return text(json.dumps({"role": role, "reason": reason, "first_step": first_step}))
 
 
-def make_engine(root, replies, *, max_turns=20, forks=True, verification=True, thinking="auto", moves_text=False):
+def make_engine(root, replies, *, max_turns=20, forks=True, verification=True, thinking="auto", moves_text=False,
+                tokens=None, context_size=None, thinking_budget=None):
     events = []
     tree = ConversationTree(Path(root) / ".refl" / "sessions", SYSTEM_PROMPT)
-    server = FakeServer(replies, moves_text=moves_text)
+    server = FakeServer(replies, moves_text=moves_text, tokens=tokens)
     engine = Engine(server, "model", WorkspaceTools(root), tree, max_turns, 256, events.append,
-                    forks=forks, verification=verification, thinking=thinking)
+                    forks=forks, verification=verification, thinking=thinking, context_size=context_size,
+                    thinking_budget=thinking_budget)
     return engine, server, events

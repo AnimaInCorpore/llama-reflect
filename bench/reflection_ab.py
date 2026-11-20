@@ -1306,7 +1306,7 @@ async def distinct_ideas(server, model, ideas, max_tokens):
     messages = [{"role": "system", "content": _JUDGE_PROMPT},
                 {"role": "user", "content": "\n".join(f"{name}: {text}" for name, text in ideas)}]
     try:
-        message = await server.complete(model, messages, [], max_tokens, response_format=_JUDGE_SCHEMA)
+        message, _ = await server.complete(model, messages, [], max_tokens, response_format=_JUDGE_SCHEMA)
         groups = json.loads(message.get("content") or "")["groups"]
         return len([group for group in groups if group])
     except (ServerError, KeyError, TypeError, ValueError):
@@ -1456,11 +1456,16 @@ async def run_arm(task, arm, workspace, args):
     async with httpx.AsyncClient(base_url=args.url, timeout=timeout, event_hooks={"response": [record]}) as http:
         server = LlamaClient(http)
         model = args.model or await server.default_model()
+        try:
+            context_size, _ = await server.properties(model)
+        except ServerError:
+            context_size = None
         tree = ConversationTree(workspace / ".refl" / "sessions", SYSTEM_PROMPT)
         started = time.monotonic()
         engine = Engine(server, model, WorkspaceTools(workspace), tree, args.max_turns, args.max_tokens,
                         lambda text: events.append([round(time.monotonic() - started, 1), text]), **ARMS[arm],
-                        thinking=args.thinking)
+                        thinking=args.thinking, thinking_budget=args.thinking_budget,
+                        context_size=context_size)
         answer = None
         work = (respond_after_stall(engine, task, args.max_turns, args.heat, args.roles) if args.seeded
                 else engine.respond(task.prompt))
@@ -1488,6 +1493,7 @@ async def run_arm(task, arm, workspace, args):
         "arm": arm,
         "mode": f"seeded at heat {args.heat}" if args.seeded else "natural",
         "thinking": args.thinking,
+        "thinking_budget": engine.thinking_budget,
         "passed": passed,
         "check": detail,
         "outcome": outcome,
@@ -1636,6 +1642,8 @@ def main():
                              "Prerequisites or \"Rebuild and swap\"")
     parser.add_argument("--thinking", choices=THINKING_MODES, default="auto",
                         help="thinking mode as in refl --thinking (default: auto)")
+    parser.add_argument("--thinking-budget", type=int, metavar="N",
+                        help="thinking tokens per request as in refl --thinking-budget (default: as in refl)")
     parser.add_argument("--validate", action="store_true", help="check the fixtures and reference fixes only")
     parser.add_argument("--judge", metavar="RESULTS_DIR",
                         help="count distinct ideas in the reflections of an earlier run and exit")

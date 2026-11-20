@@ -4,7 +4,8 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from refl.engine import _call_summary, tool_text
+from refl.client import THINKING_BUDGET_MESSAGE, ContextLimitError
+from refl.engine import _call_summary, default_thinking_budget, tool_text
 
 from .fakes import call, decision, make_engine, text, verdict
 
@@ -231,6 +232,49 @@ class EngineTest(unittest.TestCase):
             stored = next(node.message for node in engine.tree.nodes if node.message["role"] == "assistant")
             self.assertEqual((stored["content"], len(stored["tool_calls"])), ("I will read status.txt.", 1))
 
+    def test_context_use_is_reported_once_per_threshold(self):
+        reads = [call("read_file", path="status.txt") for _ in range(3)]
+        engine, _, events = make_engine(self.root, [*reads, text("Done.")], forks=False,
+                                        tokens=[500, 760, 800, 950], context_size=1000)
+        self.assertEqual(asyncio.run(engine.respond("Read the status.")), "Done.")
+        warnings = [event for event in events if event.startswith("Context:")]
+        self.assertEqual([warning.split(". ")[0] for warning in warnings],
+                         ["Context: 760 of 1,000 tokens in use (76%)", "Context: 950 of 1,000 tokens in use (95%)"])
+        self.assertIn(f"--resume {engine.tree.path.stem}", warnings[0])
+
+    def test_unknown_context_size_shows_no_warning(self):
+        engine, _, events = make_engine(self.root, [text("Done.")], forks=False, tokens=[990])
+        asyncio.run(engine.respond("hi"))
+        self.assertFalse(any(event.startswith("Context:") for event in events))
+
+    def test_a_request_that_does_not_fit_explains_how_to_continue(self):
+        engine, _, _ = make_engine(self.root, [ContextLimitError(1200, 1000)], forks=False)
+        with self.assertRaises(ContextLimitError) as raised:
+            asyncio.run(engine.respond("hi"))
+        message = str(raised.exception)
+        self.assertTrue(message.startswith(
+            "The request needs 1,200 tokens, but llama-server holds 1,000 tokens of context per slot."))
+        self.assertIn(f"--resume {engine.tree.path.stem}", message)
+        self.assertEqual(engine.tree.messages(engine.tree.head)[-1]["content"], f"[Turn stopped] {message}")
+
+
+    def test_default_thinking_budget_leaves_room_for_the_answer(self):
+        self.assertEqual([default_thinking_budget(tokens) for tokens in (256, 2048, 4096, 16384)],
+                         [128, 1024, 3072, 15360])
+
+    def test_thinking_budget_reaches_the_server(self):
+        engine, server, _ = make_engine(self.root, [text("Done.")], forks=False)
+        asyncio.run(engine.respond("hi"))
+        self.assertEqual(server.requests[0]["thinking_budget"], default_thinking_budget(256))
+        engine, server, _ = make_engine(self.root, [text("Done.")], forks=False, thinking_budget=-1)
+        asyncio.run(engine.respond("hi"))
+        self.assertIsNone(server.requests[0]["thinking_budget"])
+
+    def test_a_thinking_block_cut_at_its_budget_is_reported(self):
+        cut = {**text("Done."), "reasoning_content": f"Let me think about it.\n\n{THINKING_BUDGET_MESSAGE}\n"}
+        engine, _, events = make_engine(self.root, [cut], forks=False, thinking_budget=100)
+        self.assertEqual(asyncio.run(engine.respond("hi")), "Done.")
+        self.assertIn("Thinking stopped at its budget of 100 tokens", events)
 
 if __name__ == "__main__":
     unittest.main()

@@ -23,9 +23,9 @@ Start `llama-server` with a GGUF and a chat template that support tool calling. 
 llama-server -m model.gguf --jinja -c 32768
 ```
 
-Reflect sends the whole active conversation with every request, so give the server a context size that fits your longest sessions. With `-np 3`, the three reviewers of a reflection batch run at the same time. With one slot they run one after another. Depending on the llama.cpp build, slots can share the context size, and `/slots` shows each slot's `n_ctx`.
+Reflect sends the whole active conversation with every request, so give the server a context size that fits your longest sessions. At startup Reflect shows the context size per slot and the server build from `/props`. It warns when the main conversation fills 75% and 90% of the context, and it explains how to continue when a request no longer fits. With `-np 3`, the three reviewers of a reflection batch run at the same time. With one slot they run one after another. Depending on the llama.cpp build, slots can share the context size.
 
-A reasoning model can spend several thousand tokens thinking before it answers. If a reply stops with "Completion reached its token limit", raise `--max-tokens` or use `--thinking`.
+A reasoning model can spend several thousand tokens thinking before it answers. Reflect therefore gives each request a thinking budget. When the thinking reaches it, `llama-server` ends the thinking block, and the model answers within the rest of `--max-tokens`. The terminal then shows "Thinking stopped at its budget". If a reply still stops with "Completion reached its token limit", the answer itself was too long, so raise `--max-tokens`. Builds of `llama-server` from before July 2026 ignore the budget.
 
 Some chat templates, such as Gemma 4's, place an assistant's text after the results of its tool calls. Reflect checks the server's template once per session through `/apply-template` and adjusts the messages it sends when needed. [The coding loop](docs/design.md#the-coding-loop)
 
@@ -52,11 +52,12 @@ Omit the prompt for an interactive session, and type `/exit` or send EOF to quit
 | `--thinking auto\|off\|main` | `auto` | Thinking step for every request, none, or the main branch only |
 | `--max-turns N` | 20 | Model requests per prompt, counted across all branches |
 | `--max-tokens N` | 2048 | Output tokens per request |
+| `--thinking-budget N` | `--max-tokens` minus room for the answer | Thinking tokens per request before the server ends the thinking block. `-1` sets no limit |
 | `--timeout SECONDS` | 180 | Time per model request, including any wait for a free slot |
 
 Set `LLAMA_API_KEY` if the server requires authentication.
 
-`--thinking` sends `chat_template_kwargs` with `enable_thinking`, which Qwen3 and Gemma 4 templates read and other templates ignore. Without thinking, a reasoning model answers much faster and uses fewer tokens, but it may plan less carefully. `--thinking main` keeps thinking for the main branch, which decides what to do, and skips it for the forks.
+`--thinking` sends `chat_template_kwargs` with `enable_thinking`, which Qwen3 and Gemma 4 templates read and other templates ignore. Without thinking, a reasoning model answers much faster and uses fewer tokens, but it may plan less carefully. `--thinking main` keeps thinking for the main branch, which decides what to do, and skips it for the forks. The default budget leaves 1,024 tokens for the answer, or half of `--max-tokens` if that is less, so 1,024 of the default 2,048 tokens go to thinking.
 
 ## Interactive commands
 
@@ -97,7 +98,7 @@ Reflect discovers reusable Markdown skills under `.refl/skills/` and lists them 
 
 ## Known limitations
 
-- Reflect sends the whole active conversation with every request and does not trim it yet, so long sessions need a large context window.
+- Reflect sends the whole active conversation with every request and does not trim it yet, so long sessions need a large context window. When a conversation outgrows it, restart `llama-server` with more context per slot and continue with `--resume`.
 - The file tools read and write UTF-8 text only. Other encodings need Bash.
 - The `bash` tool runs commands with your user permissions, without a sandbox or confirmation. Use a disposable folder or a container for tasks you do not trust.
 - In tests with 27B models, reflection never started on tasks the model solved directly. It helped on a task where the model went in circles, until a newer llama.cpp build let the model solve that task directly. A 4B model stalls more often. With thinking, reflection solved a task that the model never solved alone. Without thinking, it gained nothing, because the model rarely acted on what the reviewers found. [Results so far](docs/benchmark-plan.md#results-so-far)
