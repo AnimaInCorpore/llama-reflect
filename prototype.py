@@ -1,4 +1,4 @@
-"""Probe two concurrent llama-server branches. Requires Python 3.9+, httpx, and ripgrep (rg)."""
+"""Probe two concurrent llama-server branches. Requires Python 3.9+ and ripgrep (rg)."""
 
 import argparse
 import asyncio
@@ -6,20 +6,24 @@ import os
 from pathlib import Path
 from time import perf_counter
 
-import httpx
-
 from refl.tools import TOOLS as WORKSPACE_TOOLS, WorkspaceTools
+from refl.transport import HttpClient, TransportError
 
 TOOLS = [tool for tool in WORKSPACE_TOOLS if tool["function"]["name"] in {"read_file", "grep_search"}]
 
 
+async def get_json(client, method, path, **options):
+    response = await client.request(method, path, **options)
+    if not response.is_success:
+        raise RuntimeError(f"{path} returned HTTP {response.status}: {response.reason}")
+    return response.json()
+
+
 async def complete(client, model, messages):
-    response = await client.post("/v1/chat/completions", json={
+    data = await get_json(client, "POST", "/v1/chat/completions", json={
         "model": model, "messages": messages, "tools": TOOLS,
         "temperature": 0, "max_tokens": 256,
     })
-    response.raise_for_status()
-    data = response.json()
     return data["choices"][0]["message"], data["usage"]["completion_tokens"]
 
 
@@ -50,59 +54,55 @@ async def probe(client, model, workspace, name, prompt):
 
 
 async def get_slots(client):
-    response = await client.get("/slots", timeout=2)
-    response.raise_for_status()
-    slots = response.json()
+    slots = await get_json(client, "GET", "/slots", timeout=2)
     return len(slots), sum(slot["is_processing"] for slot in slots)
 
 
 async def run(args):
     key = os.environ.get("LLAMA_API_KEY")
     headers = {"Authorization": f"Bearer {key}"} if key else {}
-    async with httpx.AsyncClient(base_url=args.url, headers=headers, timeout=120) as client:
-        (await client.get("/health", timeout=5)).raise_for_status()
-        model = args.model
-        if not model:
-            response = await client.get("/v1/models", timeout=5)
-            response.raise_for_status()
-            model = response.json()["data"][0]["id"]
-        print(f"Model: {model}")
+    client = HttpClient(args.url, headers=headers, timeout=120)
+    await get_json(client, "GET", "/health", timeout=5)
+    model = args.model
+    if not model:
+        model = (await get_json(client, "GET", "/v1/models", timeout=5))["data"][0]["id"]
+    print(f"Model: {model}")
+    try:
+        slots, busy = await get_slots(client)
+        print(f"Slots at startup: {busy}/{slots} busy")
+    except (TransportError, RuntimeError, KeyError, TypeError, ValueError) as error:
+        print(f"Slot monitoring unavailable: {error}")
+        slots = 0
+
+    workspace = WorkspaceTools(Path.cwd())
+    started = perf_counter()
+    batch = asyncio.gather(
+        probe(client, model, workspace, "read_file", "Read lines 1 through 3 of prototype.py and describe its purpose."),
+        probe(client, model, workspace, "grep_search", "Search prototype.py for the regex 'asyncio[.]gather'. Report its line number."),
+        return_exceptions=True,
+    )
+    peak = None
+    while slots and not batch.done():
         try:
-            slots, busy = await get_slots(client)
-            print(f"Slots at startup: {busy}/{slots} busy")
-        except (httpx.HTTPError, KeyError, TypeError, ValueError) as error:
-            print(f"Slot monitoring unavailable: {error}")
-            slots = 0
+            _, busy = await get_slots(client)
+            if not batch.done():
+                peak = busy if peak is None else max(peak, busy)
+        except (TransportError, RuntimeError, KeyError, TypeError, ValueError) as error:
+            print(f"Slot monitoring stopped: {error}")
+            break
+        await asyncio.wait({batch}, timeout=0.05)
 
-        workspace = WorkspaceTools(Path.cwd())
-        started = perf_counter()
-        batch = asyncio.gather(
-            probe(client, model, workspace, "read_file", "Read lines 1 through 3 of prototype.py and describe its purpose."),
-            probe(client, model, workspace, "grep_search", "Search prototype.py for the regex 'asyncio[.]gather'. Report its line number."),
-            return_exceptions=True,
-        )
-        peak = None
-        while slots and not batch.done():
-            try:
-                _, busy = await get_slots(client)
-                if not batch.done():
-                    peak = busy if peak is None else max(peak, busy)
-            except (httpx.HTTPError, KeyError, TypeError, ValueError) as error:
-                print(f"Slot monitoring stopped: {error}")
-                break
-            await asyncio.wait({batch}, timeout=0.05)
-
-        results = await batch
-        if peak is not None:
-            print(f"Peak server-wide busy slots during probe: {peak}/{slots}")
-        elif slots:
-            print("No slot samples collected during the probe.")
-        for result in results:
-            if isinstance(result, Exception):
-                raise result
-        elapsed = max(finished for finished, _ in results) - started
-        tokens = sum(count for _, count in results)
-        print(f"Both branches completed in {elapsed:.2f}s ({tokens / elapsed:.1f} output tokens/s end to end).")
+    results = await batch
+    if peak is not None:
+        print(f"Peak server-wide busy slots during probe: {peak}/{slots}")
+    elif slots:
+        print("No slot samples collected during the probe.")
+    for result in results:
+        if isinstance(result, Exception):
+            raise result
+    elapsed = max(finished for finished, _ in results) - started
+    tokens = sum(count for _, count in results)
+    print(f"Both branches completed in {elapsed:.2f}s ({tokens / elapsed:.1f} output tokens/s end to end).")
 
 
 if __name__ == "__main__":
@@ -111,5 +111,5 @@ if __name__ == "__main__":
     parser.add_argument("--model", help="Model ID (default: first model listed by the server)")
     try:
         asyncio.run(run(parser.parse_args()))
-    except (httpx.HTTPError, IndexError, KeyError, RuntimeError, TypeError, ValueError) as error:
+    except (TransportError, IndexError, KeyError, RuntimeError, TypeError, ValueError) as error:
         parser.exit(1, f"Probe failed: {error}\n")

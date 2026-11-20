@@ -4,7 +4,7 @@
 
 ## Install
 
-Install from this directory using Python 3.9 or newer. Use `python3` if that is how your system names Python.
+Install from this directory using Python 3.9 or newer. Reflect uses only Python's standard library, so the install adds no other packages. Use `python3` if that is how your system names Python.
 
 ```text
 python -m pip install -e .
@@ -50,6 +50,7 @@ Omit the prompt for an interactive session, and type `/exit` or send EOF to quit
 | `--linear` | Off | Run the main loop without verification or reflection forks |
 | `--no-verify` | Off | Keep strategic reflection and skip verification forks |
 | `--thinking auto\|off\|main` | `auto` | Thinking step for every request, none, or the main branch only |
+| `--fork-effort LEVEL` | Template default | Reasoning effort for verifier and reviewer requests, such as `low` |
 | `--max-turns N` | 20 | Model requests per prompt, counted across all branches |
 | `--max-tokens N` | 2048 | Output tokens per request |
 | `--thinking-budget N` | `--max-tokens` minus room for the answer | Thinking tokens per request before the server ends the thinking block. `-1` sets no limit |
@@ -57,7 +58,7 @@ Omit the prompt for an interactive session, and type `/exit` or send EOF to quit
 
 Set `LLAMA_API_KEY` if the server requires authentication.
 
-`--thinking` sends `chat_template_kwargs` with `enable_thinking`, which Qwen3 and Gemma 4 templates read and other templates ignore. Without thinking, a reasoning model answers much faster and uses fewer tokens, but it may plan less carefully. `--thinking main` keeps thinking for the main branch, which decides what to do, and skips it for the forks. The default budget leaves 1,024 tokens for the answer, or half of `--max-tokens` if that is less, so 1,024 of the default 2,048 tokens go to thinking.
+`--thinking` sends `chat_template_kwargs` with `enable_thinking`, which Qwen3 and Gemma 4 templates read and other templates ignore. Without thinking, a reasoning model answers much faster and uses fewer tokens, but it may plan less carefully. `--thinking main` keeps thinking for the main branch, which decides what to do, and skips it for the forks. `--fork-effort` keeps thinking in the forks at a lower or higher effort, for chat templates with effort levels, such as Qwen3.8's. At startup Reflect lists the template's levels and stops on a level the template rejects. The default budget leaves 1,024 tokens for the answer, or half of `--max-tokens` if that is less, so 1,024 of the default 2,048 tokens go to thinking.
 
 ## Interactive commands
 

@@ -1,4 +1,6 @@
-import httpx
+from dataclasses import dataclass
+
+from .transport import TransportError
 
 
 # Text that llama-server writes at the end of a thinking block that used up its budget.
@@ -20,6 +22,22 @@ class ContextLimitError(ServerError):
         self.n_ctx = n_ctx
 
 
+@dataclass
+class ServerProperties:
+    """What /props reports about the server and its chat template. None means the server did not say."""
+
+    context_size: int = None
+    build: str = None
+    # Reasoning effort values that the template renders distinctly, lowest first, and the values it raises an
+    # error for.
+    effort_levels: list = None
+    rejected_efforts: list = None
+
+
+def _strings(value):
+    return [item for item in value if isinstance(item, str)] if isinstance(value, list) else None
+
+
 class LlamaClient:
     def __init__(self, http):
         self.http = http
@@ -27,7 +45,7 @@ class LlamaClient:
     async def _request(self, method, path, **kwargs):
         try:
             response = await self.http.request(method, path, **kwargs)
-        except httpx.HTTPError as error:
+        except TransportError as error:
             raise ServerError(f"Could not reach llama-server at {self.http.base_url}: {error}") from error
         try:
             data = response.json()
@@ -41,7 +59,7 @@ class LlamaClient:
                         and isinstance(n_ctx, int)):
                     raise ContextLimitError(tokens, n_ctx)
                 detail = detail.get("message")
-            raise ServerError(f"{path} returned HTTP {response.status_code}: {detail or response.reason_phrase}")
+            raise ServerError(f"{path} returned HTTP {response.status}: {detail or response.reason}")
         return data
 
     async def check_health(self):
@@ -60,7 +78,7 @@ class LlamaClient:
         return model
 
     async def properties(self, model):
-        """Return the context size per slot and the build from /props. Either is None when unknown."""
+        """Return the context size per slot, the build, and the template's reasoning effort levels."""
         # A router serves several models and answers for one of them only when the request names it.
         data = await self._request("GET", "/props", params={"model": model}, timeout=5)
         if not isinstance(data, dict):
@@ -68,8 +86,14 @@ class LlamaClient:
         settings = data.get("default_generation_settings")
         n_ctx = settings.get("n_ctx") if isinstance(settings, dict) else None
         build = data.get("build_info")
-        return (n_ctx if isinstance(n_ctx, int) and n_ctx > 0 else None,
-                build if isinstance(build, str) and build else None)
+        caps = data.get("chat_template_caps")
+        caps = caps if isinstance(caps, dict) else {}
+        return ServerProperties(
+            context_size=n_ctx if isinstance(n_ctx, int) and n_ctx > 0 else None,
+            build=build if isinstance(build, str) and build else None,
+            effort_levels=_strings(caps.get("reasoning_effort_levels")),
+            rejected_efforts=_strings(caps.get("reasoning_effort_rejected")),
+        )
 
     async def slots(self):
         slots = await self._request("GET", "/slots", timeout=5)
@@ -89,7 +113,7 @@ class LlamaClient:
         return prompt
 
     async def complete(self, model, messages, tools, max_tokens, *, response_format=None, temperature=0.0,
-                       thinking=True, tool_choice=None, thinking_budget=None):
+                       thinking=True, tool_choice=None, thinking_budget=None, reasoning_effort=None):
         """Return the assistant message and the tokens the request used in the context, or None for those."""
         payload = {
             "model": model,
@@ -105,11 +129,15 @@ class LlamaClient:
         if not thinking:
             # Chat templates with a thinking mode, such as Qwen3's, read this flag. Others ignore it.
             payload["chat_template_kwargs"] = {"enable_thinking": False}
-        elif thinking_budget is not None:
-            # The server ends the thinking block after this many tokens, so the reply still has room for an
-            # answer. Builds without this feature ignore both fields.
-            payload["reasoning_budget_tokens"] = thinking_budget
-            payload["reasoning_budget_message"] = f"\n\n{THINKING_BUDGET_MESSAGE}\n"
+        else:
+            if thinking_budget is not None:
+                # The server ends the thinking block after this many tokens, so the reply still has room for an
+                # answer. Builds without this feature ignore both fields.
+                payload["reasoning_budget_tokens"] = thinking_budget
+                payload["reasoning_budget_message"] = f"\n\n{THINKING_BUDGET_MESSAGE}\n"
+            if reasoning_effort is not None:
+                # The server passes the level to chat templates that read it, such as Qwen3.8's.
+                payload["reasoning_effort"] = reasoning_effort
         data = await self._request("POST", "/v1/chat/completions", json=payload)
         try:
             choice = data["choices"][0]

@@ -3,7 +3,8 @@ import io
 import tempfile
 import unittest
 
-from refl.main import _check_command, _tolerant_output, main
+from refl.client import ServerProperties
+from refl.main import _check_command, _check_fork_effort, _tolerant_output, main
 
 # Nothing listens on the discard port, so a test that reaches the server fails.
 _NO_SERVER = "http://127.0.0.1:9"
@@ -50,6 +51,29 @@ class MainTest(unittest.TestCase):
         _check_command("/tmp", "is full, clean it")
         _check_command("/usr/bin/env", "")
 
+
+    def test_fork_effort_needs_thinking_in_the_forks(self):
+        for argv in (["hi", "--fork-effort", "none"], ["hi", "--fork-effort", "low", "--thinking", "main"]):
+            errors = io.StringIO()
+            with contextlib.redirect_stderr(errors), self.assertRaises(SystemExit):
+                main([*argv, "--workspace", self.directory.name, "--url", _NO_SERVER])
+            self.assertIn("--thinking", errors.getvalue())
+
+    def test_fork_effort_is_checked_against_the_template(self):
+        properties = ServerProperties(effort_levels=["low", "medium", "xhigh"], rejected_efforts=["minimal", "max"])
+        with self.assertRaisesRegex(ValueError, "rejects --fork-effort max. Its levels are low, medium, xhigh"):
+            _check_fork_effort("max", properties)
+        errors = io.StringIO()
+        with contextlib.redirect_stderr(errors):
+            _check_fork_effort("low", properties)
+            _check_fork_effort("high", properties)
+            _check_fork_effort("low", ServerProperties(effort_levels=[]))
+            _check_fork_effort("low", ServerProperties())
+        self.assertEqual(errors.getvalue().splitlines(), [
+            "--fork-effort high is not one of the chat template's levels (low, medium, xhigh), so the template "
+            "treats it like one of them or like its default.",
+            "The chat template has no reasoning effort levels, so --fork-effort low has no effect.",
+        ])
 
 if __name__ == "__main__":
     unittest.main()

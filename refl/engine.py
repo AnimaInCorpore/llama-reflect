@@ -242,7 +242,7 @@ _CONTEXT_WARNINGS = (0.75, 0.9)
 
 class Engine:
     def __init__(self, server, model, workspace, tree, max_turns, max_tokens, on_tool, *, forks=True,
-                 verification=True, thinking="auto", thinking_budget=None, context_size=None):
+                 verification=True, thinking="auto", thinking_budget=None, fork_effort=None, context_size=None):
         self.server = server
         self.model = model
         self.workspace = workspace
@@ -261,6 +261,9 @@ class Engine:
         if thinking_budget is None:
             thinking_budget = default_thinking_budget(max_tokens)
         self.thinking_budget = thinking_budget if thinking_budget >= 0 else None
+        # Reasoning effort for verifier and reviewer requests that think, such as "low". None keeps the
+        # template's default.
+        self.fork_effort = fork_effort
         self.strategy_sections = []
         self.track_strategy = False
         self.strategy_path = f".refl/strategies/{tree.path.stem}.md"
@@ -333,7 +336,8 @@ class Engine:
             message, tokens = await self.server.complete(self.model, messages, tools, self.max_tokens,
                                                          response_format=response_format, temperature=temperature,
                                                          thinking=thinking, tool_choice=tool_choice,
-                                                         thinking_budget=self.thinking_budget)
+                                                         thinking_budget=self.thinking_budget,
+                                                         reasoning_effort=self.fork_effort if fork else None)
         except ContextLimitError as error:
             raise ContextLimitError(error.tokens, error.n_ctx, self._context_advice()) from None
         reasoning = message.get("reasoning_content")

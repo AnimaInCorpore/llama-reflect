@@ -37,7 +37,7 @@ class FakeServer:
         return "\n".join(parts + after)
 
     async def complete(self, model, messages, tools, max_tokens, *, response_format=None, temperature=0.0,
-                       thinking=True, tool_choice=None, thinking_budget=None):
+                       thinking=True, tool_choice=None, thinking_budget=None, reasoning_effort=None):
         self.requests.append({
             "system": messages[0]["content"],
             "messages": messages,
@@ -47,6 +47,7 @@ class FakeServer:
             "thinking": thinking,
             "tool_choice": tool_choice,
             "thinking_budget": thinking_budget,
+            "reasoning_effort": reasoning_effort,
         })
         if not self.replies:
             raise AssertionError("Unexpected model request")
@@ -78,11 +79,11 @@ def decision(role="Diagnosis", reason="It explains the failures.", first_step="R
 
 
 def make_engine(root, replies, *, max_turns=20, forks=True, verification=True, thinking="auto", moves_text=False,
-                tokens=None, context_size=None, thinking_budget=None):
+                tokens=None, context_size=None, thinking_budget=None, fork_effort=None):
     events = []
     tree = ConversationTree(Path(root) / ".refl" / "sessions", SYSTEM_PROMPT)
     server = FakeServer(replies, moves_text=moves_text, tokens=tokens)
     engine = Engine(server, "model", WorkspaceTools(root), tree, max_turns, 256, events.append,
                     forks=forks, verification=verification, thinking=thinking, context_size=context_size,
-                    thinking_budget=thinking_budget)
+                    thinking_budget=thinking_budget, fork_effort=fork_effort)
     return engine, server, events

@@ -5,9 +5,9 @@ import re
 import sys
 from pathlib import Path
 
-import httpx
 
-from .client import LlamaClient, ServerError
+from .client import LlamaClient, ServerError, ServerProperties
+from .transport import HttpClient
 from .engine import THINKING_MODES, Engine, SYSTEM_PROMPT, TurnLimitError
 from .tools import WorkspaceTools
 from .tree import ConversationTree
@@ -36,6 +36,20 @@ def _thinking_budget(value):
 
 def _status(message):
     print(message, file=sys.stderr, flush=True)
+
+
+def _check_fork_effort(effort, properties):
+    """Stop on a level the chat template rejects, and warn about one that is not among its levels."""
+    if effort is None or properties.effort_levels is None:
+        return
+    levels = ", ".join(properties.effort_levels)
+    if effort in (properties.rejected_efforts or []):
+        raise ValueError(f"The chat template rejects --fork-effort {effort}. Its levels are {levels}.")
+    if not properties.effort_levels:
+        _status(f"The chat template has no reasoning effort levels, so --fork-effort {effort} has no effect.")
+    elif effort not in properties.effort_levels:
+        _status(f"--fork-effort {effort} is not one of the chat template's levels ({levels}), so the template "
+                f"treats it like one of them or like its default.")
 
 
 def _tolerant_output(stream):
@@ -117,52 +131,55 @@ async def _run(args):
 
     key = os.environ.get("LLAMA_API_KEY")
     headers = {"Authorization": f"Bearer {key}"} if key else {}
-    timeout = httpx.Timeout(args.timeout, connect=5)
-    async with httpx.AsyncClient(base_url=args.url, headers=headers, timeout=timeout) as http:
-        server = LlamaClient(http)
-        await server.check_health()
-        model = args.model or await server.default_model()
-        _status(f"Model: {model}\nWorkspace: {root}")
-        try:
-            slots, busy = await server.slots()
-            _status(f"Slots: {busy}/{slots} busy")
-        except ServerError as error:
-            _status(f"Slot status unavailable ({error})")
-        try:
-            context_size, build = await server.properties(model)
-        except ServerError as error:
-            context_size, build = None, None
-            _status(f"Server properties unavailable ({error})")
-        else:
-            _status(f"Context: {context_size:,} tokens per slot" if context_size else "Context size unavailable")
-        if build:
-            _status(f"Server build: {build}")
+    server = LlamaClient(HttpClient(args.url, headers=headers, timeout=args.timeout))
+    await server.check_health()
+    model = args.model or await server.default_model()
+    _status(f"Model: {model}\nWorkspace: {root}")
+    try:
+        slots, busy = await server.slots()
+        _status(f"Slots: {busy}/{slots} busy")
+    except ServerError as error:
+        _status(f"Slot status unavailable ({error})")
+    try:
+        properties = await server.properties(model)
+    except ServerError as error:
+        properties = ServerProperties()
+        _status(f"Server properties unavailable ({error})")
+    else:
+        _status(f"Context: {properties.context_size:,} tokens per slot" if properties.context_size
+                else "Context size unavailable")
+    if properties.build:
+        _status(f"Server build: {properties.build}")
+    if properties.effort_levels:
+        _status(f"Reasoning effort levels: {', '.join(properties.effort_levels)}")
+    _check_fork_effort(args.fork_effort, properties)
 
-        tree = _open_tree(root, args.resume)
-        engine = Engine(server, model, workspace, tree, args.max_turns, args.max_tokens, _status,
-                        forks=not args.linear, verification=not args.no_verify, thinking=args.thinking,
-                        thinking_budget=args.thinking_budget, context_size=context_size)
-        if args.prompt is not None:
-            await _submit(engine, args.prompt)
+    tree = _open_tree(root, args.resume)
+    engine = Engine(server, model, workspace, tree, args.max_turns, args.max_tokens, _status,
+                    forks=not args.linear, verification=not args.no_verify, thinking=args.thinking,
+                    thinking_budget=args.thinking_budget, fork_effort=args.fork_effort,
+                    context_size=properties.context_size)
+    if args.prompt is not None:
+        await _submit(engine, args.prompt)
+        return
+
+    interactive = sys.stdin.isatty()
+    if interactive:
+        _status("Enter a task or use /reflect, /tree, /checkout <node_id>, or /exit.")
+    while True:
+        try:
+            prompt = input("refl> " if interactive else "").strip()
+        except EOFError:
             return
-
-        interactive = sys.stdin.isatty()
-        if interactive:
-            _status("Enter a task or use /reflect, /tree, /checkout <node_id>, or /exit.")
-        while True:
+        if prompt == "/exit":
+            return
+        if prompt:
             try:
-                prompt = input("refl> " if interactive else "").strip()
-            except EOFError:
-                return
-            if prompt == "/exit":
-                return
-            if prompt:
-                try:
-                    await _submit(engine, prompt)
-                except (ServerError, TurnLimitError, ValueError) as error:
-                    if not interactive:
-                        raise
-                    _status(f"refl: {error}")
+                await _submit(engine, prompt)
+            except (ServerError, TurnLimitError, ValueError) as error:
+                if not interactive:
+                    raise
+                _status(f"refl: {error}")
 
 
 def main(argv=None):
@@ -180,6 +197,9 @@ def main(argv=None):
     parser.add_argument("--thinking", choices=THINKING_MODES, default="auto",
                         help="auto: the chat template decides; off: ask it to skip thinking for every request; "
                              "main: think on the main branch only (default: auto)")
+    parser.add_argument("--fork-effort", metavar="LEVEL",
+                        help="reasoning effort for verifier and reviewer requests, such as low; the chat template "
+                             "lists its levels at startup (default: the template's default)")
     parser.add_argument("--max-turns", type=_positive_int, default=20,
                         help="model requests per prompt across all branches (default: 20)")
     parser.add_argument("--max-tokens", type=_positive_int, default=2048, help="output tokens per completion (default: 2048)")
@@ -190,6 +210,10 @@ def main(argv=None):
     args = parser.parse_args(argv)
     if args.prompt is not None and not args.prompt.strip():
         parser.error("prompt must be nonempty")
+    if args.fork_effort == "none":
+        parser.error("use --thinking main to skip thinking in the forks")
+    if args.fork_effort is not None and args.thinking != "auto":
+        parser.error(f"--fork-effort needs --thinking auto, because the forks skip thinking with --thinking {args.thinking}")
     if args.prompt is not None and (mangled := _MSYS_COMMAND.fullmatch(args.prompt.strip())):
         parser.error(
             f"the prompt looks like /{mangled[1]} rewritten as a Windows path by MSYS2. Set "
@@ -201,7 +225,7 @@ def main(argv=None):
         asyncio.run(_run(args))
     except KeyboardInterrupt:
         return 130
-    except (httpx.InvalidURL, OSError, RuntimeError, ValueError) as error:
+    except (OSError, RuntimeError, ValueError) as error:
         _status(f"refl: {error}")
         return 1
     return 0

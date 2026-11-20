@@ -56,9 +56,8 @@ from typing import Callable
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-import httpx  # noqa: E402
-
 from refl.client import LlamaClient, ServerError  # noqa: E402
+from refl.transport import HttpClient  # noqa: E402
 from refl.engine import (  # noqa: E402
     _EVIDENCE_PROMPT, _PROPOSAL_PROMPT, _VERIFY_PROMPT, SYSTEM_PROMPT, THINKING_MODES, Engine, TurnLimitError,
 )
@@ -1431,57 +1430,54 @@ async def run_arm(task, arm, workspace, args):
     materialize(task, workspace)
     requests = []
 
-    async def record(response):
-        if not response.request.url.path.endswith("/chat/completions"):
+    def record(method, path, payload, response):
+        if not path.endswith("/chat/completions"):
             return
-        await response.aread()
-        body = json.loads(response.request.content)
         try:
             data = response.json()
         except ValueError:
             data = {}
+        data = data if isinstance(data, dict) else {}
         usage = data.get("usage") or {}
         timings = data.get("timings") or {}
         requests.append({
-            "branch": _branch(body["messages"][0]["content"]),
-            "status": response.status_code,
-            "seconds": round(response.elapsed.total_seconds(), 2),
+            "branch": _branch(payload["messages"][0]["content"]),
+            "status": response.status,
+            "seconds": round(response.seconds, 2),
             "prompt_tokens": usage.get("prompt_tokens"),
             "prompt_tokens_processed": timings.get("prompt_n"),
             "completion_tokens": usage.get("completion_tokens"),
         })
 
     events = []
-    timeout = httpx.Timeout(args.timeout, connect=5)
-    async with httpx.AsyncClient(base_url=args.url, timeout=timeout, event_hooks={"response": [record]}) as http:
-        server = LlamaClient(http)
-        model = args.model or await server.default_model()
-        try:
-            context_size, _ = await server.properties(model)
-        except ServerError:
-            context_size = None
-        tree = ConversationTree(workspace / ".refl" / "sessions", SYSTEM_PROMPT)
-        started = time.monotonic()
-        engine = Engine(server, model, WorkspaceTools(workspace), tree, args.max_turns, args.max_tokens,
-                        lambda text: events.append([round(time.monotonic() - started, 1), text]), **ARMS[arm],
-                        thinking=args.thinking, thinking_budget=args.thinking_budget,
-                        context_size=context_size)
-        answer = None
-        work = (respond_after_stall(engine, task, args.max_turns, args.heat, args.roles) if args.seeded
-                else engine.respond(task.prompt))
-        try:
-            answer = await asyncio.wait_for(work, args.deadline)
-            outcome = "answered"
-        except asyncio.TimeoutError:
-            outcome = "deadline"
-        except Exception as error:  # Record any failure and continue with the next run.
-            outcome = f"{type(error).__name__}: {error}"
-        seconds = round(time.monotonic() - started, 1)
-        tree.save()
-        trajectory = analyse(tree)
-        for reflection in trajectory["reflection_details"]:
-            reflection["distinct"] = await distinct_ideas(server, model, proposals(reflection["message"]),
-                                                          args.max_tokens)
+    server = LlamaClient(HttpClient(args.url, timeout=args.timeout, on_response=record))
+    model = args.model or await server.default_model()
+    try:
+        context_size = (await server.properties(model)).context_size
+    except ServerError:
+        context_size = None
+    tree = ConversationTree(workspace / ".refl" / "sessions", SYSTEM_PROMPT)
+    started = time.monotonic()
+    engine = Engine(server, model, WorkspaceTools(workspace), tree, args.max_turns, args.max_tokens,
+                    lambda text: events.append([round(time.monotonic() - started, 1), text]), **ARMS[arm],
+                    thinking=args.thinking, thinking_budget=args.thinking_budget,
+                    fork_effort=args.fork_effort, context_size=context_size)
+    answer = None
+    work = (respond_after_stall(engine, task, args.max_turns, args.heat, args.roles) if args.seeded
+            else engine.respond(task.prompt))
+    try:
+        answer = await asyncio.wait_for(work, args.deadline)
+        outcome = "answered"
+    except asyncio.TimeoutError:
+        outcome = "deadline"
+    except Exception as error:  # Record any failure and continue with the next run.
+        outcome = f"{type(error).__name__}: {error}"
+    seconds = round(time.monotonic() - started, 1)
+    tree.save()
+    trajectory = analyse(tree)
+    for reflection in trajectory["reflection_details"]:
+        reflection["distinct"] = await distinct_ideas(server, model, proposals(reflection["message"]),
+                                                      args.max_tokens)
 
     passed, detail = task.check(workspace)
     by_branch = {}
@@ -1494,6 +1490,7 @@ async def run_arm(task, arm, workspace, args):
         "mode": f"seeded at heat {args.heat}" if args.seeded else "natural",
         "thinking": args.thinking,
         "thinking_budget": engine.thinking_budget,
+        "fork_effort": engine.fork_effort,
         "passed": passed,
         "check": detail,
         "outcome": outcome,
@@ -1574,19 +1571,18 @@ async def run(args):
 async def judge_results(args):
     """Count distinct ideas in the reflections of an earlier results directory."""
     runs = json.loads(Path(args.judge, "results.json").read_text(encoding="utf-8"))
-    async with httpx.AsyncClient(base_url=args.url, timeout=httpx.Timeout(args.timeout, connect=5)) as http:
-        server = LlamaClient(http)
-        model = args.model or await server.default_model()
-        for run in runs:
-            trajectory = run["trajectory"]
-            # Results from before the role pool kept the reflection messages under another key.
-            messages = ([detail["message"] for detail in trajectory.get("reflection_details", [])]
-                        or trajectory.get("reflection_messages", []))
-            for message in messages:
-                ideas = proposals(message)
-                distinct = await distinct_ideas(server, model, ideas, args.max_tokens)
-                print(f"{run['task']} {run['arm']} {run.get('repeat')}: {distinct}/{len(ideas)} distinct "
-                      f"({', '.join(name for name, _ in ideas)})", flush=True)
+    server = LlamaClient(HttpClient(args.url, timeout=args.timeout))
+    model = args.model or await server.default_model()
+    for run in runs:
+        trajectory = run["trajectory"]
+        # Results from before the role pool kept the reflection messages under another key.
+        messages = ([detail["message"] for detail in trajectory.get("reflection_details", [])]
+                    or trajectory.get("reflection_messages", []))
+        for message in messages:
+            ideas = proposals(message)
+            distinct = await distinct_ideas(server, model, ideas, args.max_tokens)
+            print(f"{run['task']} {run['arm']} {run.get('repeat')}: {distinct}/{len(ideas)} distinct "
+                  f"({', '.join(name for name, _ in ideas)})", flush=True)
 
 
 def validate():
@@ -1644,6 +1640,8 @@ def main():
                         help="thinking mode as in refl --thinking (default: auto)")
     parser.add_argument("--thinking-budget", type=int, metavar="N",
                         help="thinking tokens per request as in refl --thinking-budget (default: as in refl)")
+    parser.add_argument("--fork-effort", metavar="LEVEL",
+                        help="reasoning effort for the forks as in refl --fork-effort (default: the template's)")
     parser.add_argument("--validate", action="store_true", help="check the fixtures and reference fixes only")
     parser.add_argument("--judge", metavar="RESULTS_DIR",
                         help="count distinct ideas in the reflections of an earlier run and exit")

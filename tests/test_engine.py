@@ -276,5 +276,15 @@ class EngineTest(unittest.TestCase):
         self.assertEqual(asyncio.run(engine.respond("hi")), "Done.")
         self.assertIn("Thinking stopped at its budget of 100 tokens", events)
 
+    def test_fork_effort_applies_to_verifiers_only(self):
+        engine, server, _ = make_engine(self.root, [
+            text(_CLAIM),
+            call("read_file", path="status.txt"),
+            verdict(),
+            text(f"Done. {_CLAIM} was verified."),
+        ], fork_effort="low")
+        asyncio.run(engine.respond("Check the status."))
+        self.assertEqual([request["reasoning_effort"] for request in server.requests], [None, "low", "low", None])
+
 if __name__ == "__main__":
     unittest.main()
