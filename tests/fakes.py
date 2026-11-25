@@ -42,7 +42,8 @@ class FakeServer:
         return "\n".join(parts + after)
 
     async def complete(self, model, messages, tools, max_tokens, *, response_format=None, temperature=0.0,
-                       thinking=True, tool_choice=None, thinking_budget=None, reasoning_effort=None, session=None):
+                       thinking=True, tool_choice=None, thinking_budget=None, reasoning_effort=None, session=None,
+                       on_text=None):
         self.requests.append({
             "system": messages[0]["content"],
             "messages": messages,
@@ -54,11 +55,13 @@ class FakeServer:
             "thinking_budget": thinking_budget,
             "reasoning_effort": reasoning_effort,
             "session": session,
+            "streamed": on_text is not None,
         })
         routed = self.route(self.requests[-1]) if self.route else None
         if routed is not None:
             if isinstance(routed, Exception):
                 raise routed
+            _stream(routed, on_text)
             return routed, None
         if not self.replies:
             raise AssertionError("Unexpected model request")
@@ -66,7 +69,19 @@ class FakeServer:
         tokens = self.tokens.pop(0) if self.tokens else None
         if isinstance(reply, Exception):
             raise reply
+        _stream(reply, on_text)
         return reply, tokens
+
+
+def _stream(reply, on_text):
+    """Hand a scripted reply to on_text word by word, as a streaming server would piece by piece."""
+    if on_text is None:
+        return
+    for field, kind in (("reasoning_content", "thinking"), ("content", "writing")):
+        for word in str(reply.get(field) or "").split():
+            on_text(kind, word + " ")
+    for call in reply.get("tool_calls") or []:
+        on_text("tool", call["function"]["arguments"])
 
 
 def text(content):
@@ -127,12 +142,14 @@ def reflection_route(ideas=None, statuses=None, status="supported", facts="a.txt
 
 
 def make_engine(root, replies, *, max_turns=20, forks=True, verification=True, thinking="auto", moves_text=False,
-                tokens=None, context_size=None, thinking_budget=None, fork_effort=None, vision=False, challenge=False, route=None):
+                tokens=None, context_size=None, thinking_budget=None, fork_effort=None, vision=False, challenge=False, route=None,
+                on_progress=None):
     """Without `challenge`, scripted replies need no answers for the critics."""
     events = []
     tree = ConversationTree(Path(root) / ".refl" / "sessions", SYSTEM_PROMPT)
     server = FakeServer(replies, moves_text=moves_text, tokens=tokens, route=route)
     engine = Engine(server, "model", WorkspaceTools(root), tree, max_turns, 256, events.append,
                     forks=forks, verification=verification, thinking=thinking, context_size=context_size,
-                    thinking_budget=thinking_budget, fork_effort=fork_effort, vision=vision, challenge=challenge)
+                    thinking_budget=thinking_budget, fork_effort=fork_effort, vision=vision, challenge=challenge,
+                    on_progress=on_progress)
     return engine, server, events

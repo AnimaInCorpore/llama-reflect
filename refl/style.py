@@ -24,6 +24,7 @@ _STYLES = {
     "challenge": "35",    # magenta: the plan challenge, its critics, and the main branch's answers to them
     "reflect": "94",      # bright blue: strategic reflection and its reviewers
     "moderate": "92",     # bright green: the moderator's rulings and choices
+    "think": "2;3",       # dim italic: the model's thinking, which reads as an aside
     "quiet": "2",         # dim: skills and status lines
     "warning": "33",
     "error": "31",
@@ -31,7 +32,10 @@ _STYLES = {
 _TOOL_NAMES = frozenset(tool["function"]["name"] for tool in TOOLS)
 _VERDICTS = (("[VERIFIED]", "verified"), ("[FALSE ASSUMPTION]", "false"), ("[UNVERIFIED]", "unverified"))
 # A message whose first line is one of these words is a block: a heading and the lines under it.
-_HEADINGS = {"Challenge": "challenge", "Strategy": "reflect", "Moderator": "moderate", "Skills": "quiet"}
+_HEADINGS = {"Challenge": "challenge", "Strategy": "reflect", "Moderator": "moderate", "Skills": "quiet",
+             "Thinking": "think"}
+# Without --verbose, thinking shows only its last lines, where the conclusion usually is.
+THINKING_LINES = 6
 # Earlier prefixes win, so "Context: ... in use" counts as a warning before "Context:" counts as status.
 _PREFIXES = (
     ("refl: ", "error"),
@@ -63,7 +67,7 @@ _CONTEXT_WARNING = re.compile(r"Context: [\d,]+ of [\d,]+ tokens in use")
 # \msys-1888ae32e00d56aa-pty0-to-master. An ordinary pipe between two programs has another name.
 _MSYS_PTY = re.compile(r"(?:msys|cygwin)-[0-9a-f]+-pty\d+-(?:to|from)-master")
 _STATUS = ("Model:", "Workspace:", "Slots:", "Slot status", "Server ", "Context:", "Reasoning effort",
-           "Image input", "Session:", "Enter a task", "Conversation switched")
+           "Image input", "Session:", "Latest earlier session", "Enter a task", "Conversation switched")
 
 
 def _wrap(text, style):
@@ -108,6 +112,18 @@ class Styler:
         if name in _TOOL_NAMES:
             return f"\x1b[{_STYLES['tool']}m{name}{_RESET}{space}{rest}"
         return message
+
+
+def brief(message, lines=THINKING_LINES):
+    """Shorten a thinking block to its last lines, with a note on what is left out."""
+    if not message.startswith("Thinking\n"):
+        return message
+    body = [line for line in message[len("Thinking\n"):].splitlines() if line.strip()]
+    if len(body) <= lines:
+        return "Thinking\n" + "\n".join(body)
+    hidden = len(body) - lines
+    return (f"Thinking\n... {hidden} earlier line{'s' if hidden > 1 else ''}, --verbose shows all\n"
+            + "\n".join(body[-lines:]))
 
 
 def is_detail(message):

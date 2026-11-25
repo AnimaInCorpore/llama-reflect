@@ -166,6 +166,8 @@ _FAILURE_REPORT = re.compile(
     r"^FAILED\b|^Traceback \(most recent call last\)|\b[1-9]\d* failed\b|^--- FAIL|^FAIL\s|test result: FAILED",
     re.MULTILINE)
 _FRACTIONAL = re.compile(r"\d+\.\d+")
+# Variable assignments at the start of a shell command, such as PYTHONIOENCODING=utf-8, and after && ; or |.
+_ASSIGNMENTS = re.compile(r"(^|&&|\|\||;|\|)(\s*)(?:[A-Za-z_]\w*=(?:'[^']*'|\"[^\"]*\"|\S*)\s+)+")
 
 
 def _result_signature(result):
@@ -187,6 +189,19 @@ class _Observation:
     @property
     def action(self):
         return self.name, self.arguments
+
+    @property
+    def core(self):
+        """The action without variable assignments in a Bash command. A failure ends when its core succeeds.
+
+        In a real session, `python -c ...` failed on the console's encoding, and the same command with
+        PYTHONIOENCODING=utf-8 in front worked. Matched on the exact command, the failure never ended, and a
+        reflection started ten tool calls later.
+        """
+        if self.name != "bash" or not isinstance(self.arguments, str):
+            return self.action
+        # For Bash, the observation keeps the command itself as its arguments.
+        return self.name, " ".join(_ASSIGNMENTS.sub(r"\1\2", self.arguments).split())
 
     @property
     def failed(self):
@@ -294,7 +309,7 @@ class StallDetector:
             self.last_bash = observation
             if observation.reports_check_failure:
                 self.unresolved = observation
-            elif (self.unresolved is not None and self.unresolved.action == observation.action
+            elif (self.unresolved is not None and self.unresolved.core == observation.core
                   and not observation.reports_failure):
                 self.unresolved = None
         self.quiet = 0 if changed else self.quiet + 1

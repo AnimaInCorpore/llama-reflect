@@ -148,6 +148,20 @@ class StallDetectorTest(unittest.TestCase):
         self.record("bash", {"command": command}, {"exit_code": 0, "output": "Ran 15 tests\n\nFAILED (failures=10)\n"})
         self.assertEqual(self.explore(9)[-1], f"10 tool calls in a row changed no file while {command} still fails.")
 
+    def test_the_same_command_with_variables_set_ends_the_failure(self):
+        # The real case: Python failed on the console's encoding, and the same command with UTF-8 output worked.
+        command = 'cd .refl/sessions && python -c "print(1)"'
+        self.record("bash", {"command": command},
+                    {"exit_code": 1, "output": "Traceback (most recent call last):\nUnicodeEncodeError"})
+        self.record("bash", {"command": command.replace("python", "PYTHONIOENCODING=utf-8 LANG=C python")},
+                    {"exit_code": 0, "output": "1"})
+        self.assertIsNone(self.detector.unresolved)
+        self.assertEqual(self.explore(12, start=2), [None] * 12)
+        # A different command that passes does not end it.
+        self.record("bash", {"command": "python check.py"}, {"exit_code": 1, "output": "FAILED"})
+        self.record("bash", {"command": "ls"}, {"exit_code": 0, "output": "check.py"})
+        self.assertIsNotNone(self.detector.unresolved)
+
     def test_exploring_without_a_failure_is_not_a_stall(self):
         self.assertEqual(self.explore(20), [None] * 20)
 

@@ -33,6 +33,18 @@ class MainTest(unittest.TestCase):
                 code = exit.code
         return code, errors.getvalue()
 
+    def test_a_new_session_names_the_latest_earlier_one(self):
+        from refl.main import _open_tree
+        sessions = Path(self.directory.name) / ".refl" / "sessions"
+        sessions.mkdir(parents=True)
+        for name in ("20261125T100000000000Z-old", "20261125T120000000000Z-newer"):
+            (sessions / f"{name}.json").write_text("{}", encoding="utf-8")
+        errors = io.StringIO()
+        with contextlib.redirect_stderr(errors):
+            _open_tree(Path(self.directory.name), None)
+        self.assertIn("Latest earlier session: 20261125T120000000000Z-newer. Continue it with --resume "
+                      "20261125T120000000000Z-newer", errors.getvalue())
+
     def test_unencodable_output_is_escaped(self):
         buffer = io.BytesIO()
         stream = io.TextIOWrapper(buffer, encoding="cp1252")

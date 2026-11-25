@@ -7,6 +7,7 @@ from pathlib import Path
 
 
 from . import style
+from .statusbar import StatusBar, wanted
 from .client import LlamaClient, ServerError, ServerProperties
 from .transport import HttpClient
 from .engine import THINKING_MODES, Engine, SYSTEM_PROMPT, TurnLimitError
@@ -14,6 +15,8 @@ from .tools import WorkspaceTools
 from .tree import ConversationTree
 
 
+# The live status panel of the running task, if the terminal has room for one.
+_PANEL = None
 _TREE_COMMANDS = {"/tree", "/checkout"}
 _COMMANDS = _TREE_COMMANDS | {"/reflect", "/exit"}
 _SLASH_WORD = re.compile(r"/[A-Za-z][\w-]*")
@@ -38,7 +41,28 @@ def _thinking_budget(value):
 def _status(message):
     if not style.show_details and style.is_detail(message):
         return
-    print(style.err.event(message), file=sys.stderr, flush=True)
+    text = style.err.event(message if style.show_details else style.brief(message))
+    if _PANEL is not None:
+        _PANEL.write(text)
+    else:
+        print(text, file=sys.stderr, flush=True)
+
+
+async def _with_panel(engine, work):
+    """Run `work` with the live status panel, which polls the server's /slots for the model's pace."""
+    if _PANEL is None:
+        return await work
+    _PANEL.start()
+    poller = asyncio.create_task(_PANEL.poll(engine.server.slot_stats))
+    try:
+        return await work
+    finally:
+        poller.cancel()
+        try:
+            await poller
+        except asyncio.CancelledError:
+            pass
+        _PANEL.stop()
 
 
 def _check_fork_effort(effort, properties):
@@ -68,9 +92,15 @@ def _check_command(command, argument):
 
 
 def _open_tree(root, resume, *, persist=True):
-    tree = ConversationTree(root / ".refl" / "sessions", SYSTEM_PROMPT, resume=resume, persist=persist)
+    folder = root / ".refl" / "sessions"
+    earlier = sorted(folder.glob("*.json")) if resume is None and folder.is_dir() else []
+    tree = ConversationTree(folder, SYSTEM_PROMPT, resume=resume, persist=persist)
     if persist:
         _status(f"Session: {tree.path.stem}")
+        # Session names start with their time, so the last one by name is the latest. Without this hint, a model
+        # asked "So?" in a new session spent seven requests reading raw session logs to find the earlier work.
+        if earlier:
+            _status(f"Latest earlier session: {earlier[-1].stem}. Continue it with --resume {earlier[-1].stem}")
     return tree
 
 
@@ -104,12 +134,12 @@ async def _submit(engine, prompt):
     elif command == "/reflect":
         if argument:
             raise ValueError("Usage: /reflect")
-        await engine.reflect()
+        await _with_panel(engine, engine.reflect())
     elif command == "/exit":
         raise ValueError("Usage: /exit")
     else:
         try:
-            print(style.out.answer(await engine.respond(prompt)), flush=True)
+            print(style.out.answer(await _with_panel(engine, engine.respond(prompt))), flush=True)
         except TurnLimitError as error:
             if error.report:
                 print(style.out.answer(error.report), flush=True)
@@ -164,12 +194,16 @@ async def _run(args):
         _status("Image input: the model can look at images with view_image")
     _check_fork_effort(args.fork_effort, properties)
 
+    global _PANEL
+    if not args.no_status and wanted(sys.stderr):
+        _PANEL = StatusBar(sys.stderr, True, styled=style.err.enabled)
     tree = _open_tree(root, args.resume)
     engine = Engine(server, model, workspace, tree, args.max_turns, args.max_tokens, _status,
                     forks=not args.linear, verification=not args.no_verify, challenge=not args.no_challenge,
                     thinking=args.thinking,
                     thinking_budget=args.thinking_budget, fork_effort=args.fork_effort,
-                    context_size=properties.context_size, vision=properties.vision is True)
+                    context_size=properties.context_size, vision=properties.vision is True,
+                    on_progress=_PANEL.progress if _PANEL is not None else None)
     if args.prompt is not None:
         await _submit(engine, args.prompt)
         return
@@ -223,6 +257,8 @@ def main(argv=None):
     parser.add_argument("--verbose", action="store_true",
                         help="show every step of the checks, the plan challenge, and reflection, not only their "
                              "summary lines")
+    parser.add_argument("--no-status", action="store_true",
+                        help="skip the live status panel at the bottom of the terminal while a task runs")
     parser.add_argument("--color", choices=style.COLOR_MODES, default="auto",
                         help="color the output: auto styles it for a terminal unless NO_COLOR is set (default: auto)")
     args = parser.parse_args(argv)

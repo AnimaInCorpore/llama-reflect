@@ -20,6 +20,42 @@ from .tree import ensure_git_ignored
 
 
 
+def _short(text, limit=60):
+    text = " ".join(str(text).split())
+    return text if len(text) <= limit else text[:limit - 3] + "..."
+
+
+# Hidden folders that hold project configuration rather than scratch files.
+_PROJECT_FOLDERS = {".github", ".gitlab", ".circleci", ".devcontainer", ".vscode", ".husky", ".config", ".cargo"}
+
+
+def _scratch(path):
+    """Whether `path` lies in a hidden folder that holds scratch files or Reflect's own notes, such as .refl/.
+
+    In a real session, a test harness in .tmpcheck/ got a full plan check, and nothing held up.
+    """
+    parts = PurePosixPath(path.replace("\\", "/")).parts
+    return len(parts) > 1 and parts[0].startswith(".") and parts[0] not in _PROJECT_FOLDERS
+
+
+def _without_images(messages, main):
+    """Leave out the images of the main branch's view_image results, of the messages where `main` is true.
+
+    A fork judges the plan or a claim and does not need the pixels. In a real session, every critic and verifier
+    request carried a 600 KB screenshot. The fork can look at the image itself with view_image.
+    """
+    stripped = []
+    for message, on_main in zip(messages, main):
+        if on_main and message["role"] == "tool" and tool_image(message.get("content")):
+            result = json.loads(message["content"])
+            result.pop("image")
+            result["output"] = (f"{result.get('output', '')}\n[The image went to the main branch. Use view_image to "
+                                f"look at it yourself.]").strip()
+            message = {**message, "content": json.dumps(result, ensure_ascii=False)}
+        stripped.append(message)
+    return stripped
+
+
 def _elapsed(start):
     seconds = round(time.monotonic() - start)
     return f"{seconds} s" if seconds < 60 else f"{seconds // 60} min {seconds % 60} s"
@@ -41,6 +77,8 @@ _PROMPT_END = (
     "Prefer existing tools for mechanical work and check the project skills for a relevant workflow. "
     "On the main branch, after confirming a reusable command or workflow, write or update a short Markdown "
     "skill under .refl/skills/ with when to use it and the command that worked. "
+    "To recall earlier work in this workspace, read the skills and the notes under .refl/strategies/ first. The "
+    "session logs under .refl/sessions/ are large raw JSON. "
     "When the task is complete, give a brief final answer."
 )
 SYSTEM_PROMPT = _PROMPT_START + _VERIFICATION_INSTRUCTION + _PROMPT_END
@@ -347,7 +385,7 @@ _CONTEXT_WARNINGS = (0.75, 0.9)
 class Engine:
     def __init__(self, server, model, workspace, tree, max_turns, max_tokens, on_tool, *, forks=True,
                  verification=True, thinking="auto", thinking_budget=None, fork_effort=None, context_size=None,
-                 vision=False, challenge=True):
+                 vision=False, challenge=True, on_progress=None):
         self.server = server
         self.model = model
         self.workspace = workspace
@@ -391,9 +429,67 @@ class Engine:
         self.context_warnings = 0
         # Whether the server takes image input. Without it the model does not get the view_image tool.
         self.vision = vision
+        # Called with the phase and its counts, such as critics=(4, 6), for a status line. Counts per phase.
+        self.on_progress = on_progress
+        self.counts = {}
+
+    def _progress(self, **fields):
+        """Report the phase, which resets its counts, or parts of it, such as moderator="ruling"."""
+        if "phase" in fields:
+            self.counts = {}
+        for name, value in fields.items():
+            if isinstance(value, tuple):
+                self.counts[name] = list(value)
+        if self.on_progress is not None:
+            self.on_progress(**fields)
+
+    def _actor(self, name, doing, tone):
+        """Report what one reflector, the moderator, or the main branch does now, for a status panel.
+
+        The tone is wait, work, good, bad, or quiet, such as work for "reading SPEC.md" and good for "proven".
+        """
+        self._progress(actor=(name, doing, tone))
+
+    def _stream_to_panel(self, actor):
+        """Return on_text for a streamed request of `actor` that reports its progress, or None without a panel."""
+        if self.on_progress is None or not actor:
+            return None
+        state = {"tokens": 0, "start": None, "kind": "waiting", "tail": ""}
+
+        def on_text(kind, text):
+            now = time.monotonic()
+            if kind == "done":
+                state["kind"] = "done"
+            else:
+                state["start"] = state["start"] or now
+                if kind != state["kind"]:
+                    state["kind"], state["tail"] = kind, ""
+                # A streamed piece is about one token: 73 pieces carried 76 tokens on Basalt.
+                state["tokens"] += 1
+                state["tail"] = (state["tail"] + text)[-200:]
+            elapsed = now - state["start"] if state["start"] else 0
+            rate = (state["tokens"] - 1) / elapsed if elapsed > 0 else 0.0
+            self._progress(stream=(actor, state["kind"], state["tokens"], rate, state["tail"]))
+
+        self._progress(stream=(actor, "waiting", 0, 0.0, ""))
+        return on_text
+
+    def _tick(self, name, done=1, total=0):
+        """Count one more finished, or with total=1 one more started, reflector of a kind."""
+        count = self.counts.setdefault(name, [0, 0])
+        count[0] += done
+        count[1] += total
+        self._progress(**{name: tuple(count)})
 
     def _messages(self, leaf, *, system_prompt=None):
         messages = self.tree.messages(leaf)
+        if system_prompt is not None:
+            # A fork: the images that the main branch viewed stay with the main branch.
+            main, node = [], leaf
+            while node is not None:
+                main.append(self.tree.nodes[node].branch_type == "main")
+                node = self.tree.nodes[node].parent_id
+            messages = _without_images(messages, list(reversed(main)))
         skills = self.workspace.skill_paths()
         # Build the main prompt for each request so resumed sessions, --linear, and --no-verify use the
         # current instructions.
@@ -442,8 +538,12 @@ class Engine:
         return "\n\n".join(parts)
 
     async def _complete(self, messages, tools, *, fork=False, response_format=None, temperature=0.0,
-                        tool_choice=None, branch=None):
-        """Request a completion. `branch` names a fork by the ID of its first node, so it gets its own session."""
+                        tool_choice=None, branch=None, actor=None):
+        """Request a completion. `branch` names a fork by the ID of its first node, so it gets its own session.
+
+        `actor` names who asks, such as a critic, for the status panel. While a panel listens, the reply streams,
+        and each piece reports that actor's tokens, speed, and latest text.
+        """
         if self.batch_left is not None:
             if self.batch_left <= 0:
                 raise TurnLimitError(f"The {self.batch_name} used all of its requests.")
@@ -453,6 +553,8 @@ class Engine:
                 raise TurnLimitError("No model requests remain for this step.")
             self.requests_left -= 1
         thinking = self.thinking == "auto" or (self.thinking == "main" and not fork)
+        if not fork and self.batch_name is None:
+            self._progress(phase="Next step, thinking" if thinking else "Next step")
         if self.split_text is None:
             self.split_text = await self._template_moves_text()
         messages = attach_images(messages, self.vision)
@@ -461,16 +563,25 @@ class Engine:
         if self.split_text:
             messages = split_text_and_calls(messages)
         try:
-            message, tokens = await self.server.complete(self.model, messages, tools, self.max_tokens,
-                                                         response_format=response_format, temperature=temperature,
-                                                         thinking=thinking, tool_choice=tool_choice,
-                                                         thinking_budget=self.thinking_budget,
-                                                         reasoning_effort=self.fork_effort if fork else None,
-                                                         session=self._session(branch))
+            stream = self._stream_to_panel(actor or (None if fork else "Main branch"))
+            try:
+                message, tokens = await self.server.complete(self.model, messages, tools, self.max_tokens,
+                                                             response_format=response_format, temperature=temperature,
+                                                             thinking=thinking, tool_choice=tool_choice,
+                                                             thinking_budget=self.thinking_budget,
+                                                             reasoning_effort=self.fork_effort if fork else None,
+                                                             session=self._session(branch),
+                                                             **({"on_text": stream} if stream else {}))
+            finally:
+                if stream:
+                    stream("done", "")
         except ContextLimitError as error:
             raise ContextLimitError(error.tokens, error.n_ctx, self._context_advice(),
                                     reply_tokens=error.reply_tokens) from None
         reasoning = message.get("reasoning_content")
+        if not fork and isinstance(reasoning, str) and reasoning.strip():
+            # The main branch's thinking, shown when its reply arrives. Requests do not stream, so not sooner.
+            self.on_tool("Thinking\n" + reasoning.strip())
         if thinking and isinstance(reasoning, str) and reasoning.rstrip().endswith(THINKING_BUDGET_MESSAGE):
             self.on_tool(f"Thinking stopped at its budget of {self.thinking_budget:,} tokens")
         if not fork and tokens and self.context_size:
@@ -531,6 +642,8 @@ class Engine:
                 if tracking:
                     self._strategy_event(f"### Attempt\n\n    {summary}")
                 self.on_tool(prefix + summary)
+                if not read_only:
+                    self._progress(phase=f"Running {summary if len(summary) <= 60 else summary[:57] + '...'}")
                 result = await asyncio.to_thread(self.workspace.execute, function)
                 if not read_only and (name == "bash" or result.get("changed") is True):
                     self.verdicts.clear()
@@ -554,7 +667,7 @@ class Engine:
             }, parent_id=leaf, branch_type=branch_type)
         return leaf, evidence
 
-    async def _verify(self, anchor, claim):
+    async def _verify(self, anchor, claim, actor="Verifier"):
         self.on_tool(f"Verifying {claim}")
         leaf = self.tree.append({
             "role": "user",
@@ -569,6 +682,7 @@ class Engine:
             for attempt in range(3):
                 message = await self._complete(
                     self._messages(leaf, system_prompt=_VERIFY_PROMPT), _READ_ONLY_TOOLS, fork=True, branch=start,
+                    actor=actor,
                 )
                 calls = _tool_calls(message)
                 leaf = self.tree.append(message, parent_id=leaf, branch_type="verification")
@@ -588,7 +702,7 @@ class Engine:
                     {"role": "user", "content": f"Claim: {claim}\n\nCurrent evidence:\n" + "\n\n".join(evidence)},
                 ]
                 message = await self._complete(
-                    messages, [], fork=True, response_format=_VERDICT_SCHEMA, branch=start,
+                    messages, [], fork=True, response_format=_VERDICT_SCHEMA, branch=start, actor=actor,
                 )
                 leaf = self.tree.append(message, parent_id=leaf, branch_type="verification")
                 try:
@@ -611,6 +725,7 @@ class Engine:
     async def _review(self, anchor, stall, role, brief, history):
         """Run one reviewer in a read-only fork and return its structured answer, or None without an idea."""
         self.on_tool(f"Reviewing as {role.name}: {role.focus}")
+        self._actor(role.name, "looking at the stall", "work")
         request = (f"User's request: {self._user_request(anchor)[:1500]}\nReflection role: {role.name}\n"
                    f"Review reason: {stall}\n\n{role.focus}")
         if role.brief:
@@ -648,11 +763,14 @@ class Engine:
                 # One request to gather evidence. Requiring a call keeps a small model from proposing a check
                 # instead of running it. A reply in text still leads to the structured answer, which needs facts.
                 message = await self._complete(context(leaf, REFLECTION_PROMPT), _READ_ONLY_TOOLS, fork=True,
-                                               temperature=role.temperature, tool_choice="required", branch=start)
+                                               temperature=role.temperature, tool_choice="required", branch=start,
+                                               actor=role.name)
                 calls = _tool_calls(message)
                 leaf = self.tree.append(message, parent_id=leaf, branch_type="reflection")
                 if calls:
+                    self._actor(role.name, f"checking {_short(_call_summary(calls[0]['function']))}", "work")
                     leaf, _ = await self._observe(leaf, calls, branch_type="reflection")
+                self._actor(role.name, "writing its idea", "work")
                 leaf = self.tree.append({
                     "role": "user",
                     "content": "Give your answer now using the evidence already in the conversation.",
@@ -660,6 +778,7 @@ class Engine:
             message = await self._complete(
                 context(leaf, _PROPOSAL_PROMPT), [], fork=True,
                 response_format=_proposal_schema(role.fields), temperature=role.temperature, branch=start,
+                actor=role.name,
             )
             if _tool_calls(message):
                 raise ServerError("The reviewer called a tool on its final request.")
@@ -671,29 +790,38 @@ class Engine:
                 answer, proposal = None, ""
             if proposal.strip(" ."):
                 self.tree.finish_fork(leaf, anchor, "merged")
+                self._actor(role.name, f"idea: {_short(proposal)}", "work")
                 return answer
         except (ServerError, TurnLimitError) as error:
             reason = str(error)
 
         self.tree.finish_fork(leaf, anchor, "pruned")
         self.on_tool(f"Reflection {role.name}: {reason}")
+        self._actor(role.name, "no idea", "quiet")
         return None
 
     async def _proven_idea(self, anchor, stall, role, brief, history):
         """Return a reviewer's idea for the main branch if a verifier confirms the facts it rests on."""
         answer = await self._review(anchor, stall, role, brief, history)
+        self._tick("reviewers")
         if answer is None:
             return None
         facts = " ".join(str(answer.get("facts", "")).split())
         if facts.strip(" .").lower() in ("", "none", "unverified", "unknown"):
             self.on_tool(f"Reflection {role.name}: dropped, the idea names no facts.")
+            self._actor(role.name, "dropped, no facts named", "quiet")
             return None
-        verdict = await self._verify(anchor, f"These facts hold in the workspace: {facts}")
+        self._actor(role.name, "verifier checks its facts", "work")
+        self._tick("verifiers", done=0, total=1)
+        verdict = await self._verify(anchor, f"These facts hold in the workspace: {facts}", actor=role.name)
+        self._tick("verifiers")
         label, _, detail = verdict.partition("] ")
         if label != "[VERIFIED":
             why = "refuted" if label == "[FALSE ASSUMPTION" else "not proven"
             self.on_tool(f"Reflection {role.name}: dropped, its facts are {why}. {detail}")
+            self._actor(role.name, f"dropped, facts {why}", "bad" if why == "refuted" else "quiet")
             return None
+        self._actor(role.name, f"proven: {_short(answer.get('proposal', ''))}", "good")
         return f"{_format_proposal(answer)[:800]} Verifier: {detail}"
 
     async def _reflect(self, reason, *, manual=False):
@@ -709,6 +837,11 @@ class Engine:
         self.on_tool(f"Strategy\nReflecting: {reason}\nTemperature {level}: {names}\nTracking: {self.strategy_path}")
         brief = self._brief(anchor, reason)
         start = time.monotonic()
+        self._progress(phase="Reflection", reviewers=(0, len(roles)), **({} if manual else {"moderator": "waiting"}))
+        for role in roles:
+            self._actor(role.name, "waiting for a slot", "wait")
+        if not manual:
+            self._actor("Moderator", "waiting for proven ideas", "wait")
         # The reviewers, the verifiers of their facts, and the moderator have a budget of their own, as for the
         # plan challenge.
         self.batch_left, self.batch_name = REFLECTION_REQUESTS, "reflection"
@@ -787,8 +920,9 @@ class Engine:
                 path = args["path"]
             except (KeyError, TypeError, ValueError):
                 continue
-            # Skills and strategy notes under .refl/ record the work rather than change the project.
-            if not isinstance(path, str) or not path.strip() or PurePosixPath(path.replace("\\", "/")).parts[:1] == (".refl",):
+            # Skills and strategy notes under .refl/, and scratch files in other hidden folders, record or support
+            # the work rather than change the project.
+            if not isinstance(path, str) or not path.strip() or _scratch(path):
                 continue
             if not small_edit(name, args, self._replaced_text(path) if name == "write_file" else None):
                 return True
@@ -823,6 +957,10 @@ class Engine:
         self.batch_left, self.batch_name = CHALLENGE_REQUESTS, "plan challenge"
         self.challenge_outcome = "stopped early"
         start = time.monotonic()
+        self._progress(phase="Plan check", critics=(0, len(CRITICS) + 1), moderator="waiting")
+        for critic in (*CRITICS, SIMPLIFIER):
+            self._actor(critic.name, "waiting for a slot", "wait")
+        self._actor("Moderator", "waiting for proven findings", "wait")
         try:
             return await self._run_challenge(calls)
         finally:
@@ -872,6 +1010,8 @@ class Engine:
         ruled = [(ruling, f"- {line}" + (f" Moderator: {reason}" if reason else ""))
                  for (*_, line), (ruling, reason) in zip(findings, rulings)]
         self.on_tool("Moderator\n" + "\n".join(f"{ruling}: {line[2:]}" for ruling, line in ruled))
+        tally = [f"{sum(ruling == kind for ruling, _ in ruled)} {kind}" for kind in ("follow", "dismiss", "ask_user")]
+        self._actor("Moderator", " · ".join(count for count in tally if not count.startswith("0 ")), "good")
         ask = [line for ruling, line in ruled if ruling == "ask_user"]
         follow = [line for ruling, line in ruled if ruling == "follow"]
         counted = f"{len(findings)} proven, {len(follow)} to follow, {len(findings) - len(follow) - len(ask)} dismissed"
@@ -905,6 +1045,7 @@ class Engine:
             if status != "not_complied":
                 self.on_tool(f"Moderator\nThe revised plan follows the rulings. {reason}".rstrip())
                 self.challenge_outcome = f"{counted}; the revised plan follows them"
+                self._actor("Moderator", "the revised plan follows the rulings", "good")
                 break
             self.on_tool(f"Moderator\nThe revised plan does not follow the rulings yet. {reason}".rstrip())
             if attempt:
@@ -923,6 +1064,8 @@ class Engine:
         self.tree.append({"role": "user", "content": (
             f"For the user\nThe moderator ruled that only the user can settle these confirmed findings.\n\n"
             f"{standing}\n\n{_ASK_USER_REQUEST}")})
+        self._progress(main="writing a question for you")
+        self._actor("Main branch", "writing a question for you", "work")
         try:
             message = await self._complete(self._messages(self.tree.head), [])
             question = message.get("content")
@@ -940,19 +1083,29 @@ class Engine:
         start = leaf = self.tree.append({"role": "user", "content": content}, parent_id=anchor,
                                         branch_type="moderator")
         messages = [{"role": "system", "content": f"{MODERATOR_PROMPT}\n\n{task}"}, {"role": "user", "content": content}]
+        doing = {RULING_PROMPT: "ruling", CHECK_PROMPT: "checking the revised plan", CHOICE_PROMPT: "choosing"}
+        self._progress(moderator=doing.get(task, "deciding"))
+        self._actor("Moderator", doing.get(task, "deciding"), "work")
         try:
-            message = await self._complete(messages, [], fork=True, response_format=schema, branch=start)
+            message = await self._complete(messages, [], fork=True, response_format=schema, branch=start,
+                                           actor="Moderator")
             leaf = self.tree.append(message, parent_id=leaf, branch_type="moderator")
             answer = json.loads(message.get("content") or "")
         except (ServerError, TurnLimitError, TypeError, ValueError) as error:
             self.tree.finish_fork(leaf, anchor, "pruned")
             self.on_tool(f"Moderator\nNo answer: {error}")
+            self._progress(moderator="no answer")
+            self._actor("Moderator", "no answer", "bad")
             return None
         self.tree.finish_fork(leaf, anchor, "merged")
+        self._progress(moderator="done")
+        self._actor("Moderator", "decided", "good")
         return answer
 
     async def _answer_objections(self):
         """Have the main branch answer the findings in the last message, without tools."""
+        self._progress(main="revising its plan")
+        self._actor("Main branch", "revising its plan", "work")
         try:
             message = await self._complete(self._messages(self.tree.head), [])
             answer = message.get("content")
@@ -964,14 +1117,23 @@ class Engine:
         else:
             answer = answer.strip()
             self.on_tool(f"Challenge\nAnswer\n{answer}")
+        self._progress(main=None)
+        self._actor("Main branch", "plan revised", "good")
         self.tree.append({"role": "assistant", "content": answer})
 
     async def _object(self, anchor, critic, pending):
         """Return a critic's answer and the verifier's verdict on its objection, or None without one."""
         answer = await self._critique(anchor, critic, pending)
+        self._tick("critics")
         if answer is None:
             return None
-        verdict = await self._verify(anchor, f"The planned change ({pending}) fails: {objection_of(answer)}")
+        self._tick("verifiers", done=0, total=1)
+        verdict = await self._verify(anchor, f"The planned change ({pending}) fails: {objection_of(answer)}",
+                                     actor=critic.name)
+        self._tick("verifiers")
+        label = verdict[1:].partition("]")[0]
+        self._actor(critic.name, {"VERIFIED": "objection proven", "FALSE ASSUMPTION": "objection refuted"}.get(
+            label, "objection not proven"), {"VERIFIED": "good", "FALSE ASSUMPTION": "bad"}.get(label, "quiet"))
         return answer, verdict
 
     async def _simplify(self, anchor, pending):
@@ -979,14 +1141,19 @@ class Engine:
         answer = await self._critique(anchor, SIMPLIFIER, pending, prompt=SIMPLIFY_PROMPT,
                                       answer_prompt=SIMPLIFY_ANSWER_PROMPT, schema=simplify_schema(),
                                       found=simplification_of, nothing="The current plan is already about as simple.")
+        self._tick("critics")
         if answer is None:
             return None
         strategy = simplification_of(answer)
-        verdict = await self._verify(anchor, simplification_claim(answer))
+        self._tick("verifiers", done=0, total=1)
+        verdict = await self._verify(anchor, simplification_claim(answer), actor=SIMPLIFIER.name)
+        self._tick("verifiers")
         label, _, detail = verdict.partition("] ")
         if label != "[VERIFIED":
             self.on_tool(f"Challenge\nDropped the simpler strategy: {detail}")
+            self._actor(SIMPLIFIER.name, "strategy not proven", "bad" if label == "[FALSE ASSUMPTION" else "quiet")
             return None
+        self._actor(SIMPLIFIER.name, "simpler strategy proven", "good")
         line = f"{SIMPLIFIER.name}: {format_simplification(answer)[:800]} Verifier: {detail}"
         return SIMPLIFIER, strategy, line
 
@@ -994,6 +1161,7 @@ class Engine:
                         schema=None, found=objection_of, nothing="The critic returned no objection."):
         """Run one critic in a read-only fork and return its structured answer, or None if `found` sees nothing."""
         self.on_tool(f"Challenging as {critic.name}")
+        self._actor(critic.name, "looking at the plan", "work")
         start = leaf = self.tree.append({
             "role": "user",
             "content": (f"User's request: {self._user_request(anchor)[:1500]}\nCritic role: {critic.name}\n"
@@ -1005,11 +1173,13 @@ class Engine:
             # One request to gather evidence, then the answer without tools, as for a reflection reviewer.
             message = await self._complete(self._messages(leaf, system_prompt=f"{prompt}\n\n{role}"),
                                            _READ_ONLY_TOOLS, fork=True, temperature=critic.temperature,
-                                           tool_choice="required", branch=start)
+                                           tool_choice="required", branch=start, actor=critic.name)
             calls = _tool_calls(message)
             leaf = self.tree.append(message, parent_id=leaf, branch_type="challenge")
             if calls:
+                self._actor(critic.name, f"checking {_short(_call_summary(calls[0]['function']))}", "work")
                 leaf, _ = await self._observe(leaf, calls, branch_type="challenge")
+            self._actor(critic.name, "writing its finding", "work")
             leaf = self.tree.append({
                 "role": "user",
                 "content": "Give your answer now using the evidence already in the conversation.",
@@ -1017,6 +1187,7 @@ class Engine:
             message = await self._complete(
                 self._messages(leaf, system_prompt=f"{prompt} {answer_prompt}\n\n{role}"), [], fork=True,
                 response_format=schema or answer_schema(), temperature=critic.temperature, branch=start,
+                actor=critic.name,
             )
             if _tool_calls(message):
                 raise ServerError("The critic called a tool on its final request.")
@@ -1027,12 +1198,14 @@ class Engine:
                 answer = None
             if found(answer):
                 self.tree.finish_fork(leaf, anchor, "merged")
+                self._actor(critic.name, f"{_short(found(answer))}; verifier checks it", "work")
                 return answer
         except (ServerError, TurnLimitError) as error:
             reason = str(error)
 
         self.tree.finish_fork(leaf, anchor, "pruned")
         self.on_tool(f"Challenge {critic.name}: {reason}")
+        self._actor(critic.name, "nothing found" if reason == nothing else _short(reason), "quiet")
         return None
 
     async def reflect(self):
@@ -1160,7 +1333,19 @@ class Engine:
                 continue
             if claims:
                 anchor = self.tree.head
-                verdicts = await asyncio.gather(*(self._verify(anchor, claim) for claim in claims))
+                self._progress(phase="Checking claims", verifiers=(0, len(claims)))
+
+                async def checked(number, claim):
+                    name = f"Verifier {number}"
+                    self._actor(name, f"checking: {_short(claim)}", "work")
+                    verdict = await self._verify(anchor, claim, actor=name)
+                    self._tick("verifiers")
+                    label = verdict[1:].partition("]")[0]
+                    self._actor(name, f"{label.lower()}: {_short(claim)}",
+                                {"VERIFIED": "good", "FALSE ASSUMPTION": "bad"}.get(label, "quiet"))
+                    return verdict
+
+                verdicts = await asyncio.gather(*(checked(number, claim) for number, claim in enumerate(claims, 1)))
                 self.verdicts.update(zip(claims, verdicts))
                 findings = [f"{claim}\n{verdict}" for claim, verdict in zip(claims, verdicts)]
                 for claim, verdict in zip(claims, verdicts):

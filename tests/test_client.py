@@ -21,11 +21,12 @@ class _Handler(BaseHTTPRequestHandler):
         url = urllib.parse.urlsplit(self.path)
         request = SimpleNamespace(method=self.command, path=url.path, params=dict(urllib.parse.parse_qsl(url.query)),
                                   json=json.loads(body) if body else None, headers=self.headers)
-        status, payload = self.server.handler(request)
-        data = json.dumps(payload).encode("utf-8")
+        # A handler returns the status and a JSON payload, or a text body with its content type.
+        status, payload, *kind = self.server.handler(request)
+        data = payload.encode("utf-8") if isinstance(payload, str) else json.dumps(payload).encode("utf-8")
         try:
             self.send_response(status)
-            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Type", kind[0] if kind else "application/json")
             self.send_header("Content-Length", str(len(data)))
             self.end_headers()
             self.wfile.write(data)
@@ -138,6 +139,47 @@ class ClientTest(unittest.TestCase):
 
         with self.assertRaisesRegex(ServerError, "^/health returned HTTP 503: Loading model$"):
             serve(handler, lambda client: client.check_health())
+
+    def test_a_streamed_reply_reports_its_pieces_and_joins_into_the_same_message(self):
+        def event(delta, finish=None, usage=None):
+            data = {"choices": [{"index": 0, "delta": delta, "finish_reason": finish}]}
+            if usage:
+                data["usage"] = usage
+            return f"data: {json.dumps(data)}\n\n"
+
+        stream = "".join([
+            event({"role": "assistant", "content": ""}), ": keep-alive\n\n",
+            event({"reasoning_content": "Read "}), event({"reasoning_content": "it."}),
+            event({"content": "Reading."}),
+            event({"tool_calls": [{"index": 0, "id": "c1", "type": "function",
+                                   "function": {"name": "read_file", "arguments": "{\"pa"}}]}),
+            event({"tool_calls": [{"index": 0, "function": {"arguments": "th\": \"a.txt\"}"}}]}),
+            event({}, finish="tool_calls", usage={"prompt_tokens": 40, "completion_tokens": 9, "total_tokens": 49}),
+            "data: [DONE]\n\n",
+        ])
+        payloads, pieces = [], []
+
+        def handler(request):
+            payloads.append(request.json)
+            return 200, stream, "text/event-stream"
+
+        message, tokens = serve(handler, lambda client: client.complete(
+            "qwen", [], [], 64, on_text=lambda kind, text: pieces.append((kind, text))))
+        self.assertEqual((payloads[0]["stream"], payloads[0]["stream_options"]), (True, {"include_usage": True}))
+        self.assertEqual(pieces, [("thinking", "Read "), ("thinking", "it."), ("writing", "Reading."),
+                                  ("tool", "{\"pa"), ("tool", "th\": \"a.txt\"}")])
+        self.assertEqual(message, {"role": "assistant", "content": "Reading.", "reasoning_content": "Read it.",
+                                   "tool_calls": [{"id": "c1", "type": "function", "function": {
+                                       "name": "read_file", "arguments": "{\"path\": \"a.txt\"}"}}]})
+        self.assertEqual(tokens, 49)
+
+    def test_a_streamed_request_that_does_not_fit_still_raises_the_context_error(self):
+        def handler(request):
+            return 400, {"error": {"type": "exceed_context_size_error", "n_prompt_tokens": 900, "n_ctx": 512,
+                                   "message": "too long"}}
+
+        with self.assertRaises(ContextLimitError):
+            serve(handler, lambda client: client.complete("qwen", [], [], 16, on_text=lambda kind, text: None))
 
     def test_thinking_settings_are_sent_only_with_thinking(self):
         payloads = []

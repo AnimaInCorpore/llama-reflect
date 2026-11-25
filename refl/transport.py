@@ -27,6 +27,8 @@ class Response:
     reason: str
     body: bytes
     seconds: float
+    # The events of a streamed reply, decoded from its "data:" lines, or None for a whole reply.
+    events: list = None
 
     @property
     def is_success(self):
@@ -88,7 +90,12 @@ class HttpClient:
         # The address that accepted the last connection, tried first next time.
         self.last_address = None
 
-    async def request(self, method, path, *, json=None, params=None, timeout=None, headers=None):
+    async def request(self, method, path, *, json=None, params=None, timeout=None, headers=None, on_event=None):
+        """Send one request and return its Response.
+
+        With `on_event`, a reply that streams server-sent events is read event by event, and each decoded event
+        goes to `on_event` on the event loop as it arrives. Response.events then holds them all.
+        """
         target = self.prefix + path
         if params:
             target += "?" + urllib.parse.urlencode(params)
@@ -99,9 +106,12 @@ class HttpClient:
             headers["Content-Type"] = "application/json"
         timeout = self.timeout if timeout is None else timeout
         call = _Call(self._connection())
+        # The worker thread hands each streamed event to the event loop, where the callback runs.
+        loop = asyncio.get_running_loop()
+        relay = None if on_event is None else (lambda event: loop.call_soon_threadsafe(on_event, event))
         try:
             response = await asyncio.to_thread(self._send, call, method, target, body, headers, timeout,
-                                               min(self.connect_timeout, timeout))
+                                               min(self.connect_timeout, timeout), relay)
         except asyncio.CancelledError:
             call.abort()
             raise
@@ -139,7 +149,7 @@ class HttpClient:
             return sock
         raise errors[-1] if errors else OSError(f"{self.host} has no address")
 
-    def _send(self, call, method, target, body, headers, timeout, connect_timeout):
+    def _send(self, call, method, target, body, headers, timeout, connect_timeout, relay=None):
         started = time.monotonic()
         connection = call.connection
         try:
@@ -153,13 +163,28 @@ class HttpClient:
             sock.settimeout(timeout)
             connection.request(method, target, body=body, headers=headers)
             reply = connection.getresponse()
+            streamed = "text/event-stream" in (reply.getheader("Content-Type") or "")
+            if relay is not None and streamed and 200 <= reply.status < 300:
+                events = []
+                for line in reply:
+                    # Comments such as ": keep-alive" and blank lines between events carry no data.
+                    text = line.decode("utf-8").strip()
+                    if not text.startswith("data:"):
+                        continue
+                    data = text[5:].strip()
+                    if data == "[DONE]":
+                        break
+                    event = json.loads(data)
+                    events.append(event)
+                    relay(event)
+                return Response(reply.status, reply.reason, b"", time.monotonic() - started, events)
             data = reply.read()
             return Response(reply.status, reply.reason, data, time.monotonic() - started)
         except socket.timeout as error:
             if connection.sock:
                 raise ReplyTimeout(timeout) from error
             raise TransportError(f"no connection within {connect_timeout} s") from error
-        except (OSError, http.client.HTTPException) as error:
+        except (OSError, http.client.HTTPException, ValueError) as error:
             raise TransportError(str(error) or type(error).__name__) from error
         finally:
             connection.close()

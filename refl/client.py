@@ -52,6 +52,55 @@ class ServerProperties:
     vision: bool = None
 
 
+def _pieces(event):
+    """The (kind, text) pieces of one streamed chat completion event."""
+    for choice in event.get("choices") or []:
+        delta = choice.get("delta") if isinstance(choice, dict) else None
+        if not isinstance(delta, dict):
+            continue
+        for field, kind in (("reasoning_content", "thinking"), ("content", "writing")):
+            if isinstance(delta.get(field), str) and delta[field]:
+                yield kind, delta[field]
+        for call in delta.get("tool_calls") or []:
+            arguments = (call.get("function") or {}).get("arguments") if isinstance(call, dict) else None
+            if isinstance(arguments, str) and arguments:
+                yield "tool", arguments
+
+
+def _assemble(events):
+    """Join the events of a streamed reply into the response that the same request without streaming gets."""
+    content, reasoning, calls, finish, usage = [], [], {}, None, None
+    for event in events:
+        if not isinstance(event, dict):
+            continue
+        usage = event.get("usage") or usage
+        for choice in event.get("choices") or []:
+            if not isinstance(choice, dict):
+                continue
+            finish = choice.get("finish_reason") or finish
+            delta = choice.get("delta") or {}
+            if isinstance(delta.get("content"), str):
+                content.append(delta["content"])
+            if isinstance(delta.get("reasoning_content"), str):
+                reasoning.append(delta["reasoning_content"])
+            for part in delta.get("tool_calls") or []:
+                call = calls.setdefault(part.get("index", len(calls)),
+                                        {"id": None, "type": "function", "function": {"name": "", "arguments": ""}})
+                call["id"] = part.get("id") or call["id"]
+                function = part.get("function") or {}
+                call["function"]["name"] += function.get("name") or ""
+                call["function"]["arguments"] += function.get("arguments") or ""
+    message = {"role": "assistant", "content": "".join(content)}
+    if reasoning:
+        message["reasoning_content"] = "".join(reasoning)
+    if calls:
+        message["tool_calls"] = [calls[index] for index in sorted(calls)]
+    data = {"choices": [{"message": message, "finish_reason": finish}]}
+    if usage is not None:
+        data["usage"] = usage
+    return data
+
+
 def _strings(value):
     return [item for item in value if isinstance(item, str)] if isinstance(value, list) else None
 
@@ -68,6 +117,8 @@ class LlamaClient:
                               f"or lower --max-tokens.") from error
         except TransportError as error:
             raise ServerError(f"Could not reach llama-server at {self.http.base_url}: {error}") from error
+        if response.events is not None:
+            return _assemble(response.events)
         try:
             data = response.json()
         except ValueError:
@@ -131,6 +182,13 @@ class LlamaClient:
             raise ServerError("Unexpected /slots response")
         return len(slots), sum(slot["is_processing"] for slot in slots)
 
+    async def slot_stats(self):
+        """What /slots reports about each slot, such as whether it is busy and the tokens it generated."""
+        slots = await self._request("GET", "/slots", timeout=5)
+        if not isinstance(slots, list):
+            raise ServerError("Unexpected /slots response")
+        return slots
+
     async def apply_template(self, messages, tools):
         """Render messages with the server's chat template without running the model."""
         data = await self._request("POST", "/apply-template", json={"messages": messages, "tools": tools},
@@ -141,8 +199,13 @@ class LlamaClient:
         return prompt
 
     async def complete(self, model, messages, tools, max_tokens, *, response_format=None, temperature=0.0,
-                       thinking=True, tool_choice=None, thinking_budget=None, reasoning_effort=None, session=None):
-        """Return the assistant message and the tokens the request used in the context, or None for those."""
+                       thinking=True, tool_choice=None, thinking_budget=None, reasoning_effort=None, session=None,
+                       on_text=None):
+        """Return the assistant message and the tokens the request used in the context, or None for those.
+
+        With `on_text`, the reply streams, and each piece goes to on_text(kind, text) as it arrives: kind is
+        thinking, writing, or tool. The returned message is the same as without streaming.
+        """
         payload = {
             "model": model,
             "messages": messages,
@@ -169,7 +232,15 @@ class LlamaClient:
         # Servers such as Basalt keep a conversation on one slot by this header, so its cached context is reused.
         # llama-server ignores it and picks the slot whose cache matches the prompt best.
         headers = {"x-session-id": session} if session else None
-        data = await self._request("POST", "/v1/chat/completions", json=payload, headers=headers)
+        def relay(event):
+            for kind, text in _pieces(event):
+                on_text(kind, text)
+
+        if on_text is not None:
+            payload["stream"] = True
+            payload["stream_options"] = {"include_usage": True}
+        data = await self._request("POST", "/v1/chat/completions", json=payload, headers=headers,
+                                   on_event=relay if on_text is not None else None)
         try:
             choice = data["choices"][0]
             message = choice["message"]

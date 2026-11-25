@@ -39,6 +39,13 @@ class EngineTest(unittest.TestCase):
     def tearDown(self):
         self.directory.cleanup()
 
+    def test_the_main_branchs_thinking_is_shown_when_its_reply_arrives(self):
+        engine, _, events = make_engine(self.root, [
+            {"role": "assistant", "content": "Done.", "reasoning_content": "The user wants a short answer.\n"},
+        ])
+        self.assertEqual(asyncio.run(engine.respond("hi")), "Done.")
+        self.assertIn("Thinking\nThe user wants a short answer.", events)
+
     def test_the_agent_tells_the_user_what_it_does(self):
         engine, server, events = make_engine(self.root, [
             {"role": "assistant", "content": "I will read the status first.\nThen I answer.",
@@ -473,6 +480,29 @@ class EngineTest(unittest.TestCase):
         self.assertEqual(image["content"][0], {"type": "text", "text": "The image from the view_image call above."})
         self.assertTrue(image["content"][1]["image_url"]["url"].startswith("data:image/png;base64,"))
 
+    def test_forks_do_not_get_the_main_branchs_images(self):
+        (self.root / "square.png").write_bytes(png(8, 8))
+        claim = "<verify>square.png is red</verify>"
+        engine, server, _ = make_engine(self.root, [
+            call("view_image", path="square.png"), text(f"It is red. {claim}"),
+            call("read_file", path="status.txt"), verdict("supported", "status.txt line 1"), text("It is red."),
+        ], vision=True)
+        self.assertEqual(asyncio.run(engine.respond("What colour is square.png?")), "It is red.")
+
+        def images(request):
+            return sum(isinstance(message["content"], list) for message in request["messages"])
+
+        main = [request for request in server.requests if request["system"].startswith("You are Reflect, a coding")]
+        fork = [request for request in server.requests if request["system"].startswith("You are Reflect's read-only")]
+        self.assertTrue(main and fork)
+        self.assertTrue(all(images(request) == 1 for request in main[1:]))
+        self.assertEqual(images(fork[0]), 0)
+        self.assertTrue(any("The image went to the main branch." in str(message["content"])
+                            for message in fork[0]["messages"]))
+        # The session keeps the image.
+        self.assertTrue(any('"image": "data:image/png' in str(node.message.get("content"))
+                            for node in engine.tree.nodes))
+
     def test_without_image_input_the_tool_is_not_offered(self):
         engine, server, _ = make_engine(self.root, [text("Done.")], forks=False)
         asyncio.run(engine.respond("hi"))
@@ -556,6 +586,36 @@ class ChallengeTest(unittest.TestCase):
 
     def tearDown(self):
         self.directory.cleanup()
+
+    def test_the_panel_hears_each_critic_the_moderator_and_the_main_branch(self):
+        route = _critic_route({"Requirements": "It keeps old_ready"}, verdicts={"old_ready": "supported"})
+        replies = [call("write_file", path="app.py", content=_LARGE), text("I will write new_ready."),
+                   call("write_file", path="app.py", content=_LARGE), text("Done.")]
+        reports = []
+        engine, _, _ = make_engine(self.root, replies, challenge=True, route=route,
+                                   on_progress=lambda **fields: reports.append(fields))
+        self.assertEqual(asyncio.run(engine.respond("Write app.py.")), "Done.")
+        actors = [report["actor"] for report in reports if "actor" in report]
+        phases = [report["phase"] for report in reports if "phase" in report]
+        # The first write waits for the plan check, so it runs only when the main branch reissues it.
+        self.assertEqual(phases, ["Next step, thinking", "Plan check", "Next step, thinking",
+                                  "Running write_file app.py", "Next step, thinking"])
+        self.assertIn(("Security", "waiting for a slot", "wait"), actors)
+        self.assertIn(("Requirements", "checking read_file status.txt", "work"), actors)
+        self.assertIn(("Requirements", "objection proven", "good"), actors)
+        self.assertIn(("Environment", "nothing found", "quiet"), actors)
+        self.assertIn(("Moderator", "ruling", "work"), actors)
+        self.assertIn(("Moderator", "1 follow", "good"), actors)
+        self.assertIn(("Main branch", "revising its plan", "work"), actors)
+        critics = [report["critics"] for report in reports if "critics" in report]
+        self.assertEqual((critics[0], critics[-1]), ((0, 6), (6, 6)))
+        # With a panel listening, every request streams, and each actor's tokens arrive as they come.
+        streams = [report["stream"] for report in reports if "stream" in report]
+        self.assertIn(("Requirements", "waiting", 0, 0.0, ""), streams)
+        self.assertTrue(any(name == "Moderator" and kind == "writing" for name, kind, *_ in streams))
+        self.assertTrue(any(name == "Main branch" and kind == "done" and tokens > 0
+                            for name, kind, tokens, *_ in streams))
+        self.assertTrue(all(request["streamed"] for request in engine.server.requests))
 
     def test_the_moderator_rules_on_proven_findings_and_checks_the_revised_plan(self):
         route = _critic_route({"Requirements": "It keeps old_ready", "Environment": "Python is missing"},
@@ -723,6 +783,17 @@ class ChallengeTest(unittest.TestCase):
         self.assertEqual(sum(event.startswith("Challenge\nLooking for reasons") for event in events), 1)
         self.assertIn("Looking for reasons the plan fails, and for a simpler one, before its first change: "
                       "write_file big.txt", next(event for event in events if "Looking for reasons" in event))
+
+    def test_scratch_files_in_hidden_folders_are_not_challenged(self):
+        route = _critic_route({}, explore=False)
+        replies = [call("write_file", path=".tmpcheck/harness.js", content=_LARGE),
+                   call("write_file", path=".github/workflows/ci.yml", content=_LARGE),
+                   call("write_file", path=".github/workflows/ci.yml", content=_LARGE), text("Done.")]
+        engine, _, events = make_engine(self.root, replies, challenge=True, route=route)
+        self.assertEqual(asyncio.run(engine.respond("Add a CI workflow.")), "Done.")
+        started = [event for event in events if event.startswith("Challenge\nLooking for reasons")]
+        self.assertEqual(len(started), 1)
+        self.assertIn("write_file .github/workflows/ci.yml", started[0])
 
     def test_what_counts_as_a_small_edit(self):
         from refl.challenge import small_edit
