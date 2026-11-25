@@ -4,6 +4,7 @@ from pathlib import Path
 
 from refl.client import ServerError
 from refl.engine import SYSTEM_PROMPT, Engine
+from refl.moderator import CHOICE_PROMPT, MODERATOR_PROMPT
 from refl.reflection import REFLECTION_PROMPT
 from refl.tools import WorkspaceTools
 from refl.tree import ConversationTree
@@ -88,15 +89,22 @@ def decision(role="Diagnosis", reason="It explains the failures.", first_step="R
     return text(json.dumps({"role": role, "reason": reason, "first_step": first_step}))
 
 
-def reflection_route(ideas=None, statuses=None, status="supported", facts="a.txt line 1 says a"):
-    """Answer reflection reviewers and the verifiers of their facts by content, so their order does not matter.
+def reflection_route(ideas=None, statuses=None, status="supported", facts="a.txt line 1 says a", choose=None):
+    """Answer reflection reviewers, the verifiers of their facts, and the moderator by content.
 
     `ideas` maps a role to its proposal, and other roles propose "<role> idea". `facts` is every idea's facts,
     or a dict from role to facts. The verdict is the status of the first word of `statuses` in the facts, or
-    `status`.
+    `status`. The moderator chooses the role `choose`, or the first idea it is shown, and answers in plain
+    text for "invalid".
     """
     def route(request):
         system = request["system"]
+        if system.startswith(MODERATOR_PROMPT) and CHOICE_PROMPT in system:
+            if choose == "invalid":
+                return text("not json")
+            first = request["messages"][1]["content"].split("confirmed\n", 1)[1].split(". ", 1)[1].split(":")[0]
+            return text(json.dumps({"reason": "a.txt line 1 explains the stall", "first_step": "Run the check.",
+                                    "role": choose or first}))
         properties = ((request["response_format"] or {}).get("schema") or {}).get("properties", {})
         if system.startswith(REFLECTION_PROMPT) and request["tools"]:
             return text("Nothing to read.")

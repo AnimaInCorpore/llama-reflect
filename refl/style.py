@@ -23,6 +23,7 @@ _STYLES = {
     "unverified": "1;33",
     "challenge": "35",    # magenta: the plan challenge, its critics, and the main branch's answers to them
     "reflect": "94",      # bright blue: strategic reflection and its reviewers
+    "moderate": "92",     # bright green: the moderator's rulings and choices
     "quiet": "2",         # dim: skills and status lines
     "warning": "33",
     "error": "31",
@@ -30,7 +31,7 @@ _STYLES = {
 _TOOL_NAMES = frozenset(tool["function"]["name"] for tool in TOOLS)
 _VERDICTS = (("[VERIFIED]", "verified"), ("[FALSE ASSUMPTION]", "false"), ("[UNVERIFIED]", "unverified"))
 # A message whose first line is one of these words is a block: a heading and the lines under it.
-_HEADINGS = {"Challenge": "challenge", "Strategy": "reflect", "Skills": "quiet"}
+_HEADINGS = {"Challenge": "challenge", "Strategy": "reflect", "Moderator": "moderate", "Skills": "quiet"}
 # Earlier prefixes win, so "Context: ... in use" counts as a warning before "Context:" counts as status.
 _PREFIXES = (
     ("refl: ", "error"),
@@ -49,6 +50,14 @@ _PREFIXES = (
     ("The chat template has no", "warning"),
     ("--fork-effort", "warning"),
 )
+# One line that sums up each check, plan challenge, and reflection. These show without --verbose.
+_SUMMARIES = (("Plan check:", "challenge"), ("Reflection:", "reflect"), ("Check:", "verify"))
+# The main branch's words to the user, which read as the conversation rather than as processing.
+CHAT_MARK = "» "
+# The details behind the summaries, shown only with --verbose.
+_DETAILS = ("Challenge\n", "Challenge ", "Challenging as ", "challenge ", "Moderator\n", "Verifying ", "verify ",
+            "[VERIFIED]", "[FALSE ASSUMPTION]", "[UNVERIFIED]", "Strategy\n", "Reviewing as ", "Reflection ",
+            "reflect ")
 _CONTEXT_WARNING = re.compile(r"Context: [\d,]+ of [\d,]+ tokens in use")
 # The pipe through which mintty, the terminal of MSYS2 and Git Bash, connects a native program, such as
 # \msys-1888ae32e00d56aa-pty0-to-master. An ordinary pipe between two programs has another name.
@@ -75,6 +84,12 @@ class Styler:
     def event(self, message):
         if not self.enabled or not message:
             return message
+        if message.startswith(CHAT_MARK):
+            # The marker stands out, and the words keep the terminal's own color, like the user's.
+            return f"\x1b[1m{CHAT_MARK.strip()}{_RESET} {message[len(CHAT_MARK):]}"
+        for label, style in _SUMMARIES:
+            if message.startswith(label):
+                return f"\x1b[1;{_STYLES[style]}m{label}{_RESET}{_wrap(message[len(label):], style)}"
         heading, newline, body = message.partition("\n")
         if newline and heading in _HEADINGS:
             style = _HEADINGS[heading]
@@ -93,6 +108,11 @@ class Styler:
         if name in _TOOL_NAMES:
             return f"\x1b[{_STYLES['tool']}m{name}{_RESET}{space}{rest}"
         return message
+
+
+def is_detail(message):
+    """Whether a message is a detail behind a summary line, such as one critic's step or one verdict."""
+    return message.startswith(_DETAILS)
 
 
 def wants_color(stream, mode="auto", environ=None):
@@ -149,8 +169,12 @@ def _msys_pty(ctypes, wintypes, kernel32, handle):
 # Reflect writes its events to stderr and its answers to stdout, each styled only if it reaches a terminal.
 err = Styler(False)
 out = Styler(False)
+# Whether the details behind the summary lines show. Without --verbose, refl hides them.
+show_details = True
 
 
-def configure(mode="auto"):
+def configure(mode="auto", details=True):
+    global show_details
     err.enabled = wants_color(sys.stderr, mode)
     out.enabled = wants_color(sys.stdout, mode)
+    show_details = details

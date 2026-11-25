@@ -10,11 +10,17 @@ def names(roles):
 
 class RoleTest(unittest.TestCase):
     def test_every_reflector_is_told_to_be_honest_and_to_argue_from_proven_facts(self):
-        from refl import challenge, engine
+        from refl import challenge, engine, moderator
         from refl.reflection import FACTS_RULE, HONESTY_RULE, REFLECTION_PROMPT, ROLES
         for prompt in (REFLECTION_PROMPT, engine._PROPOSAL_PROMPT, challenge.CHALLENGE_PROMPT,
-                       challenge.SIMPLIFY_PROMPT, challenge.REBUTTAL_PROMPT, challenge.SIMPLIFY_REBUTTAL_PROMPT):
+                       challenge.SIMPLIFY_PROMPT, moderator.MODERATOR_PROMPT):
             self.assertIn(HONESTY_RULE, prompt)
+        # The moderator decides from the reflectors' confirmed facts and the user's request, nothing of its own.
+        self.assertIn("Decide only from the facts that the reflectors cited and a verifier confirmed",
+                      moderator.MODERATOR_PROMPT)
+        self.assertIn("Bring in no facts, ideas, or preferences of your own", moderator.MODERATOR_PROMPT)
+        self.assertEqual([critic.name for critic in challenge.CRITICS],
+                         ["Requirements", "Environment", "Edge cases", "Security", "Quality"])
         for prompt in (REFLECTION_PROMPT, engine._PROPOSAL_PROMPT):
             self.assertIn(FACTS_RULE, prompt)
         # Every reviewer can gather facts, and every answer names them for the verifier.

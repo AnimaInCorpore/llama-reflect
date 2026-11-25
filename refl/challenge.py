@@ -18,26 +18,6 @@ ANSWER_PROMPT = (
 )
 FIELDS = ("objection", "evidence", "check", "likelihood")
 LIKELIHOODS = ("high", "medium", "low")
-REBUTTAL_PROMPT = (
-    "You are a read-only critic. A verifier confirmed your objection to the main branch's plan in the "
-    "workspace, and the main branch answered it in its last reply. Judge only whether the answer resolves your "
-    "objection: a changed plan that removes the cause, or a reason grounded in the conversation why it does not "
-    "apply. A promise to be careful does not resolve it, and neither does a plan that no longer serves the "
-    "user's request. In reason, say what the answer changes or misses. Set status to resolved or unresolved. "
-    + GOAL_RULE + " " + HONESTY_RULE
-)
-REBUTTAL_SCHEMA = {
-    "type": "json_object",
-    "schema": {
-        "type": "object",
-        "properties": {
-            "reason": {"type": "string"},
-            "status": {"type": "string", "enum": ["resolved", "unresolved"]},
-        },
-        "required": ["reason", "status"],
-        "additionalProperties": False,
-    },
-}
 # The simplifier does not object. It steps back to the goal at the highest level of abstraction and derives the
 # simplest strategy from there, without starting from the steps of the current plan.
 SIMPLIFY_PROMPT = (
@@ -62,28 +42,22 @@ SIMPLIFY_ANSWER_PROMPT = (
 )
 # The goal comes first, so the model abstracts before it proposes.
 SIMPLIFY_FIELDS = ("goal", "simpler_plan", "relies_on", "why_simpler", "requirements")
-SIMPLIFY_REBUTTAL_PROMPT = (
-    "You are a read-only critic. A verifier confirmed that your simpler strategy keeps the requirements, and the "
-    "main branch answered it in its last reply. Judge only whether the answer settles it: switching to the "
-    "simpler strategy, or a concrete reason grounded in the conversation why it misses something or costs more. "
-    "Preferring the current plan without such a reason does not settle it. In reason, say what the answer "
-    "decides or misses. Set status to resolved or unresolved. " + GOAL_RULE + " " + HONESTY_RULE
-)
 SIMPLIFIER = Role("Simpler plan", "challenge",
                   "Restate the goal at the highest level of abstraction and find a clearly simpler strategy that "
                   "reaches it and keeps every requirement.",
                   tools=True, brief=False)
-# Requests for one challenge: critics, verifiers, answers, and rebuttals. They do not count toward --max-turns,
-# which would leave the task too few requests. A request beyond this stops that step, and the rest goes on.
-REQUESTS = 36
+# Requests for one challenge: the critics and the simplifier, their verifiers, the moderator's rulings and checks,
+# and the main branch's answers. They do not count toward --max-turns, which would leave the task too few
+# requests. A request beyond this stops that step, and the rest goes on.
+REQUESTS = 44
 # The tools whose first call in a task starts the challenge. Changes made through Bash are not caught.
 EDIT_TOOLS = {"write_file", "edit_file"}
-# An edit of a few lines is cheaper to check by making it than by four critics. In a live test, a one-line edit
+# An edit of a few lines is cheaper to check by making it than by six critics. In a live test, a one-line edit
 # took several minutes of challenge over a trailing newline that the edit kept anyway.
 SMALL_EDIT_LINES = 3
 SMALL_EDIT_CHARS = 200
 
-# They run at the same time, one per server slot.
+# They run alongside the simplifier, as many at a time as the server has slots.
 CRITICS = (
     Role("Requirements", "challenge",
          "Compare the plan with the user's request and with any spec, tests, or documentation in the workspace. "
@@ -98,6 +72,18 @@ CRITICS = (
          "Find an input, a state, or a caller of the changed code for which the planned change gives a wrong "
          "result or breaks behavior that works today.",
          tools=True, brief=False, temperature=0.3),
+    Role("Security", "challenge",
+         "Check whether the planned change opens a security hole: input that gets executed or evaluated, a "
+         "shell command, query, or path built from input, a path that can leave its folder, a secret in code or "
+         "logs, a weakened check or permission, or code that is downloaded and run. Name the hole and the input "
+         "that reaches it.",
+         tools=True, brief=False),
+    Role("Quality", "challenge",
+         "Check whether the planned change keeps the code easy to keep correct: it follows the project's "
+         "existing conventions and structure, reuses what exists instead of duplicating it, leaves no dead code, "
+         "debug output, or scratch files, and keeps the tests that cover the changed code working. Name a "
+         "problem of that kind, not a matter of taste.",
+         tools=True, brief=False),
 )
 
 

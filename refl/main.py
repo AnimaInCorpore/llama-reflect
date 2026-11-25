@@ -36,6 +36,8 @@ def _thinking_budget(value):
 
 
 def _status(message):
+    if not style.show_details and style.is_detail(message):
+        return
     print(style.err.event(message), file=sys.stderr, flush=True)
 
 
@@ -218,6 +220,9 @@ def main(argv=None):
                         help="thinking tokens per request before the server ends the thinking block; -1 sets no "
                              "limit (default: half of --max-tokens)")
     parser.add_argument("--timeout", type=_positive_int, default=600, help="model request timeout in seconds (default: 600)")
+    parser.add_argument("--verbose", action="store_true",
+                        help="show every step of the checks, the plan challenge, and reflection, not only their "
+                             "summary lines")
     parser.add_argument("--color", choices=style.COLOR_MODES, default="auto",
                         help="color the output: auto styles it for a terminal unless NO_COLOR is set (default: auto)")
     args = parser.parse_args(argv)
@@ -235,7 +240,7 @@ def main(argv=None):
         )
     for stream in (sys.stdout, sys.stderr):
         _tolerant_output(stream)
-    style.configure(args.color)
+    style.configure(args.color, details=args.verbose)
     try:
         asyncio.run(_run(args))
     except KeyboardInterrupt:

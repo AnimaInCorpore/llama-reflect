@@ -1,9 +1,10 @@
+import contextlib
 import io
 import tempfile
 import unittest
 
 from refl import style
-from refl.main import main
+from refl.main import _status, main
 from refl.style import Styler, wants_color
 
 ON = Styler(True)
@@ -74,6 +75,37 @@ class StyleTest(unittest.TestCase):
         self.assertTrue(style._MSYS_PTY.search(r"\cygwin-e022582115c10879-pty3-from-master"))
         self.assertFalse(style._MSYS_PTY.search(r"\Device\NamedPipe\Win32Pipes.00001a2c.00000002"))
         self.assertFalse(style._MSYS_PTY.search(r"\msys-1888ae32e00d56aa-pipe-0x1F"))
+
+    def test_the_agents_words_read_as_chat(self):
+        self.assertStyled("» I will read the spec first.", "^[1m»^[0m I will read the spec first.")
+        self.assertEqual(Styler(False).event("» Reading."), "» Reading.")
+
+    def test_summary_lines_have_a_bold_label(self):
+        self.assertStyled("Plan check: 2 proven, 1 to follow, 1 dismissed (40 s)",
+                          "^[1;35mPlan check:^[0m^[35m 2 proven, 1 to follow, 1 dismissed (40 s)^[0m")
+        self.assertStyled("Reflection: 1 of 3 ideas proven; nothing to try (9 s)",
+                          "^[1;94mReflection:^[0m^[94m 1 of 3 ideas proven; nothing to try (9 s)^[0m")
+        self.assertStyled("Check: verified: a.txt holds a", "^[1;36mCheck:^[0m^[36m verified: a.txt holds a^[0m")
+
+    def test_details_hide_without_verbose_and_the_rest_stays(self):
+        details = ("Challenge\nLooking for reasons", "Challenging as Security", "challenge read_file a.py",
+                   "Moderator\nfollow: Quality", "Verifying a claim", "verify read_file a.py", "[VERIFIED] yes",
+                   "Strategy\nReflecting: stall", "Reviewing as Diagnosis: x", "Reflection Observe: dropped",
+                   "reflect grep_search")
+        shown = ("» I will check it.", "Plan check: no objection held up (5 s)", "Reflection: 0 of 3 ideas proven",
+                 "Check: verified: a", "read_file a.py", "Skills\nSaved a.md", "Model: qwen", "refl: failed",
+                 "Context: 98,000 of 131,072 tokens in use (75%).")
+        self.assertTrue(all(style.is_detail(message) for message in details))
+        self.assertFalse(any(style.is_detail(message) for message in shown))
+        errors = io.StringIO()
+        try:
+            style.configure("never", details=False)
+            with contextlib.redirect_stderr(errors):
+                for message in details + shown:
+                    _status(message)
+        finally:
+            style.configure("never")
+        self.assertEqual(errors.getvalue(), "".join(f"{message}\n" for message in shown))
 
     def test_the_color_option_sets_both_streams(self):
         with tempfile.TemporaryDirectory() as directory:

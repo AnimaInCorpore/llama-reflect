@@ -1,23 +1,35 @@
 import asyncio
 import json
 import re
+import time
 from pathlib import PurePosixPath
 
-from .challenge import ANSWER_PROMPT, CHALLENGE_PROMPT, CRITICS, EDIT_TOOLS, REBUTTAL_PROMPT, REBUTTAL_SCHEMA
+from .challenge import ANSWER_PROMPT, CHALLENGE_PROMPT, CRITICS, EDIT_TOOLS
 from .challenge import REQUESTS as CHALLENGE_REQUESTS
-from .challenge import SIMPLIFIER, SIMPLIFY_ANSWER_PROMPT, SIMPLIFY_PROMPT, SIMPLIFY_REBUTTAL_PROMPT
+from .challenge import SIMPLIFIER, SIMPLIFY_ANSWER_PROMPT, SIMPLIFY_PROMPT
 from .challenge import answer_schema, format_objection, format_simplification, objection_of, simplification_of
 from .challenge import SMALL_EDIT_CHARS, SMALL_EDIT_LINES, simplification_claim, simplify_schema, small_edit
 from .client import THINKING_BUDGET_MESSAGE, ContextLimitError, ServerError, TokenLimitError
 from .reflection import FACTS_RULE, GOAL_RULE, HONESTY_RULE, MANUAL, REFLECTION_PROMPT, StallDetector
+from .moderator import CHECK_PROMPT, CHECK_SCHEMA, CHOICE_PROMPT, MODERATOR_PROMPT, RULING_PROMPT
+from .moderator import case, choice_schema, ruling_schema, rulings_of
 from .reflection import REQUESTS as REFLECTION_REQUESTS
+from .style import CHAT_MARK
 from .tools import TOOLS
 from .tree import ensure_git_ignored
+
+
+
+def _elapsed(start):
+    seconds = round(time.monotonic() - start)
+    return f"{seconds} s" if seconds < 60 else f"{seconds // 60} min {seconds % 60} s"
 
 
 _PROMPT_START = (
     "You are Reflect, a coding agent working in the current workspace. "
     "Use the provided tools to carry out the user's request. Use workspace-relative paths. "
+    "Talk to the user while you work: before each group of tool calls, tell the user in one or two short "
+    "sentences what you are about to do and why, and say briefly what you found when a result matters. "
     "Read a file before editing it and check the result of each tool call. "
     "If a tool returns an error or a nonzero exit code, use that information to recover. "
 )
@@ -41,8 +53,8 @@ _BASH_TOOLS = [tool for tool in TOOLS if tool["function"]["name"] == "bash"]
 # Requests of the turn that a reflection needs: the decision, one step on it, and a final check. The reviewers
 # and their verifiers have a budget of their own.
 _ACT_ON_REFLECTION = 3
-_ENGINE_PROMPTS = ("Verification results", "Reflection results", "Plan challenge", "Unresolved points",
-                   "Still open after two answers", "Run the smoke check now.", "Carry out the plan now", "Carry out the revised plan now", "Your last reply reached the limit",
+_ENGINE_PROMPTS = ("Verification results", "Reflection results", "Plan challenge", "Not followed yet",
+                   "For the user", "Run the smoke check now.", "Carry out the moderator's plan now", "Carry out the revised plan now", "Your last reply reached the limit",
                    "This is the final request", "The request limit of this turn is reached")
 # One request beyond the limit, so that a turn that ran out of requests still says where the task stands.
 _LIMIT_REPORT_PROMPT = (
@@ -96,8 +108,8 @@ _EVIDENCE_PROMPT = (
 _PROPOSAL_PROMPT = (
     "You are a read-only reviewer helping a coding task that stalled. Answer in your role. In proposal, give "
     "one concrete next action that does not contradict the task's stated requirements, or leave it empty if the "
-    "evidence supports none. In facts, give the facts from tool results in this conversation that the proposal "
-    "rests on, with file and line. In basis, give the reasoning, known technique, or analogy that connects those "
+    "evidence supports none. In facts, give the facts in the workspace as it is now that the proposal rests on, "
+    "with file and line. In basis, give the reasoning, known technique, or analogy that connects those "
     "facts to the proposal. In cost, say what trying it takes. In fails_if, give the result that would show it "
     "did not work. Keep each field brief. " + FACTS_RULE + " " + GOAL_RULE + " " + HONESTY_RULE
 )
@@ -110,34 +122,20 @@ _AFTER_REFLECTION = (
     "and make a targeted edit. Preserve unrelated code and keep the final request for rerunning the check that "
     "showed the problem."
 )
-_DECISION_REQUEST = (
-    "Before you act, choose the idea to try first. In reason, say which idea you chose and which observations "
-    "it explains. In first_step, give the exact action you will take next. In role, name the reviewer whose "
-    "idea that is."
+_CARRY_OUT = "Carry out the moderator's plan now, starting with its first step."
+_FOLLOW_REQUEST = (
+    "Revise your plan so that it follows each of these findings and still serves the user's request. Then give "
+    "the first step of the revised plan. Do not call tools in this reply."
 )
-# The role comes last, so the model names it after writing the plan and the label matches the plan.
-_DECISION_FIELDS = ("reason", "first_step", "role")
-_CARRY_OUT = "Carry out the plan now, starting with its first step."
-_OBJECTION_REQUEST = (
-    "Answer each objection in one or two sentences: say whether it holds, and if it does, how you change the "
-    "plan. When an objection may hold and you cannot tell, make its check the first step. If an objection shows "
-    "that the request conflicts with the workspace or leaves a decision open that only the user can make, say "
-    "so honestly instead of changing what the user asked for."
+_NOT_FOLLOWED_REQUEST = (
+    "The moderator found that your revised plan does not follow its rulings yet: {reason} Revise the plan so "
+    "that it does and still serves the user's request. Then give the first step. Do not call tools in this reply."
 )
-_SIMPLER_REQUEST = (
-    "For the simpler strategy, say whether you switch to it. Keep your plan only for a concrete reason, such as "
-    "a requirement that the simpler strategy misses."
-)
-_REVISED_PLAN = "Then give the first step of the revised plan. Do not call tools in this reply."
-_UNRESOLVED_REQUEST = (
-    "For each open objection, change the plan so that it removes the cause, or show from the conversation why it "
-    "does not apply. For an open simpler strategy, switch to it or name the requirement it misses. If you cannot "
-    "settle a point without changing what the user asked for, say so. " + _REVISED_PLAN
-)
-# When a proven point still stands after both answers, the devil's advocate has won: the user decides.
+# When a confirmed fact conflicts with the request as stated, or the plan cannot follow the rulings, the user
+# decides how the request is meant.
 _ASK_USER_REQUEST = (
     "Do not make the change. Write a short message to the user instead. Say what you were about to do and the "
-    "proven fact that stands against it. Then ask one or two precise questions about how the user wants the "
+    "confirmed fact that stands against it. Then ask one or two precise questions about how the user wants the "
     "request specified, with the options you see. Do not call tools in this reply."
 )
 _AFTER_CHALLENGE = "Carry out the revised plan now. Reissue the deferred calls that are still needed."
@@ -532,9 +530,7 @@ class Engine:
                 tracking = not read_only and self.track_strategy
                 if tracking:
                     self._strategy_event(f"### Attempt\n\n    {summary}")
-                    self.on_tool(f"Strategy\nTrying {summary}")
-                else:
-                    self.on_tool(prefix + summary)
+                self.on_tool(prefix + summary)
                 result = await asyncio.to_thread(self.workspace.execute, function)
                 if not read_only and (name == "bash" or result.get("changed") is True):
                     self.verdicts.clear()
@@ -712,44 +708,52 @@ class Engine:
             f"## Reflection\n\n{heading}\n\n    {' '.join(reason.split())}\n\nTemperature {level}: {names}")
         self.on_tool(f"Strategy\nReflecting: {reason}\nTemperature {level}: {names}\nTracking: {self.strategy_path}")
         brief = self._brief(anchor, reason)
-        # The reviewers and the verifiers of their facts have a budget of their own, as for the plan challenge.
+        start = time.monotonic()
+        # The reviewers, the verifiers of their facts, and the moderator have a budget of their own, as for the
+        # plan challenge.
         self.batch_left, self.batch_name = REFLECTION_REQUESTS, "reflection"
         try:
             ideas = await asyncio.gather(*(self._proven_idea(anchor, reason, role, brief, history)
                                            for role in roles))
+            found = [(role, idea) for role, idea in zip(roles, ideas) if idea]
+            # Grounded roles come first, since their ideas start from the stall's own evidence.
+            found.sort(key=lambda item: item[0].group != "grounded")
+            choice = None
+            if found and not manual:
+                choice = await self._moderate(anchor, CHOICE_PROMPT,
+                                              case(self._user_request(anchor), "",
+                                                   [f"{role.name}: {idea}" for role, idea in found]),
+                                              choice_schema([role.name for role, _ in found]))
         finally:
             self.batch_left = self.batch_name = None
-        found = [(role, idea) for role, idea in zip(roles, ideas) if idea]
-        # Grounded roles come first, since their ideas start from the stall's own evidence.
-        found.sort(key=lambda item: item[0].group != "grounded")
         summary = ("Proven ideas\n" + "\n".join(f"- {role.name}: {idea}" for role, idea in found) if found
                    else "No reviewer idea rested on facts that a verifier could confirm.")
         self.on_tool(f"Strategy\nReflection proposals\n{summary}")
         self._strategy_event("### Proposals\n\n" + summary)
         self.track_strategy = True
-        decide = bool(found) and not manual
-        content = f"Reflection results\n{heading}: {reason}\n\n{summary}\n\n{_AFTER_REFLECTION}"
-        self.tree.append({"role": "user", "content": content + ("\n\n" + _DECISION_REQUEST if decide else "")})
-        if decide:
-            await self._decide([role.name for role, _ in found])
-
-    async def _decide(self, names):
-        """Have the main branch commit to one reviewer's idea before it acts, without tools."""
-        schema = _proposal_schema(_DECISION_FIELDS)
-        schema["schema"]["properties"]["role"] = {"type": "string", "enum": names}
-        try:
-            message = await self._complete(self._messages(self.tree.head), [], response_format=schema)
-            decision = json.loads(message.get("content") or "")
-            plan = (f"Plan: try the {decision['role']} idea first. Reason: {' '.join(decision['reason'].split())} "
-                    f"First step: {' '.join(decision['first_step'].split())}")
-        except (AttributeError, KeyError, TypeError, ValueError, ServerError, TurnLimitError) as error:
-            self.on_tool(f"Strategy\nNo plan after reflection: {error}")
-            self.tree.append({"role": "assistant", "content": "I will follow the reflection results."})
-        else:
-            self.on_tool(f"Strategy\n{plan}")
+        chosen = choice.get("role") if isinstance(choice, dict) else None
+        ideas = dict((role.name, idea) for role, idea in found)
+        if chosen in ideas:
+            why = " ".join(str(choice.get("reason", "")).split())
+            step = " ".join(str(choice.get("first_step", "")).split())
+            plan = f"The moderator chose the {chosen} idea. Reason: {why} First step: {step}"
+            self.on_tool(f"Moderator\n{plan}")
             self._strategy_event(f"### Plan\n\n{plan}")
-            self.tree.append({"role": "assistant", "content": plan})
-        self.tree.append({"role": "user", "content": _CARRY_OUT})
+            outcome = f"the moderator chose {chosen}: {step}"
+            content = (f"Reflection results\n{heading}: {reason}\n\nChosen idea\n- {chosen}: {ideas[chosen]}\n\n"
+                       f"{plan}\n\n{_AFTER_REFLECTION}\n\n{_CARRY_OUT}")
+        elif chosen == "none":
+            outcome = "the moderator found that none serves your request"
+            self.on_tool("Moderator\nNo proven idea serves the user's request.")
+            content = (f"Reflection results\n{heading}: {reason}\n\nThe moderator found that no proven idea serves "
+                       f"the user's request. Do not go back to the edits or commands you repeated before this "
+                       f"reflection.")
+        else:
+            # A manual reflection, no proven idea, or no usable choice: the main branch sees what was proven.
+            outcome = "the main branch sees them all" if found else "nothing to try"
+            content = f"Reflection results\n{heading}: {reason}\n\n{summary}\n\n{_AFTER_REFLECTION}"
+        self.tree.append({"role": "user", "content": content})
+        self.on_tool(f"Reflection: {len(found)} of {len(roles)} ideas proven; {outcome} ({_elapsed(start)})")
 
     def _close_unfinished_round(self):
         messages = self.tree.messages(self.tree.head)
@@ -817,10 +821,13 @@ class Engine:
         """
         self.challenged = True
         self.batch_left, self.batch_name = CHALLENGE_REQUESTS, "plan challenge"
+        self.challenge_outcome = "stopped early"
+        start = time.monotonic()
         try:
             return await self._run_challenge(calls)
         finally:
             self.batch_left = self.batch_name = None
+            self.on_tool(f"Plan check: {self.challenge_outcome} ({_elapsed(start)})")
 
     async def _run_challenge(self, calls):
         anchor = self.tree.head
@@ -831,79 +838,91 @@ class Engine:
         # Each finding goes to a verifier as soon as it is ready. The simplifier runs alongside the critics.
         *results, simpler = await asyncio.gather(*(self._object(anchor, critic, pending) for critic in CRITICS),
                                                  self._simplify(anchor, pending))
-        # A proven finding is (critic, the point it makes, its rebuttal prompt, its line for the main branch).
+        # A proven finding is (critic, the point it makes, its line with its confirmed facts).
         proven = []
         for critic, result in zip(CRITICS, results):
             if result is None:
                 continue
             answer, verdict = result
-            line = f"- {critic.name}: {format_objection(answer)[:800]}"
+            line = f"{critic.name}: {format_objection(answer)[:800]}"
             label, _, detail = verdict.partition("] ")
             if label == "[VERIFIED":
-                proven.append((critic, objection_of(answer), REBUTTAL_PROMPT, f"{line} Verifier: {detail}"))
+                proven.append((critic, objection_of(answer), f"{line} Verifier: {detail}"))
             else:
                 # Only proven facts may argue against the plan, so an unproven objection is dropped too.
                 why = "refuted" if label == "[FALSE ASSUMPTION" else "not proven"
                 self.on_tool(f"Challenge\nDropped the {critic.name} objection, {why}: {detail}")
-        if not proven and simpler is None:
+        findings = proven + ([simpler] if simpler is not None else [])
+        if not findings:
+            self.challenge_outcome = "no objection or simpler strategy held up"
             self.on_tool("Challenge\nNo objection or simpler strategy held up.")
             self.tree.append({"role": "user", "content": (
                 f"Plan challenge\nNo objection to the plan held up in the workspace, and no simpler strategy was "
                 f"proven. {_AFTER_CHALLENGE}")})
-            return
+            return None
 
-        sections, requests = [], []
-        if proven:
-            sections.append("Proven objections\n" + "\n".join(line for *_, line in proven))
-            requests.append(_OBJECTION_REQUEST)
-        if simpler is not None:
-            sections.append("Simpler strategy, proven to keep the requirements\n" + simpler[-1])
-            requests.append(_SIMPLER_REQUEST)
-            proven.append(simpler)
-        summary = "\n\n".join(sections)
-        self.on_tool(f"Challenge\n{summary}")
+        # The moderator rules on each finding from its confirmed facts and the user's request alone.
+        request = self._user_request(anchor)
+        answer = await self._moderate(anchor, RULING_PROMPT, case(request, pending, [line for *_, line in findings]),
+                                      ruling_schema(len(findings)))
+        rulings = rulings_of(answer, len(findings))
+        if rulings is None:
+            self.on_tool("Moderator\nNo usable rulings, so every proven finding stands.")
+            rulings = [("follow", "")] * len(findings)
+        ruled = [(ruling, f"- {line}" + (f" Moderator: {reason}" if reason else ""))
+                 for (*_, line), (ruling, reason) in zip(findings, rulings)]
+        self.on_tool("Moderator\n" + "\n".join(f"{ruling}: {line[2:]}" for ruling, line in ruled))
+        ask = [line for ruling, line in ruled if ruling == "ask_user"]
+        follow = [line for ruling, line in ruled if ruling == "follow"]
+        counted = f"{len(findings)} proven, {len(follow)} to follow, {len(findings) - len(follow) - len(ask)} dismissed"
+        if ask:
+            self.challenge_outcome = f"{len(findings)} proven; the moderator leaves the decision to you"
+            return await self._ask_user("\n".join(ask))
+        self.challenge_outcome = counted
+        if not follow:
+            self.on_tool("Moderator\nNo proven finding calls for a change of plan.")
+            self.tree.append({"role": "user", "content": (
+                f"Plan challenge\nThe moderator ruled that no proven finding calls for a change of your plan. "
+                f"{_AFTER_CHALLENGE}")})
+            return None
+        followed = "\n".join(follow)
         self.tree.append({"role": "user", "content": (
             f"Plan challenge\nBefore your first change ({pending}), critics looked for reasons that your plan fails "
-            f"and for a simpler strategy at the level of the goal. A verifier checked each finding in the "
-            f"workspace.\n\n{summary}\n\nBefore you act: {' '.join(requests)} {_REVISED_PLAN}")})
+            f"and for a simpler strategy at the level of the goal. A verifier confirmed their facts, and the "
+            f"moderator ruled on them against the user's request.\n\nFollow these findings\n{followed}\n\n"
+            f"{_FOLLOW_REQUEST}")})
         await self._answer_objections()
 
-        # One rebuttal round: each critic whose finding was proven judges the answer to it.
-        if proven:
-            rebuttal_anchor = self.tree.head
-            reasons = await asyncio.gather(*(self._rebut(rebuttal_anchor, critic, point, prompt)
-                                             for critic, point, prompt, _ in proven))
-            open_points = [(entry, reason) for entry, reason in zip(proven, reasons) if reason]
-            if open_points:
-                text = "\n".join(f"- {critic.name}: {point} Still open: {reason}"
-                                 for (critic, point, *_), reason in open_points)
-                self.on_tool(f"Challenge\nUnresolved points\n{text}")
-                self.tree.append({"role": "user", "content": (
-                    f"Unresolved points\nThe critics whose findings were proven say that your answer does not "
-                    f"settle these yet.\n\n{text}\n\n{_UNRESOLVED_REQUEST}")})
-                await self._answer_objections()
-                # The last word: a critic whose proven point still stands after the second answer wins, and
-                # the user is asked how to specify the request instead of the main branch acting against it.
-                final_anchor = self.tree.head
-                reasons = await asyncio.gather(*(self._rebut(final_anchor, critic, point, prompt)
-                                                 for (critic, point, prompt, _), _ in open_points))
-                standing = [f"- {critic.name}: {point} Still open: {reason}"
-                            for ((critic, point, *_), _), reason in zip(open_points, reasons) if reason]
-                if standing:
-                    return await self._ask_user("\n".join(standing))
-                self.on_tool("Challenge\nThe second answer settles the open points.")
-            else:
-                self.on_tool("Challenge\nThe revised plan settles the proven findings.")
+        # The moderator checks the revised plan against its rulings, and the main branch gets one more try.
+        for attempt in range(2):
+            revised = self.tree.nodes[self.tree.head].message.get("content") or ""
+            check = await self._moderate(
+                self.tree.head, CHECK_PROMPT,
+                f"{case(request, pending, [line[2:] for line in follow])}\n\nThe main branch's revised plan\n{revised}",
+                CHECK_SCHEMA)
+            status = check.get("status") if isinstance(check, dict) else None
+            reason = " ".join(str(check.get("reason", "")).split()) if isinstance(check, dict) else ""
+            if status != "not_complied":
+                self.on_tool(f"Moderator\nThe revised plan follows the rulings. {reason}".rstrip())
+                self.challenge_outcome = f"{counted}; the revised plan follows them"
+                break
+            self.on_tool(f"Moderator\nThe revised plan does not follow the rulings yet. {reason}".rstrip())
+            if attempt:
+                self.challenge_outcome = f"{counted}; the plan missed them twice, so you decide"
+                return await self._ask_user(f"{followed}\nThe moderator: the revised plan still does not follow "
+                                            f"these. {reason}")
+            self.tree.append({"role": "user", "content": (
+                f"Not followed yet\n{_NOT_FOLLOWED_REQUEST.format(reason=reason or 'no reason given.')}")})
+            await self._answer_objections()
         self.tree.append({"role": "user", "content": _AFTER_CHALLENGE})
         return None
 
     async def _ask_user(self, standing):
-        """Return a question for the user about the proven points that still stand, instead of the change."""
-        self.on_tool(f"Challenge\nThe devil's advocate wins. These proven points still stand, so Reflect asks you "
-                     f"to specify the request.\n{standing}")
+        """Return a question for the user about the findings that only the user can settle, instead of the change."""
+        self.on_tool(f"Moderator\nOnly you can settle this, so Reflect asks you to specify the request.\n{standing}")
         self.tree.append({"role": "user", "content": (
-            f"Still open after two answers\nThese proven points still stand against your plan.\n\n{standing}\n\n"
-            f"{_ASK_USER_REQUEST}")})
+            f"For the user\nThe moderator ruled that only the user can settle these confirmed findings.\n\n"
+            f"{standing}\n\n{_ASK_USER_REQUEST}")})
         try:
             message = await self._complete(self._messages(self.tree.head), [])
             question = message.get("content")
@@ -911,10 +930,26 @@ class Engine:
                 raise ServerError("Expected a question for the user.")
             question = question.strip()
         except (ServerError, TurnLimitError):
-            question = (f"I have not made the change yet, because these proven points still stand against my "
-                        f"plan:\n{standing}\n\nHow do you want the request specified?")
+            question = (f"I have not made the change yet, because these confirmed findings need your decision:\n"
+                        f"{standing}\n\nHow do you want the request specified?")
         self.tree.append({"role": "assistant", "content": question})
         return question
+
+    async def _moderate(self, anchor, task, content, schema):
+        """Ask the moderator one question in a fork that sees only `content`, and return its parsed answer."""
+        start = leaf = self.tree.append({"role": "user", "content": content}, parent_id=anchor,
+                                        branch_type="moderator")
+        messages = [{"role": "system", "content": f"{MODERATOR_PROMPT}\n\n{task}"}, {"role": "user", "content": content}]
+        try:
+            message = await self._complete(messages, [], fork=True, response_format=schema, branch=start)
+            leaf = self.tree.append(message, parent_id=leaf, branch_type="moderator")
+            answer = json.loads(message.get("content") or "")
+        except (ServerError, TurnLimitError, TypeError, ValueError) as error:
+            self.tree.finish_fork(leaf, anchor, "pruned")
+            self.on_tool(f"Moderator\nNo answer: {error}")
+            return None
+        self.tree.finish_fork(leaf, anchor, "merged")
+        return answer
 
     async def _answer_objections(self):
         """Have the main branch answer the findings in the last message, without tools."""
@@ -952,8 +987,8 @@ class Engine:
         if label != "[VERIFIED":
             self.on_tool(f"Challenge\nDropped the simpler strategy: {detail}")
             return None
-        line = f"- {SIMPLIFIER.name}: {format_simplification(answer)[:800]} Verifier: {detail}"
-        return SIMPLIFIER, strategy, SIMPLIFY_REBUTTAL_PROMPT, line
+        line = f"{SIMPLIFIER.name}: {format_simplification(answer)[:800]} Verifier: {detail}"
+        return SIMPLIFIER, strategy, line
 
     async def _critique(self, anchor, critic, pending, *, prompt=CHALLENGE_PROMPT, answer_prompt=ANSWER_PROMPT,
                         schema=None, found=objection_of, nothing="The critic returned no objection."):
@@ -999,32 +1034,6 @@ class Engine:
         self.tree.finish_fork(leaf, anchor, "pruned")
         self.on_tool(f"Challenge {critic.name}: {reason}")
         return None
-
-    async def _rebut(self, anchor, critic, point, prompt):
-        """Have a critic judge the main branch's answer to its proven finding. Return why it is still open."""
-        start = leaf = self.tree.append({
-            "role": "user",
-            "content": (f"User's request: {self._user_request(anchor)[:1500]}\nCritic role: {critic.name}\n"
-                        f"Your proven finding: {point}\n\nDoes the main branch's last reply settle it, in a way "
-                        f"that still serves the user's request?"),
-        }, parent_id=anchor, branch_type="challenge")
-        try:
-            message = await self._complete(
-                self._messages(leaf, system_prompt=f"{prompt}\n\nYour role: {critic.name}. {critic.focus}"),
-                [], fork=True, response_format=REBUTTAL_SCHEMA, branch=start,
-            )
-            leaf = self.tree.append(message, parent_id=leaf, branch_type="challenge")
-            verdict = json.loads(message.get("content") or "")
-            status, reason = verdict["status"], " ".join(str(verdict["reason"]).split())
-            if status not in ("resolved", "unresolved"):
-                raise ValueError(f"unknown status {status!r}")
-        except (ServerError, TurnLimitError, AttributeError, KeyError, TypeError, ValueError) as error:
-            self.tree.finish_fork(leaf, anchor, "pruned")
-            self.on_tool(f"Challenge {critic.name}: no rebuttal ({error})")
-            return None
-        self.tree.finish_fork(leaf, anchor, "merged")
-        self.on_tool(f"Challenge {critic.name}: {status}. {reason}")
-        return (reason or "No reason given.") if status == "unresolved" else None
 
     async def reflect(self):
         if not self.forks:
@@ -1131,6 +1140,10 @@ class Engine:
             claims = [claim for claim in claims if claim not in self.verdicts]
             if not calls and not answer.strip():
                 raise ServerError("Model returned neither an answer nor a tool call")
+            if calls and answer.strip():
+                # The words to the user read as the conversation, with later lines under the first.
+                words = _VERIFY_TAG.sub(lambda match: match[1], answer).strip()
+                self.on_tool(CHAT_MARK + words.replace("\n", "\n" + " " * len(CHAT_MARK)))
 
             # The challenge has its own requests, but the plan needs at least one more of the turn's.
             challenge = not claims and self.requests_left >= 1 and self._first_change(calls)
@@ -1150,8 +1163,9 @@ class Engine:
                 verdicts = await asyncio.gather(*(self._verify(anchor, claim) for claim in claims))
                 self.verdicts.update(zip(claims, verdicts))
                 findings = [f"{claim}\n{verdict}" for claim, verdict in zip(claims, verdicts)]
-                for verdict in verdicts:
+                for claim, verdict in zip(claims, verdicts):
                     self.on_tool(verdict)
+                    self.on_tool(f"Check: {verdict[1:].partition(']')[0].lower()}: {claim}")
                 self.tree.append({
                     "role": "user",
                     "content": "Verification results\n\n" + "\n\n".join(findings) + (

@@ -11,10 +11,21 @@ from refl.engine import TurnLimitError, _call_summary, attach_images, default_th
 from .test_tools import png
 
 from refl.reflection import REFLECTION_PROMPT
-from refl.challenge import CHALLENGE_PROMPT, REBUTTAL_PROMPT, SIMPLIFY_PROMPT, SIMPLIFY_REBUTTAL_PROMPT
+from refl.challenge import CHALLENGE_PROMPT, SIMPLIFY_PROMPT
+from refl.moderator import CHECK_PROMPT, CHOICE_PROMPT, MODERATOR_PROMPT, RULING_PROMPT
 from refl.tree import ConversationTree
 
-from .fakes import call, decision, make_engine, reflection_route, text, verdict
+from .fakes import call, make_engine, reflection_route, text, verdict
+
+
+def _choose(route, role):
+    """Have the moderator of a reflection route choose `role`."""
+    def chosen(request):
+        if request["system"].startswith(MODERATOR_PROMPT) and CHOICE_PROMPT in request["system"]:
+            return text(json.dumps({"reason": "a.txt line 1 explains the stall", "first_step": "Run the check.",
+                                    "role": role}))
+        return route(request)
+    return chosen
 
 _CLAIM = "<verify>status.txt contains old_ready</verify>"
 
@@ -27,6 +38,25 @@ class EngineTest(unittest.TestCase):
 
     def tearDown(self):
         self.directory.cleanup()
+
+    def test_the_agent_tells_the_user_what_it_does(self):
+        engine, server, events = make_engine(self.root, [
+            {"role": "assistant", "content": "I will read the status first.\nThen I answer.",
+             "tool_calls": call("read_file", path="status.txt")["tool_calls"]},
+            text("It says old_ready."),
+        ])
+        self.assertEqual(asyncio.run(engine.respond("What is the status?")), "It says old_ready.")
+        self.assertIn("» I will read the status first.\n  Then I answer.", events)
+        self.assertIn("Talk to the user while you work", server.requests[0]["system"])
+
+    def test_a_check_ends_with_one_summary_line(self):
+        engine, _, events = make_engine(self.root, [
+            text(f"I check first. {_CLAIM}"), call("read_file", path="status.txt"), verdict(), text("Done."),
+        ])
+        self.assertEqual(asyncio.run(engine.respond("Check the status.")), "Done.")
+        self.assertIn("Check: verified: status.txt contains old_ready", events)
+        # Only words beside tool calls are narration. A reply with a tag and no calls is not shown as chat.
+        self.assertFalse(any(event.startswith("» ") for event in events))
 
     def test_restated_claim_reuses_its_verdict_and_ends_the_turn(self):
         engine, server, events = make_engine(self.root, [
@@ -74,10 +104,10 @@ class EngineTest(unittest.TestCase):
     def test_smoke_check_request_answered_in_text(self):
         (self.root / "a.txt").write_text("a\n", encoding="utf-8")
         replies = [call("read_file", path="missing.txt"), call("read_file", path="missing.txt")]
-        replies += [decision(), call("write_file", path="a.txt", content="b\n")]
+        replies += [call("write_file", path="a.txt", content="b\n")]
         replies += [call("read_file", path="a.txt", start_line=1, end_line=line) for line in range(1, 4)]
         replies += [text("All checks pass.")]
-        engine, server, events = make_engine(self.root, replies, max_turns=8, route=reflection_route())
+        engine, server, events = make_engine(self.root, replies, max_turns=7, route=reflection_route())
         self.assertEqual(asyncio.run(engine.respond("Fix it.")), "All checks pass.")
         self.assertTrue(any(event.startswith("Strategy\nReflecting") for event in events))
         self.assertEqual(server.requests[-1]["tools"], ["bash"])
@@ -87,16 +117,15 @@ class EngineTest(unittest.TestCase):
         # A question that stalled must not end with a smoke check in place of its answer.
         (self.root / "a.txt").write_text("a\n", encoding="utf-8")
         replies = [call("read_file", path="missing.txt"), call("read_file", path="missing.txt")]
-        replies += [decision()]
         replies += [call("read_file", path="a.txt", start_line=1, end_line=line) for line in range(1, 5)]
         replies += [text("a.txt holds one line, a.")]
-        engine, server, _ = make_engine(self.root, replies, max_turns=8, route=reflection_route())
+        engine, server, _ = make_engine(self.root, replies, max_turns=7, route=reflection_route())
         self.assertEqual(asyncio.run(engine.respond("What is in a.txt?")), "a.txt holds one line, a.")
         self.assertEqual(server.requests[-1]["tools"], [])
         self.assertTrue(server.requests[-1]["messages"][-1]["content"].startswith("This is the final request"))
 
         replies[-1] = call("bash", command="cat a.txt")
-        engine, _, _ = make_engine(self.root, replies, max_turns=8, route=reflection_route())
+        engine, _, _ = make_engine(self.root, replies, max_turns=7, route=reflection_route())
         with self.assertRaisesRegex(ServerError, "Expected a text answer on the final request"):
             asyncio.run(engine.respond("What is in a.txt?"))
 
@@ -152,7 +181,7 @@ class EngineTest(unittest.TestCase):
         self.assertFalse(any(event.startswith("Verifying") for event in events))
 
         replies = [call("read_file", path="missing.txt"), call("read_file", path="missing.txt")]
-        replies += [decision(), text("Done.")]
+        replies += [text("Done.")]
         engine, _, events = make_engine(self.root, replies, verification=False, route=reflection_route())
         self.assertEqual(asyncio.run(engine.respond("Fix it.")), "Done.")
         self.assertTrue(any(event.startswith("Strategy\nReflecting") for event in events))
@@ -163,8 +192,8 @@ class EngineTest(unittest.TestCase):
                                   "Switch tools": "Edit the bytes with Python"},
                                  facts="status.txt line 1 says old_ready")
         replies = [call("read_file", path="missing.txt"), call("read_file", path="missing.txt"),
-                   decision("Observe"), text("Done.")]
-        engine, server, events = make_engine(self.root, replies, route=route)
+                   text("Done.")]
+        engine, server, events = make_engine(self.root, replies, route=_choose(route, "Observe"))
         self.assertEqual(asyncio.run(engine.respond("Fix it.")), "Done.")
         self.assertIn("Temperature 0: Diagnosis, Observe, Switch tools", next(e for e in events if "Reflecting" in e))
 
@@ -175,9 +204,10 @@ class EngineTest(unittest.TestCase):
         self.assertNotIn("You are Reflect", brief["system"])
         self.assertIn("Your role: Switch tools.", brief["system"])
         # The main branch, the reviewers with the whole conversation, and the brief ones get the dependency rule.
+        # The verdict and the moderator propose nothing, so they do not.
         rule = "Do not install packages or add dependencies."
         self.assertTrue(all(rule in request["system"] for request in server.requests
-                            if not request["system"].startswith("Compare the exact claim")))
+                            if not request["system"].startswith(("Compare the exact claim", MODERATOR_PROMPT))))
         self.assertEqual(brief["temperature"], 0.3)
         summary = brief["messages"][1]["content"]
         self.assertIn("Task: Fix it.", summary)
@@ -186,10 +216,11 @@ class EngineTest(unittest.TestCase):
 
         results = next(node.message["content"] for node in engine.tree.nodes
                        if str(node.message.get("content", "")).startswith("Reflection results"))
+        proposals = next(event for event in events if event.startswith("Strategy\nReflection proposals"))
         self.assertIn("Proven ideas\n- Diagnosis: Check whether missing.txt exists. Facts: status.txt line 1 says "
                       "old_ready. Basis: it fits. Cost: one command. Fails if: nothing changes. Verifier: supported "
-                      "by the workspace\n- Observe: Print the directory listing.", results)
-        self.assertIn("\n- Switch tools: Edit the bytes with Python.", results)
+                      "by the workspace\n- Observe: Print the directory listing.", proposals)
+        self.assertIn("\n- Switch tools: Edit the bytes with Python.", proposals)
         self.assertNotIn("Unverified", results)
 
         explore = [request for request in server.requests if request["system"].startswith(REFLECTION_PROMPT)]
@@ -197,23 +228,29 @@ class EngineTest(unittest.TestCase):
         self.assertEqual([request["tool_choice"] for request in explore], ["required"] * 3)
         # Each idea's facts went to a verifier before the main branch saw it.
         self.assertEqual(sum(event.startswith("Verifying These facts hold in the workspace") for event in events), 3)
+        # The moderator, not the stalled main branch, chooses the idea, from the proven ideas alone.
         choice = next(request for request in server.requests if request["response_format"]
                       and "role" in request["response_format"]["schema"]["properties"])
-        self.assertEqual(choice["tools"], [])
+        self.assertTrue(choice["system"].startswith(MODERATOR_PROMPT))
+        self.assertEqual((choice["tools"], len(choice["messages"])), ([], 2))
         self.assertEqual(list(choice["response_format"]["schema"]["properties"]), ["reason", "first_step", "role"])
         self.assertEqual(choice["response_format"]["schema"]["properties"]["role"]["enum"],
-                         ["Diagnosis", "Observe", "Switch tools"])
-        main = [node.message["content"] for node in engine.tree.nodes if node.branch_type == "main"]
-        self.assertIn("Plan: try the Observe idea first. Reason: It explains the failures. "
-                      "First step: Run the check.", main)
-        self.assertEqual(main[main.index(next(m for m in main if str(m).startswith("Plan:"))) + 1],
-                         "Carry out the plan now, starting with its first step.")
+                         ["Diagnosis", "Observe", "Switch tools", "none"])
+        chosen = next(node.message["content"] for node in engine.tree.nodes
+                      if str(node.message.get("content", "")).startswith("Reflection results"))
+        self.assertIn("Chosen idea\n- Observe: Print the directory listing.", chosen)
+        self.assertNotIn("Check whether missing.txt exists", chosen)
+        self.assertIn("The moderator chose the Observe idea. Reason: a.txt line 1 explains the stall First step: "
+                      "Run the check.", chosen)
+        self.assertTrue(chosen.endswith("Carry out the moderator's plan now, starting with its first step."))
+        summary = next(event for event in events if event.startswith("Reflection: "))
+        self.assertRegex(summary, r"^Reflection: 3 of 3 ideas proven; the moderator chose Observe: Run the check\. "
+                                  r"\(\d+ s\)$")
 
     def test_final_answer_while_the_check_fails_starts_reflection(self):
         check = "echo FAILED; exit 1"
         replies = [call("bash", command=check), call("write_file", path="a.txt", content="x"),
-                   call("bash", command=check), text("The environment must be broken."), decision("Diagnosis"),
-                   text("Done.")]
+                   call("bash", command=check), text("The environment must be broken."), text("Done.")]
         engine, server, events = make_engine(self.root, replies, verification=False, route=reflection_route())
         self.assertEqual(asyncio.run(engine.respond("Make the check pass.")), "Done.")
         self.assertFalse(server.replies)
@@ -233,19 +270,19 @@ class EngineTest(unittest.TestCase):
                                         "Observe": "missing.txt line 1 says ready", "Switch tools": ""},
                                  statuses={"missing.txt": "contradicted"})
         replies = [call("read_file", path="missing.txt"), call("read_file", path="missing.txt"),
-                   decision("Diagnosis"), text("Done.")]
+                   text("Done.")]
         engine, server, events = make_engine(self.root, replies, route=route)
         self.assertEqual(asyncio.run(engine.respond("Fix it.")), "Done.")
         results = next(node.message["content"] for node in engine.tree.nodes
                        if str(node.message.get("content", "")).startswith("Reflection results"))
-        self.assertIn("Proven ideas\n- Diagnosis: Diagnosis idea.", results)
+        self.assertIn("Chosen idea\n- Diagnosis: Diagnosis idea.", results)
         self.assertNotIn("Observe idea", results)
         self.assertNotIn("Switch tools idea", results)
         self.assertIn("Reflection Observe: dropped, its facts are refuted. contradicted by the workspace", events)
         self.assertIn("Reflection Switch tools: dropped, the idea names no facts.", events)
         choice = next(request for request in server.requests if request["response_format"]
                       and "role" in request["response_format"]["schema"]["properties"])
-        self.assertEqual(choice["response_format"]["schema"]["properties"]["role"]["enum"], ["Diagnosis"])
+        self.assertEqual(choice["response_format"]["schema"]["properties"]["role"]["enum"], ["Diagnosis", "none"])
 
     def test_without_a_proven_idea_there_is_no_decision(self):
         replies = [call("read_file", path="missing.txt"), call("read_file", path="missing.txt"), text("Done.")]
@@ -258,14 +295,23 @@ class EngineTest(unittest.TestCase):
                              for request in server.requests))
         self.assertEqual(sum("its facts are not proven" in event for event in events), 3)
 
-    def test_unusable_decision_still_continues(self):
-        replies = [call("read_file", path="missing.txt"), call("read_file", path="missing.txt")]
-        replies += [text("not json"), text("Done.")]
-        engine, _, events = make_engine(self.root, replies, route=reflection_route())
+    def test_an_unusable_choice_still_shows_the_proven_ideas(self):
+        replies = [call("read_file", path="missing.txt"), call("read_file", path="missing.txt"), text("Done.")]
+        engine, _, events = make_engine(self.root, replies, route=reflection_route(choose="invalid"))
         self.assertEqual(asyncio.run(engine.respond("Fix it.")), "Done.")
-        main = [node.message["content"] for node in engine.tree.nodes if node.branch_type == "main"]
-        self.assertIn("I will follow the reflection results.", main)
-        self.assertTrue(any(event.startswith("Strategy\nNo plan after reflection") for event in events))
+        results = next(node.message["content"] for node in engine.tree.nodes
+                       if str(node.message.get("content", "")).startswith("Reflection results"))
+        self.assertIn("Proven ideas\n- Diagnosis: Diagnosis idea.", results)
+        self.assertTrue(any(event.startswith("Moderator\nNo answer:") for event in events))
+
+    def test_the_moderator_may_choose_no_idea(self):
+        replies = [call("read_file", path="missing.txt"), call("read_file", path="missing.txt"), text("Done.")]
+        engine, _, events = make_engine(self.root, replies, route=reflection_route(choose="none"))
+        self.assertEqual(asyncio.run(engine.respond("Fix it.")), "Done.")
+        results = next(node.message["content"] for node in engine.tree.nodes
+                       if str(node.message.get("content", "")).startswith("Reflection results"))
+        self.assertIn("The moderator found that no proven idea serves the user's request.", results)
+        self.assertNotIn("Diagnosis idea", results)
 
     def test_brief_shows_what_writes_changed(self):
         engine, _, _ = make_engine(self.root, [
@@ -458,23 +504,14 @@ if __name__ == "__main__":
 _LARGE = "".join(f"line {number}\n" for number in range(5))
 
 
-def _critic_route(objections, verdicts=None, rebuttal=None, explore=True, simpler="", simpler_rebuttal=None):
+def _critic_route(objections, verdicts=None, rulings=None, checks=None, explore=True, simpler=""):
     """Answer the forks of a plan challenge by their content, so their order does not matter.
 
     `objections` maps a critic to its objection, `verdicts` a word in a finding to the verifier's status, and
-    `rebuttal` gives the status of every objection's rebuttal. `simpler` is the simplifier's strategy, empty for
-    none, and `simpler_rebuttal` the status of its rebuttal. A list of statuses answers the rebuttal and then
-    the last word in turn.
+    `simpler` is the simplifier's strategy, empty for none. `rulings` maps a critic to the moderator's ruling,
+    follow by default, and `checks` lists the moderator's checks of the revised plan in turn, complied by default.
     """
-    rebuttals = {"objection": rebuttal, "simpler": simpler_rebuttal}
-
-    def rebuttal_status(kind):
-        value = rebuttals[kind]
-        if isinstance(value, list):
-            value = list(value)
-            rebuttals[kind] = value[1:] or value
-            return value[0]
-        return value
+    checks = list(checks or [])
 
     def route(request):
         system, schema = request["system"], (request["response_format"] or {}).get("schema", {})
@@ -485,18 +522,24 @@ def _critic_route(objections, verdicts=None, rebuttal=None, explore=True, simple
             return text(json.dumps({"goal": "status.txt says new_ready", "simpler_plan": simpler,
                                     "relies_on": "status.txt", "why_simpler": "one edit instead of a script",
                                     "requirements": "keeps line 1"}))
-        if "status" in properties and system.startswith(SIMPLIFY_REBUTTAL_PROMPT):
-            return text(json.dumps({"reason": "It kept the script without a reason.",
-                                    "status": rebuttal_status("simpler")}))
         if "objection" in properties:
             critic = system.split("Your role: ")[1].split(".")[0]
             return text(json.dumps({"objection": objections.get(critic, ""), "evidence": "status.txt line 1",
                                     "check": "read status.txt", "likelihood": "high"}))
         if system.startswith("You are Reflect's read-only verifier"):
             return call("read_file", path="status.txt")
-        if "status" in properties and system.startswith(REBUTTAL_PROMPT):
-            return text(json.dumps({"reason": "The plan still writes old_ready.",
-                                    "status": rebuttal_status("objection")}))
+        if system.startswith(MODERATOR_PROMPT) and RULING_PROMPT in system:
+            findings = request["messages"][1]["content"].split("confirmed\n", 1)[1].splitlines()
+            answer = {}
+            for line in findings:
+                number, _, rest = line.partition(". ")
+                critic = rest.split(":")[0]
+                answer[number] = {"reason": f"status.txt line 1 bears on {critic}",
+                                  "ruling": (rulings or {}).get(critic, "follow")}
+            return text(json.dumps(answer))
+        if system.startswith(MODERATOR_PROMPT) and CHECK_PROMPT in system:
+            status = checks.pop(0) if checks else "complied"
+            return text(json.dumps({"reason": "The plan still writes old_ready.", "status": status}))
         if "status" in properties:
             claim = request["messages"][1]["content"].split("\n\nCurrent evidence")[0]
             status = next(status for word, status in (verdicts or {}).items() if word in claim)
@@ -514,12 +557,12 @@ class ChallengeTest(unittest.TestCase):
     def tearDown(self):
         self.directory.cleanup()
 
-    def test_proven_objections_reach_the_plan_and_get_one_rebuttal(self):
+    def test_the_moderator_rules_on_proven_findings_and_checks_the_revised_plan(self):
         route = _critic_route({"Requirements": "It keeps old_ready", "Environment": "Python is missing"},
                               verdicts={"old_ready": "supported", "Python": "contradicted"},
-                              rebuttal=["unresolved", "resolved"])
+                              checks=["not_complied", "complied"])
         replies = [call("write_file", path="app.py", content=_LARGE),
-                   text("The requirement holds, so I will write new_ready."),
+                   text("I will write new_ready."),
                    text("I will change status.txt first."),
                    call("write_file", path="app.py", content="print(2)\n"),
                    text("Done.")]
@@ -532,28 +575,50 @@ class ChallengeTest(unittest.TestCase):
         contents = [str(message.get("content")) for message in messages]
         self.assertIn("Tool call deferred. Reissue it after reviewing the plan challenge.", contents[3])
         challenge = next(content for content in contents if content.startswith("Plan challenge"))
-        self.assertIn("Proven objections\n- Requirements: (high) It keeps old_ready. Evidence: status.txt line 1. "
-                      "Check: read status.txt. Verifier: supported by status.txt line 1", challenge)
+        self.assertIn("Follow these findings\n- Requirements: (high) It keeps old_ready. Evidence: status.txt line 1. "
+                      "Check: read status.txt. Verifier: supported by status.txt line 1 Moderator: status.txt line "
+                      "1 bears on Requirements", challenge)
         self.assertNotIn("Python is missing", challenge)
         self.assertTrue(any("Dropped the Environment objection" in event for event in events))
-        unresolved = next(content for content in contents if content.startswith("Unresolved points"))
-        self.assertIn("- Requirements: It keeps old_ready Still open: The plan still writes old_ready.", unresolved)
+        retry = next(content for content in contents if content.startswith("Not followed yet"))
+        self.assertIn("does not follow its rulings yet: The plan still writes old_ready.", retry)
         self.assertEqual(contents.count("Carry out the revised plan now. Reissue the deferred calls that are still "
                                         "needed."), 1)
+        summary = next(event for event in events if event.startswith("Plan check: "))
+        self.assertRegex(summary, r"^Plan check: 1 proven, 1 to follow, 0 dismissed; the revised plan follows them "
+                                  r"\(\d+ s\)$")
 
-        # Each critic and the verifier and rebuttal of its objection have their own sessions.
+        # The moderator sees only the request, the planned change, and the findings, not the conversation.
+        moderator = [request for request in server.requests if request["system"].startswith(MODERATOR_PROMPT)]
+        self.assertEqual(len(moderator), 3)
+        self.assertTrue(all(len(request["messages"]) == 2 and request["tools"] == [] for request in moderator))
+        self.assertTrue(moderator[0]["messages"][1]["content"].startswith(
+            "User's request: Write app.py.\n\nPlanned change: write_file app.py\n\nFindings"))
+        self.assertIn("The main branch's revised plan\nI will write new_ready.", moderator[1]["messages"][1]["content"])
+        # Each critic, verifier, and moderator question has its own session: six critics and the simplifier
+        # minus four without an objection, the verifiers of two objections, and three moderator questions.
         stem = engine.tree.path.stem
         forks = {request["session"] for request in server.requests if request["session"] != stem}
-        # The critics and the simplifier, the verifiers of two objections, and the rebuttal of the proven one.
-        self.assertEqual(len(forks), 4 + 2 + 2)  # and the last word on it after the second answer
-        self.assertIn("Challenge\nThe second answer settles the open points.", events)
-        # Every reflector sees the user's request in its task.
+        self.assertEqual(len(forks), 6 + 2 + 3)
+        # Every critic sees the user's request in its task.
         self.assertTrue(all("User's request: Write app.py." in request["messages"][-1]["content"]
                             for request in server.requests if request["system"].startswith(CHALLENGE_PROMPT)
                             and request["tools"]))
-        # A saved session with challenge branches loads again.
+        # A saved session with challenge and moderator branches loads again.
         resumed = ConversationTree(engine.tree.path.parent, "system", resume=stem)
         self.assertEqual(len(resumed.nodes), len(engine.tree.nodes))
+
+    def test_a_dismissed_finding_never_reaches_the_main_branch(self):
+        route = _critic_route({"Quality": "It duplicates read_status"}, verdicts={"duplicates": "supported"},
+                              rulings={"Quality": "dismiss"})
+        replies = [call("write_file", path="a.txt", content=_LARGE),
+                   call("write_file", path="a.txt", content=_LARGE), text("Done.")]
+        engine, _, events = make_engine(self.root, replies, challenge=True, route=route)
+        self.assertEqual(asyncio.run(engine.respond("Write a.")), "Done.")
+        contents = [str(message.get("content")) for message in engine.tree.messages(engine.tree.head)]
+        self.assertFalse(any("duplicates read_status" in content for content in contents))
+        self.assertIn("Moderator\nNo proven finding calls for a change of plan.", events)
+        self.assertTrue(any(event.startswith("Moderator\ndismiss: Quality:") for event in events))
 
     def test_only_the_first_project_change_of_a_task_is_challenged(self):
         route = _critic_route({}, explore=False)
@@ -573,9 +638,9 @@ class ChallengeTest(unittest.TestCase):
         self.assertEqual(asyncio.run(engine.respond("Write c.")), "Done.")
         self.assertEqual(sum(event.startswith("Challenge\nLooking for reasons") for event in events), 2)
 
-    def test_a_proven_simpler_strategy_must_be_taken_or_refused_for_a_reason(self):
+    def test_a_proven_simpler_strategy_the_moderator_follows_must_be_taken(self):
         route = _critic_route({}, verdicts={"Edit line 1": "supported"}, simpler="Edit line 1 of status.txt",
-                              simpler_rebuttal=["unresolved", "resolved"])
+                              checks=["not_complied", "complied"])
         replies = [call("write_file", path="update.py", content=_LARGE),
                    text("I keep the script."),
                    text("I switch to the single edit."),
@@ -588,43 +653,49 @@ class ChallengeTest(unittest.TestCase):
 
         contents = [str(message.get("content")) for message in engine.tree.messages(engine.tree.head)]
         challenge = next(content for content in contents if content.startswith("Plan challenge"))
-        self.assertIn("Simpler strategy, proven to keep the requirements\n- Simpler plan: Goal: status.txt says "
-                      "new_ready. Simpler strategy: Edit line 1 of status.txt. Relies on: status.txt. Saves: one edit "
-                      "instead of a script. Keeps: keeps line 1. Verifier: supported by status.txt line 1", challenge)
+        self.assertIn("Follow these findings\n- Simpler plan: Goal: status.txt says new_ready. Simpler strategy: "
+                      "Edit line 1 of status.txt. Relies on: status.txt. Saves: one edit instead of a script. Keeps: "
+                      "keeps line 1. Verifier: supported by status.txt line 1", challenge)
         # The verifier checks what the strategy rests on today, not a prediction that it will work.
         claim = next(event for event in events if event.startswith("Verifying The workspace has"))
         self.assertEqual(claim, "Verifying The workspace has what this strategy relies on, and it does what the "
                                 "strategy needs: status.txt. The request and any spec or tests in the workspace set "
                                 "no requirement beyond these: keeps line 1. Strategy: Edit line 1 of status.txt")
-        self.assertIn("For the simpler strategy, say whether you switch to it.", challenge)
-        self.assertNotIn("Answer each objection", challenge)
-        unresolved = next(content for content in contents if content.startswith("Unresolved points"))
-        self.assertIn("- Simpler plan: Edit line 1 of status.txt Still open: It kept the script without a reason.",
-                      unresolved)
+        self.assertTrue(any(content.startswith("Not followed yet") for content in contents))
         # The simplifier states the goal before its strategy.
         schema = next(request["response_format"]["schema"] for request in server.requests
                       if request["response_format"] and "simpler_plan" in request["response_format"]["schema"]["properties"])
         self.assertEqual(schema["required"][:2], ["goal", "simpler_plan"])
 
-    def test_the_user_is_asked_when_the_devils_advocate_wins(self):
+    def test_the_user_is_asked_when_the_moderator_rules_so(self):
         route = _critic_route({"Requirements": "It keeps old_ready"}, verdicts={"old_ready": "supported"},
-                              rebuttal="unresolved")
+                              rulings={"Requirements": "ask_user"})
         question = ("I was about to write app.py, but status.txt still says old_ready. Should app.py replace it, "
                     "or keep it?")
-        replies = [call("write_file", path="app.py", content=_LARGE),
-                   text("It does not apply."), text("It still does not apply."), text(question)]
+        replies = [call("write_file", path="app.py", content=_LARGE), text(question)]
         engine, server, events = make_engine(self.root, replies, challenge=True, route=route)
         self.assertEqual(asyncio.run(engine.respond("Write app.py.")), question)
         # The deferred change stays unmade, and the turn ends with the question.
         self.assertFalse((self.root / "app.py").exists())
         self.assertFalse(server.replies)
-        self.assertTrue(any(event.startswith("Challenge\nThe devil's advocate wins.") for event in events))
+        self.assertTrue(any(event.startswith("Moderator\nOnly you can settle this") for event in events))
         ask = server.requests[-1]
         self.assertEqual(ask["tools"], [])
-        self.assertTrue(ask["messages"][-1]["content"].startswith("Still open after two answers"))
+        self.assertTrue(ask["messages"][-1]["content"].startswith("For the user"))
         self.assertIn("ask one or two precise questions about how the user wants the request specified",
                       ask["messages"][-1]["content"])
         self.assertEqual(engine.tree.nodes[engine.tree.head].message["content"], question)
+
+    def test_the_user_is_asked_when_the_plan_twice_fails_the_rulings(self):
+        route = _critic_route({"Requirements": "It keeps old_ready"}, verdicts={"old_ready": "supported"},
+                              checks=["not_complied", "not_complied"])
+        replies = [call("write_file", path="app.py", content=_LARGE),
+                   text("It does not apply."), text("It still does not apply."), text("How should I proceed?")]
+        engine, server, events = make_engine(self.root, replies, challenge=True, route=route)
+        self.assertEqual(asyncio.run(engine.respond("Write app.py.")), "How should I proceed?")
+        self.assertFalse((self.root / "app.py").exists())
+        self.assertFalse(server.replies)
+        self.assertIn("the revised plan still does not follow these", server.requests[-1]["messages"][-1]["content"])
 
     def test_a_simpler_strategy_that_misses_a_requirement_is_dropped(self):
         route = _critic_route({}, verdicts={"Delete": "contradicted"}, simpler="Delete status.txt")
@@ -672,7 +743,7 @@ class ChallengeTest(unittest.TestCase):
 
     def test_a_challenge_stops_at_its_own_request_budget(self):
         route = _critic_route({"Requirements": "It keeps old_ready"}, verdicts={"old_ready": "supported"},
-                              rebuttal="resolved", explore=False)
+                              explore=False)
         # Five requests give the first critic its answer and its verifier one step. The third critic and the
         # verdict find the budget used up, so the objection stays unproven and is dropped.
         replies = [call("write_file", path="a.txt", content=_LARGE),
