@@ -9,6 +9,18 @@ def names(roles):
 
 
 class RoleTest(unittest.TestCase):
+    def test_every_reflector_is_told_to_be_honest_and_to_argue_from_proven_facts(self):
+        from refl import challenge, engine
+        from refl.reflection import FACTS_RULE, HONESTY_RULE, REFLECTION_PROMPT, ROLES
+        for prompt in (REFLECTION_PROMPT, engine._PROPOSAL_PROMPT, challenge.CHALLENGE_PROMPT,
+                       challenge.SIMPLIFY_PROMPT, challenge.REBUTTAL_PROMPT, challenge.SIMPLIFY_REBUTTAL_PROMPT):
+            self.assertIn(HONESTY_RULE, prompt)
+        for prompt in (REFLECTION_PROMPT, engine._PROPOSAL_PROMPT):
+            self.assertIn(FACTS_RULE, prompt)
+        # Every reviewer can gather facts, and every answer names them for the verifier.
+        self.assertTrue(all(role.tools and "facts" in role.fields for role in ROLES))
+        self.assertNotIn("without evidence", " ".join(role.focus for role in ROLES))
+
     def test_first_reflection_is_grounded(self):
         self.assertEqual(names(choose_roles(0, FAILURE, unavailable={"Existing patterns"})),
                          ["Diagnosis", "Observe", "Switch tools"])

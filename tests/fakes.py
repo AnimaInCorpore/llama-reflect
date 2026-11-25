@@ -4,6 +4,7 @@ from pathlib import Path
 
 from refl.client import ServerError
 from refl.engine import SYSTEM_PROMPT, Engine
+from refl.reflection import REFLECTION_PROMPT
 from refl.tools import WorkspaceTools
 from refl.tree import ConversationTree
 
@@ -85,6 +86,36 @@ def verdict(status="supported", reason="status.txt line 1 contains old_ready"):
 
 def decision(role="Diagnosis", reason="It explains the failures.", first_step="Run the check."):
     return text(json.dumps({"role": role, "reason": reason, "first_step": first_step}))
+
+
+def reflection_route(ideas=None, statuses=None, status="supported", facts="a.txt line 1 says a"):
+    """Answer reflection reviewers and the verifiers of their facts by content, so their order does not matter.
+
+    `ideas` maps a role to its proposal, and other roles propose "<role> idea". `facts` is every idea's facts,
+    or a dict from role to facts. The verdict is the status of the first word of `statuses` in the facts, or
+    `status`.
+    """
+    def route(request):
+        system = request["system"]
+        properties = ((request["response_format"] or {}).get("schema") or {}).get("properties", {})
+        if system.startswith(REFLECTION_PROMPT) and request["tools"]:
+            return text("Nothing to read.")
+        if "proposal" in properties:
+            role = system.split("Your role: ")[1].split(".")[0]
+            answer = {"proposal": (ideas or {}).get(role, f"{role} idea"),
+                      "facts": facts.get(role, "") if isinstance(facts, dict) else facts,
+                      "basis": "it fits", "cost": "one command", "fails_if": "nothing changes"}
+            if "abstraction" in properties:
+                answer["abstraction"] = "parts and a goal"
+            return text(json.dumps(answer))
+        if system.startswith("You are Reflect's read-only verifier"):
+            return call("grep_search", pattern=".", path=".")
+        if "status" in properties and system.startswith("Compare the exact claim"):
+            claim = request["messages"][1]["content"].split("\n\nCurrent evidence")[0]
+            found = next((value for word, value in (statuses or {}).items() if word in claim), status)
+            return verdict(found, f"{found} by the workspace")
+        return None
+    return route
 
 
 def make_engine(root, replies, *, max_turns=20, forks=True, verification=True, thinking="auto", moves_text=False,

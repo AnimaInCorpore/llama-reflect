@@ -5,6 +5,25 @@ from collections import deque
 from dataclasses import dataclass
 
 
+# Every reflector gets this rule: reviewers, plan-challenge critics, the simplifier, and the rebuttals.
+HONESTY_RULE = (
+    "Be honest about your opinion. State only what the evidence shows, and say how sure you are. Do not invent "
+    "a problem or an idea to fill your role: if the evidence supports none, say so and leave the answer empty. "
+    "Do not agree or disagree to please the main branch, and do not overstate or soften what you found."
+)
+# Every idea must rest on workspace facts that a verifier confirms. An idea without proven facts is dropped.
+FACTS_RULE = (
+    "Base your opinion on facts that a read of the workspace as it is now can confirm, such as what a file "
+    "contains at a line. A verifier checks those facts by reading the workspace, and an idea whose facts it "
+    "cannot confirm does not reach the main branch. Earlier command output or a file's earlier content cannot "
+    "be checked that way."
+)
+# Every reflector serves the user's request, not a goal of its own.
+GOAL_RULE = (
+    "Keep the user's request in view as the user stated it. What you propose must serve that request: do not "
+    "replace it with a goal of your own, and do not drop part of it. If the evidence conflicts with the request, "
+    "say so instead of choosing a side for the user."
+)
 REFLECTION_PROMPT = (
     "You are a read-only reviewer investigating why a coding task stalled. Use the recent tool results as "
     "evidence and open relevant project skills with read_file. Do not assume anything that no tool result in "
@@ -13,14 +32,18 @@ REFLECTION_PROMPT = (
     "checks something the main branch has not looked at yet, such as a file that the failing command imports "
     "or reads, or the value it actually uses. Check your idea against the task's requirements, such as a spec "
     "or tests in the workspace, and do not propose anything they rule out. Give one concrete next action, the "
-    "evidence behind it, and a check the main branch can run to see progress. Keep your proposal brief."
+    "evidence behind it, and a check the main branch can run to see progress. Keep your proposal brief. "
+    + FACTS_RULE + " " + GOAL_RULE + " " + HONESTY_RULE
 )
 
 # A failure is an action that fails repeatedly, usually a tool or usage problem. An unfixed failure is a check
 # that keeps failing the same way although the code changed between runs, or a final answer while it fails.
 FAILURE, UNFIXED, NO_PROGRESS, MANUAL = "failure", "unfixed failure", "no progress", "manual"
 _ANY = frozenset({FAILURE, UNFIXED, NO_PROGRESS, MANUAL})
-PROPOSAL_FIELDS = ("proposal", "basis", "cost", "fails_if")
+PROPOSAL_FIELDS = ("proposal", "facts", "basis", "cost", "fails_if")
+# Requests for one reflection batch: the reviewers and the verifiers of their facts. They do not count toward
+# --max-turns, as for the plan challenge. A request beyond this stops that step, and the rest goes on.
+REQUESTS = 18
 
 
 @dataclass(frozen=True)
@@ -31,7 +54,7 @@ class Role:
     group: str
     focus: str
     fits: frozenset = _ANY
-    tools: bool = False  # inspects the workspace with read_file and grep_search
+    tools: bool = True  # inspects the workspace with read_file and grep_search, so its facts can be proven
     brief: bool = True  # sees a short summary of the stall instead of the whole conversation
     temperature: float = 0.0
     fields: tuple = PROPOSAL_FIELDS  # answer fields, generated in this order
@@ -87,14 +110,14 @@ ROLES = (
          "involved, how they relate, the goal, and what blocks it. Then name a field of engineering or science "
          "where a problem with the same structure is solved routinely. In basis, name that field, map each "
          "abstract part onto it, and name the mechanism that transfers. In proposal, give one concrete step "
-         "here that applies the mechanism.",
-         temperature=0.8, fields=("abstraction", "basis", "proposal", "cost", "fails_if")),
+         "here that applies the mechanism. In facts, give the workspace facts that the step depends on.",
+         temperature=0.8, fields=("abstraction", "basis", "proposal", "facts", "cost", "fails_if")),
     Role("Naive shortcut", "lateral",
-         "Propose the simplest thing that might work, even without evidence that it will.",
+         "Propose the simplest thing that might work. In facts, name what in the workspace makes it plausible.",
          temperature=0.8),
     Role("Inversion", "lateral",
          "Name a stated or assumed constraint that may be optional, or invert the goal. Say what becomes "
-         "possible without it and how to check whether it is really required.",
+         "possible without it. In facts, show from the request, spec, or tests that nothing requires it.",
          temperature=0.8),
     Role("Backtrack", "lateral",
          "Find the earliest decision that led into this dead end. Propose a different route from that point "
@@ -102,7 +125,7 @@ ROLES = (
          frozenset({FAILURE, UNFIXED, NO_PROGRESS}), brief=False, temperature=0.8),
     Role("Ask the user", "lateral",
          "Name the one question for the user whose answer would unblock the task, and what to do for each "
-         "likely answer.",
+         "likely answer. In facts, show what in the workspace leaves that question open.",
          temperature=0.8),
 )
 

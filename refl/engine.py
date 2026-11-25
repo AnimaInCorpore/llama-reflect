@@ -9,7 +9,8 @@ from .challenge import SIMPLIFIER, SIMPLIFY_ANSWER_PROMPT, SIMPLIFY_PROMPT, SIMP
 from .challenge import answer_schema, format_objection, format_simplification, objection_of, simplification_of
 from .challenge import SMALL_EDIT_CHARS, SMALL_EDIT_LINES, simplification_claim, simplify_schema, small_edit
 from .client import THINKING_BUDGET_MESSAGE, ContextLimitError, ServerError, TokenLimitError
-from .reflection import MANUAL, REFLECTION_PROMPT, TEMPERATURE_SLOTS, StallDetector
+from .reflection import FACTS_RULE, GOAL_RULE, HONESTY_RULE, MANUAL, REFLECTION_PROMPT, StallDetector
+from .reflection import REQUESTS as REFLECTION_REQUESTS
 from .tools import TOOLS
 from .tree import ensure_git_ignored
 
@@ -37,11 +38,11 @@ _VERIFY_TAG = re.compile(r"<verify>(.*?)</verify>", re.DOTALL | re.IGNORECASE)
 _READ_ONLY_NAMES = {"read_file", "grep_search", "view_image"}
 _READ_ONLY_TOOLS = [tool for tool in TOOLS if tool["function"]["name"] in _READ_ONLY_NAMES]
 _BASH_TOOLS = [tool for tool in TOOLS if tool["function"]["name"] == "bash"]
-_REVIEWERS = len(TEMPERATURE_SLOTS[0])
-_REVIEW_REQUESTS = 2  # at most, for a role with tools
+# Requests of the turn that a reflection needs: the decision, one step on it, and a final check. The reviewers
+# and their verifiers have a budget of their own.
+_ACT_ON_REFLECTION = 3
 _ENGINE_PROMPTS = ("Verification results", "Reflection results", "Plan challenge", "Unresolved points",
-                   "Run the smoke check now.",
-                   "Carry out the plan now", "Carry out the revised plan now", "Your last reply reached the limit",
+                   "Still open after two answers", "Run the smoke check now.", "Carry out the plan now", "Carry out the revised plan now", "Your last reply reached the limit",
                    "This is the final request", "The request limit of this turn is reached")
 # One request beyond the limit, so that a turn that ran out of requests still says where the task stands.
 _LIMIT_REPORT_PROMPT = (
@@ -94,16 +95,18 @@ _EVIDENCE_PROMPT = (
 )
 _PROPOSAL_PROMPT = (
     "You are a read-only reviewer helping a coding task that stalled. Answer in your role. In proposal, give "
-    "one concrete next action that does not contradict the task's stated requirements. In basis, give the "
-    "evidence, known technique, or analogy behind it, and say whether it is unverified. In cost, say what "
-    "trying it takes. In fails_if, give the result that would show it did not work. Keep each field brief."
+    "one concrete next action that does not contradict the task's stated requirements, or leave it empty if the "
+    "evidence supports none. In facts, give the facts from tool results in this conversation that the proposal "
+    "rests on, with file and line. In basis, give the reasoning, known technique, or analogy that connects those "
+    "facts to the proposal. In cost, say what trying it takes. In fails_if, give the result that would show it "
+    "did not work. Keep each field brief. " + FACTS_RULE + " " + GOAL_RULE + " " + HONESTY_RULE
 )
-_FIELD_LABELS = {"abstraction": "Abstract form", "basis": "Basis", "cost": "Cost", "fails_if": "Fails if"}
+_FIELD_LABELS = {"abstraction": "Abstract form", "facts": "Facts", "basis": "Basis", "cost": "Cost",
+                 "fails_if": "Fails if"}
 _AFTER_REFLECTION = (
-    "Evidence-based ideas rest on results from this workspace. Unverified ideas have no evidence yet. Start with "
-    "the evidence-based idea that explains the most of what you observed, run its check, and act on what it "
-    "shows. Try unverified ideas only when the evidence does not settle the question. Do not go back to the "
-    "edits or commands you repeated before this reflection. For a localized fix, read only the lines you need "
+    "A verifier confirmed the facts behind each idea in this workspace. Start with the idea that explains the "
+    "most of what you observed, run its check, and act on what it shows. Do not go back to the edits or "
+    "commands you repeated before this reflection. For a localized fix, read only the lines you need "
     "and make a targeted edit. Preserve unrelated code and keep the final request for rerunning the check that "
     "showed the problem."
 )
@@ -117,7 +120,9 @@ _DECISION_FIELDS = ("reason", "first_step", "role")
 _CARRY_OUT = "Carry out the plan now, starting with its first step."
 _OBJECTION_REQUEST = (
     "Answer each objection in one or two sentences: say whether it holds, and if it does, how you change the "
-    "plan. When an objection may hold and you cannot tell, make its check the first step."
+    "plan. When an objection may hold and you cannot tell, make its check the first step. If an objection shows "
+    "that the request conflicts with the workspace or leaves a decision open that only the user can make, say "
+    "so honestly instead of changing what the user asked for."
 )
 _SIMPLER_REQUEST = (
     "For the simpler strategy, say whether you switch to it. Keep your plan only for a concrete reason, such as "
@@ -126,7 +131,14 @@ _SIMPLER_REQUEST = (
 _REVISED_PLAN = "Then give the first step of the revised plan. Do not call tools in this reply."
 _UNRESOLVED_REQUEST = (
     "For each open objection, change the plan so that it removes the cause, or show from the conversation why it "
-    "does not apply. For an open simpler strategy, switch to it or name the requirement it misses. " + _REVISED_PLAN
+    "does not apply. For an open simpler strategy, switch to it or name the requirement it misses. If you cannot "
+    "settle a point without changing what the user asked for, say so. " + _REVISED_PLAN
+)
+# When a proven point still stands after both answers, the devil's advocate has won: the user decides.
+_ASK_USER_REQUEST = (
+    "Do not make the change. Write a short message to the user instead. Say what you were about to do and the "
+    "proven fact that stands against it. Then ask one or two precise questions about how the user wants the "
+    "request specified, with the options you see. Do not call tools in this reply."
 )
 _AFTER_CHALLENGE = "Carry out the revised plan now. Reissue the deferred calls that are still needed."
 
@@ -352,8 +364,10 @@ class Engine:
         # Whether critics challenge the plan before the first file change of a task, and whether they did.
         self.challenge = forks and challenge
         self.challenged = False
-        # Requests left in the running challenge, which has a budget of its own, or None outside one.
-        self.challenge_left = None
+        # Requests left in the running plan challenge or reflection batch, which has a budget of its own, and
+        # its name for the message when the budget runs out. None outside one.
+        self.batch_left = None
+        self.batch_name = None
         if thinking not in THINKING_MODES:
             raise ValueError(f"Unknown thinking mode {thinking!r}")
         self.thinking = thinking
@@ -403,12 +417,16 @@ class Engine:
             system += "\n\nProject guidance from REFLECT.md:\n" + guidance
         return [{"role": "system", "content": system}, *self.tree.messages(leaf, start=start)]
 
+    def _user_request(self, anchor):
+        """The user's latest request on the path to `anchor`, without the messages that Reflect adds."""
+        return next((message["content"] for message in reversed(self.tree.messages(anchor))
+                     if message["role"] == "user" and isinstance(message.get("content"), str)
+                     and not message["content"].startswith(_ENGINE_PROMPTS)), "")
+
     def _brief(self, anchor, reason):
         """Summarize the task, the reason for reflecting, and the latest main-branch actions."""
         messages = self.tree.messages(anchor)
-        task = next((message["content"] for message in reversed(messages)
-                     if message["role"] == "user" and isinstance(message.get("content"), str)
-                     and not message["content"].startswith(_ENGINE_PROMPTS)), "")
+        task = self._user_request(anchor)
         functions, actions = {}, []
         for message in messages:
             if message["role"] == "assistant":
@@ -428,10 +446,10 @@ class Engine:
     async def _complete(self, messages, tools, *, fork=False, response_format=None, temperature=0.0,
                         tool_choice=None, branch=None):
         """Request a completion. `branch` names a fork by the ID of its first node, so it gets its own session."""
-        if self.challenge_left is not None:
-            if self.challenge_left <= 0:
-                raise TurnLimitError("The plan challenge used all of its requests.")
-            self.challenge_left -= 1
+        if self.batch_left is not None:
+            if self.batch_left <= 0:
+                raise TurnLimitError(f"The {self.batch_name} used all of its requests.")
+            self.batch_left -= 1
         elif self.requests_left is not None:
             if self.requests_left <= (1 if fork else 0):
                 raise TurnLimitError("No model requests remain for this step.")
@@ -595,8 +613,10 @@ class Engine:
         return f"[UNVERIFIED] {reason}"
 
     async def _review(self, anchor, stall, role, brief, history):
+        """Run one reviewer in a read-only fork and return its structured answer, or None without an idea."""
         self.on_tool(f"Reviewing as {role.name}: {role.focus}")
-        request = f"Reflection role: {role.name}\nReview reason: {stall}\n\n{role.focus}"
+        request = (f"User's request: {self._user_request(anchor)[:1500]}\nReflection role: {role.name}\n"
+                   f"Review reason: {stall}\n\n{role.focus}")
         if role.brief:
             request = f"{brief}\n\n{request}"
         skill = None
@@ -628,43 +648,57 @@ class Engine:
 
         reason = "The reviewer returned no proposal."
         try:
-            proposal = None
             if role.tools:
                 # One request to gather evidence. Requiring a call keeps a small model from proposing a check
-                # instead of running it. A server that ignores tool_choice can still answer in text.
+                # instead of running it. A reply in text still leads to the structured answer, which needs facts.
                 message = await self._complete(context(leaf, REFLECTION_PROMPT), _READ_ONLY_TOOLS, fork=True,
                                                temperature=role.temperature, tool_choice="required", branch=start)
                 calls = _tool_calls(message)
                 leaf = self.tree.append(message, parent_id=leaf, branch_type="reflection")
                 if calls:
                     leaf, _ = await self._observe(leaf, calls, branch_type="reflection")
-                    leaf = self.tree.append({
-                        "role": "user",
-                        "content": "Give your answer now using the evidence already in the conversation.",
-                    }, parent_id=leaf, branch_type="reflection")
-                else:
-                    proposal = " ".join(str(message.get("content") or "").split())
-            if proposal is None:
-                message = await self._complete(
-                    context(leaf, _PROPOSAL_PROMPT), [], fork=True,
-                    response_format=_proposal_schema(role.fields), temperature=role.temperature, branch=start,
-                )
-                if _tool_calls(message):
-                    raise ServerError("The reviewer called a tool on its final request.")
-                leaf = self.tree.append(message, parent_id=leaf, branch_type="reflection")
-                try:
-                    proposal = _format_proposal(json.loads(message.get("content") or ""))
-                except (AttributeError, KeyError, TypeError, ValueError):
-                    proposal = ""
+                leaf = self.tree.append({
+                    "role": "user",
+                    "content": "Give your answer now using the evidence already in the conversation.",
+                }, parent_id=leaf, branch_type="reflection")
+            message = await self._complete(
+                context(leaf, _PROPOSAL_PROMPT), [], fork=True,
+                response_format=_proposal_schema(role.fields), temperature=role.temperature, branch=start,
+            )
+            if _tool_calls(message):
+                raise ServerError("The reviewer called a tool on its final request.")
+            leaf = self.tree.append(message, parent_id=leaf, branch_type="reflection")
+            try:
+                answer = json.loads(message.get("content") or "")
+                proposal = " ".join(str(answer["proposal"]).split())
+            except (AttributeError, KeyError, TypeError, ValueError):
+                answer, proposal = None, ""
             if proposal.strip(" ."):
                 self.tree.finish_fork(leaf, anchor, "merged")
-                return proposal[:800]
+                return answer
         except (ServerError, TurnLimitError) as error:
             reason = str(error)
 
         self.tree.finish_fork(leaf, anchor, "pruned")
         self.on_tool(f"Reflection {role.name}: {reason}")
         return None
+
+    async def _proven_idea(self, anchor, stall, role, brief, history):
+        """Return a reviewer's idea for the main branch if a verifier confirms the facts it rests on."""
+        answer = await self._review(anchor, stall, role, brief, history)
+        if answer is None:
+            return None
+        facts = " ".join(str(answer.get("facts", "")).split())
+        if facts.strip(" .").lower() in ("", "none", "unverified", "unknown"):
+            self.on_tool(f"Reflection {role.name}: dropped, the idea names no facts.")
+            return None
+        verdict = await self._verify(anchor, f"These facts hold in the workspace: {facts}")
+        label, _, detail = verdict.partition("] ")
+        if label != "[VERIFIED":
+            why = "refuted" if label == "[FALSE ASSUMPTION" else "not proven"
+            self.on_tool(f"Reflection {role.name}: dropped, its facts are {why}. {detail}")
+            return None
+        return f"{_format_proposal(answer)[:800]} Verifier: {detail}"
 
     async def _reflect(self, reason, *, manual=False):
         anchor = self.tree.head
@@ -678,15 +712,18 @@ class Engine:
             f"## Reflection\n\n{heading}\n\n    {' '.join(reason.split())}\n\nTemperature {level}: {names}")
         self.on_tool(f"Strategy\nReflecting: {reason}\nTemperature {level}: {names}\nTracking: {self.strategy_path}")
         brief = self._brief(anchor, reason)
-        proposals = await asyncio.gather(*(self._review(anchor, reason, role, brief, history) for role in roles))
-        found = [(role, proposal) for role, proposal in zip(roles, proposals) if proposal]
-        # Grounded roles inspect the workspace, so their ideas come first and are labeled as evidence-based.
-        sections = []
-        for title, grounded in (("Evidence-based ideas", True), ("Unverified ideas", False)):
-            entries = [f"- {role.name}: {proposal}" for role, proposal in found if (role.group == "grounded") == grounded]
-            if entries:
-                sections.append(title + "\n" + "\n".join(entries))
-        summary = "\n\n".join(sections) or "The reviewers returned no usable proposals."
+        # The reviewers and the verifiers of their facts have a budget of their own, as for the plan challenge.
+        self.batch_left, self.batch_name = REFLECTION_REQUESTS, "reflection"
+        try:
+            ideas = await asyncio.gather(*(self._proven_idea(anchor, reason, role, brief, history)
+                                           for role in roles))
+        finally:
+            self.batch_left = self.batch_name = None
+        found = [(role, idea) for role, idea in zip(roles, ideas) if idea]
+        # Grounded roles come first, since their ideas start from the stall's own evidence.
+        found.sort(key=lambda item: item[0].group != "grounded")
+        summary = ("Proven ideas\n" + "\n".join(f"- {role.name}: {idea}" for role, idea in found) if found
+                   else "No reviewer idea rested on facts that a verifier could confirm.")
         self.on_tool(f"Strategy\nReflection proposals\n{summary}")
         self._strategy_event("### Proposals\n\n" + summary)
         self.track_strategy = True
@@ -779,11 +816,11 @@ class Engine:
         The requests come from a budget of their own, so the task keeps all of its --max-turns.
         """
         self.challenged = True
-        self.challenge_left = CHALLENGE_REQUESTS
+        self.batch_left, self.batch_name = CHALLENGE_REQUESTS, "plan challenge"
         try:
-            await self._run_challenge(calls)
+            return await self._run_challenge(calls)
         finally:
-            self.challenge_left = None
+            self.batch_left = self.batch_name = None
 
     async def _run_challenge(self, calls):
         anchor = self.tree.head
@@ -795,7 +832,7 @@ class Engine:
         *results, simpler = await asyncio.gather(*(self._object(anchor, critic, pending) for critic in CRITICS),
                                                  self._simplify(anchor, pending))
         # A proven finding is (critic, the point it makes, its rebuttal prompt, its line for the main branch).
-        proven, unproven = [], []
+        proven = []
         for critic, result in zip(CRITICS, results):
             if result is None:
                 continue
@@ -804,11 +841,11 @@ class Engine:
             label, _, detail = verdict.partition("] ")
             if label == "[VERIFIED":
                 proven.append((critic, objection_of(answer), REBUTTAL_PROMPT, f"{line} Verifier: {detail}"))
-            elif label == "[FALSE ASSUMPTION":
-                self.on_tool(f"Challenge\nDropped the {critic.name} objection: {detail}")
             else:
-                unproven.append(f"{line} Not proven: {detail}")
-        if not proven and not unproven and simpler is None:
+                # Only proven facts may argue against the plan, so an unproven objection is dropped too.
+                why = "refuted" if label == "[FALSE ASSUMPTION" else "not proven"
+                self.on_tool(f"Challenge\nDropped the {critic.name} objection, {why}: {detail}")
+        if not proven and simpler is None:
             self.on_tool("Challenge\nNo objection or simpler strategy held up.")
             self.tree.append({"role": "user", "content": (
                 f"Plan challenge\nNo objection to the plan held up in the workspace, and no simpler strategy was "
@@ -818,9 +855,6 @@ class Engine:
         sections, requests = [], []
         if proven:
             sections.append("Proven objections\n" + "\n".join(line for *_, line in proven))
-        if unproven:
-            sections.append("Unproven objections\n" + "\n".join(unproven))
-        if proven or unproven:
             requests.append(_OBJECTION_REQUEST)
         if simpler is not None:
             sections.append("Simpler strategy, proven to keep the requirements\n" + simpler[-1])
@@ -839,18 +873,48 @@ class Engine:
             rebuttal_anchor = self.tree.head
             reasons = await asyncio.gather(*(self._rebut(rebuttal_anchor, critic, point, prompt)
                                              for critic, point, prompt, _ in proven))
-            unresolved = [f"- {critic.name}: {point} Still open: {reason}"
-                          for (critic, point, *_), reason in zip(proven, reasons) if reason]
-            if unresolved:
-                text = "\n".join(unresolved)
+            open_points = [(entry, reason) for entry, reason in zip(proven, reasons) if reason]
+            if open_points:
+                text = "\n".join(f"- {critic.name}: {point} Still open: {reason}"
+                                 for (critic, point, *_), reason in open_points)
                 self.on_tool(f"Challenge\nUnresolved points\n{text}")
                 self.tree.append({"role": "user", "content": (
                     f"Unresolved points\nThe critics whose findings were proven say that your answer does not "
                     f"settle these yet.\n\n{text}\n\n{_UNRESOLVED_REQUEST}")})
                 await self._answer_objections()
+                # The last word: a critic whose proven point still stands after the second answer wins, and
+                # the user is asked how to specify the request instead of the main branch acting against it.
+                final_anchor = self.tree.head
+                reasons = await asyncio.gather(*(self._rebut(final_anchor, critic, point, prompt)
+                                                 for (critic, point, prompt, _), _ in open_points))
+                standing = [f"- {critic.name}: {point} Still open: {reason}"
+                            for ((critic, point, *_), _), reason in zip(open_points, reasons) if reason]
+                if standing:
+                    return await self._ask_user("\n".join(standing))
+                self.on_tool("Challenge\nThe second answer settles the open points.")
             else:
                 self.on_tool("Challenge\nThe revised plan settles the proven findings.")
         self.tree.append({"role": "user", "content": _AFTER_CHALLENGE})
+        return None
+
+    async def _ask_user(self, standing):
+        """Return a question for the user about the proven points that still stand, instead of the change."""
+        self.on_tool(f"Challenge\nThe devil's advocate wins. These proven points still stand, so Reflect asks you "
+                     f"to specify the request.\n{standing}")
+        self.tree.append({"role": "user", "content": (
+            f"Still open after two answers\nThese proven points still stand against your plan.\n\n{standing}\n\n"
+            f"{_ASK_USER_REQUEST}")})
+        try:
+            message = await self._complete(self._messages(self.tree.head), [])
+            question = message.get("content")
+            if _tool_calls(message) or not isinstance(question, str) or not question.strip():
+                raise ServerError("Expected a question for the user.")
+            question = question.strip()
+        except (ServerError, TurnLimitError):
+            question = (f"I have not made the change yet, because these proven points still stand against my "
+                        f"plan:\n{standing}\n\nHow do you want the request specified?")
+        self.tree.append({"role": "assistant", "content": question})
+        return question
 
     async def _answer_objections(self):
         """Have the main branch answer the findings in the last message, without tools."""
@@ -897,7 +961,8 @@ class Engine:
         self.on_tool(f"Challenging as {critic.name}")
         start = leaf = self.tree.append({
             "role": "user",
-            "content": f"Critic role: {critic.name}\nPlanned first change: {pending}\n\n{critic.focus}",
+            "content": (f"User's request: {self._user_request(anchor)[:1500]}\nCritic role: {critic.name}\n"
+                        f"Planned first change: {pending}\n\n{critic.focus}"),
         }, parent_id=anchor, branch_type="challenge")
         role = f"Your role: {critic.name}. {critic.focus}"
         reason = nothing
@@ -939,8 +1004,9 @@ class Engine:
         """Have a critic judge the main branch's answer to its proven finding. Return why it is still open."""
         start = leaf = self.tree.append({
             "role": "user",
-            "content": (f"Critic role: {critic.name}\nYour proven finding: {point}\n\n"
-                        f"Does the main branch's last reply settle it?"),
+            "content": (f"User's request: {self._user_request(anchor)[:1500]}\nCritic role: {critic.name}\n"
+                        f"Your proven finding: {point}\n\nDoes the main branch's last reply settle it, in a way "
+                        f"that still serves the user's request?"),
         }, parent_id=anchor, branch_type="challenge")
         try:
             message = await self._complete(
@@ -1073,8 +1139,11 @@ class Engine:
             await self._observe(leaf, calls, defer=defer, stalls=self.stalls if self.forks else None)
             if challenge:
                 self.tree.save()
-                await self._challenge(calls)
+                question = await self._challenge(calls)
                 self.tree.save()
+                if question:
+                    # The deferred change stays unmade until the user has specified the request.
+                    return question
                 continue
             if claims:
                 anchor = self.tree.head
@@ -1091,7 +1160,7 @@ class Engine:
                         "Reissue any deferred calls that are still needed."
                     ),
                 })
-            elif (self.forks and self.requests_left >= _REVIEWERS * _REVIEW_REQUESTS + 3
+            elif (self.forks and self.requests_left >= _ACT_ON_REFLECTION
                   # A final answer while a rerun check still fails is a stall too: the model gave up.
                   and (stall := self.stalls.stall() if calls else self.stalls.stopped())):
                 self.tree.save()

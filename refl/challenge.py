@@ -1,6 +1,6 @@
 """Critics that look for the reasons a plan will fail, and for a simpler one, before its first file change."""
 
-from .reflection import Role
+from .reflection import GOAL_RULE, HONESTY_RULE, Role
 
 
 CHALLENGE_PROMPT = (
@@ -8,7 +8,8 @@ CHALLENGE_PROMPT = (
     "first file change, which ends the conversation. Assume that the plan will fail and find out why. Look for "
     "evidence with read_file or grep_search before you answer, such as a requirement, a caller, a test, or a "
     "setting that the plan does not account for. Do not assume anything that no tool result shows. Object to "
-    "the plan, not to the task."
+    "the plan, not to the task. Assuming failure is a way to search, not a verdict: if the evidence shows no "
+    "reason that the plan fails, leave objection empty. " + GOAL_RULE + " " + HONESTY_RULE
 )
 ANSWER_PROMPT = (
     "Name the one most likely reason that the plan fails. In objection, state it. In evidence, give the tool "
@@ -21,8 +22,9 @@ REBUTTAL_PROMPT = (
     "You are a read-only critic. A verifier confirmed your objection to the main branch's plan in the "
     "workspace, and the main branch answered it in its last reply. Judge only whether the answer resolves your "
     "objection: a changed plan that removes the cause, or a reason grounded in the conversation why it does not "
-    "apply. A promise to be careful does not resolve it. In reason, say what the answer changes or misses. Set "
-    "status to resolved or unresolved."
+    "apply. A promise to be careful does not resolve it, and neither does a plan that no longer serves the "
+    "user's request. In reason, say what the answer changes or misses. Set status to resolved or unresolved. "
+    + GOAL_RULE + " " + HONESTY_RULE
 )
 REBUTTAL_SCHEMA = {
     "type": "json_object",
@@ -47,7 +49,8 @@ SIMPLIFY_PROMPT = (
     "workspace or on this system and does part of the work, or a more direct route. Do not propose a new "
     "dependency. Look for evidence with read_file or grep_search before you answer. The "
     "simpler strategy must keep every requirement of the request and of any spec or tests in the workspace. If "
-    "the current plan already follows that strategy or is about as simple, say so."
+    "the current plan already follows that strategy or is about as simple, say so. " + GOAL_RULE + " "
+    + HONESTY_RULE
 )
 SIMPLIFY_ANSWER_PROMPT = (
     "In goal, restate what must be true when the task is done, without any steps. In simpler_plan, give the "
@@ -64,7 +67,7 @@ SIMPLIFY_REBUTTAL_PROMPT = (
     "main branch answered it in its last reply. Judge only whether the answer settles it: switching to the "
     "simpler strategy, or a concrete reason grounded in the conversation why it misses something or costs more. "
     "Preferring the current plan without such a reason does not settle it. In reason, say what the answer "
-    "decides or misses. Set status to resolved or unresolved."
+    "decides or misses. Set status to resolved or unresolved. " + GOAL_RULE + " " + HONESTY_RULE
 )
 SIMPLIFIER = Role("Simpler plan", "challenge",
                   "Restate the goal at the highest level of abstraction and find a clearly simpler strategy that "
@@ -72,7 +75,7 @@ SIMPLIFIER = Role("Simpler plan", "challenge",
                   tools=True, brief=False)
 # Requests for one challenge: critics, verifiers, answers, and rebuttals. They do not count toward --max-turns,
 # which would leave the task too few requests. A request beyond this stops that step, and the rest goes on.
-REQUESTS = 30
+REQUESTS = 36
 # The tools whose first call in a task starts the challenge. Changes made through Bash are not caught.
 EDIT_TOOLS = {"write_file", "edit_file"}
 # An edit of a few lines is cheaper to check by making it than by four critics. In a live test, a one-line edit
