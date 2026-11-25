@@ -67,7 +67,10 @@ _COLUMN_LIMIT = 300
 _SEARCH_SECONDS = 15
 _MORE_MATCHES = "\n[More matches omitted. Narrow the search to continue.]"
 # view_image sends at most this many bytes of image data. The session keeps each viewed image.
-_IMAGE_LIMIT = 5 * 1024 * 1024
+_IMAGE_LIMIT = 32 * 1024 * 1024
+# Basalt refuses images above 64 megapixels. Refusing them here lets the model scale the image down, while an image
+# the server rejects would stay in the conversation and fail every later request. 64 million is the lower reading.
+_PIXEL_LIMIT = 64_000_000
 # JPEG markers that start a frame and carry the image size: SOF0 to SOF15 without DHT, JPG, and DAC.
 _JPEG_FRAMES = set(range(0xC0, 0xD0)) - {0xC4, 0xC8, 0xCC}
 
@@ -426,7 +429,7 @@ class WorkspaceTools:
         target = self._file(path)
         size = target.stat().st_size
         if size > _IMAGE_LIMIT:
-            raise ValueError(f"{path} has {size:,} bytes, more than the {_IMAGE_LIMIT // (1024 * 1024)} MB that "
+            raise ValueError(f"{path} has {size:,} bytes, more than the {_IMAGE_LIMIT // (1024 * 1024)} MiB that "
                              f"view_image sends. Scale it down with bash first.")
         data = target.read_bytes()
         info = _image_info(data)
@@ -434,6 +437,9 @@ class WorkspaceTools:
             raise ValueError(f"{path} is not a PNG, JPEG, GIF, or BMP image. Convert it to PNG with bash first, "
                              f"for example an SVG with rsvg-convert or ImageMagick if one is installed.")
         kind, mime, width, height = info
+        if width and height and width * height > _PIXEL_LIMIT:
+            raise ValueError(f"{path} has {width:,} x {height:,} pixels, more than the {_PIXEL_LIMIT // 1_000_000} "
+                             f"megapixels that view_image sends. Scale it down with bash first.")
         dimensions = f"{width} x {height} pixels, " if width and height else ""
         relative = target.relative_to(self.root).as_posix()
         return {

@@ -230,6 +230,25 @@ class ViewImageTest(unittest.TestCase):
             result = self.view("big.png", png(64, 64))
         self.assertTrue(result["error"].endswith("Scale it down with bash first."))
 
+    def test_images_up_to_32_mib_are_sent(self):
+        # Data after the end of a PNG still counts toward the file size.
+        accepted = self.view("photo.png", png(64, 64).ljust(32 * 1024 * 1024, b"\0"))
+        refused = self.view("huge.png", png(64, 64).ljust(32 * 1024 * 1024 + 1, b"\0"))
+        self.assertNotIn("error", accepted)
+        self.assertIn("more than the 32 MiB that view_image sends", refused["error"])
+
+    def test_images_over_64_megapixels_are_refused(self):
+        def sized(width, height):
+            # view_image reads the size from the PNG header only.
+            data = png(64, 64)
+            return data[:16] + width.to_bytes(4, "big") + height.to_bytes(4, "big") + data[24:]
+
+        accepted = self.view("wide.png", sized(8000, 8000))
+        refused = self.view("wider.png", sized(8001, 8000))
+        self.assertNotIn("error", accepted)
+        self.assertEqual(refused["error"], "wider.png has 8,001 x 8,000 pixels, more than the 64 megapixels that "
+                                           "view_image sends. Scale it down with bash first.")
+
     def test_paths_outside_the_workspace_are_refused(self):
         result = self.tools.execute({"name": "view_image", "arguments": json.dumps({"path": "../outside.png"})})
         self.assertEqual(result, {"error": "Path must stay inside the workspace"})
