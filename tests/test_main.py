@@ -73,12 +73,12 @@ class MainTest(unittest.TestCase):
 
     def test_fork_effort_needs_thinking_in_the_forks(self):
         for argv in (["hi", "--fork-effort", "none"], ["hi", "--fork-effort", "low", "--thinking", "main"],
-                     ["hi", "--fork-effort", "low"]):
+                     ["hi", "--fork-effort", "low", "--thinking", "off"]):
             errors = io.StringIO()
             with contextlib.redirect_stderr(errors), self.assertRaises(SystemExit):
                 main([*argv, "--workspace", self.directory.name, "--url", _NO_SERVER])
             self.assertIn("--thinking", errors.getvalue())
-        self.assertIn("--thinking off, the default", errors.getvalue())
+        self.assertIn("skip thinking with --thinking off", errors.getvalue())
 
     def test_the_report_is_shown_when_a_turn_runs_out(self):
         class Engine:
@@ -90,7 +90,7 @@ class MainTest(unittest.TestCase):
             asyncio.run(_submit(Engine(), "Port it."))
         self.assertEqual(output.getvalue(), "Done: A. Open: B.\n")
 
-    def test_thinking_is_off_by_default(self):
+    def test_thinking_is_on_by_default(self):
         seen = []
 
         async def run(args):
@@ -98,8 +98,9 @@ class MainTest(unittest.TestCase):
 
         with mock.patch("refl.main._run", run):
             self.assertEqual(main(["hi"]), 0)
-            self.assertEqual(main(["hi", "--thinking", "auto", "--fork-effort", "low"]), 0)
-        self.assertEqual(seen, ["off", "auto"])
+            self.assertEqual(main(["hi", "--fork-effort", "low"]), 0)
+            self.assertEqual(main(["hi", "--thinking", "off"]), 0)
+        self.assertEqual(seen, ["auto", "auto", "off"])
 
     def test_fork_effort_is_checked_against_the_template(self):
         properties = ServerProperties(effort_levels=["low", "medium", "xhigh"], rejected_efforts=["minimal", "max"])

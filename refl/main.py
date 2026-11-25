@@ -205,9 +205,9 @@ def main(argv=None):
                         help="disable verification forks and keep strategic reflection")
     parser.add_argument("--no-challenge", action="store_true",
                         help="skip the critics that challenge the plan before the first file change of a task")
-    parser.add_argument("--thinking", choices=THINKING_MODES, default="off",
-                        help="off: ask the chat template to skip thinking for every request; auto: the chat template "
-                             "decides; main: think on the main branch only (default: off)")
+    parser.add_argument("--thinking", choices=THINKING_MODES, default="auto",
+                        help="auto: the chat template decides, and Qwen3.8's thinks on every request; main: think on "
+                             "the main branch only; off: ask the chat template to skip thinking (default: auto)")
     parser.add_argument("--fork-effort", metavar="LEVEL",
                         help="reasoning effort for verifier and reviewer requests, such as low; the chat template "
                              "lists its levels at startup (default: the template's default)")
@@ -227,7 +227,7 @@ def main(argv=None):
         parser.error("use --thinking main to skip thinking in the forks")
     if args.fork_effort is not None and args.thinking != "auto":
         parser.error(f"--fork-effort needs --thinking auto, because the forks skip thinking with --thinking "
-                     f"{args.thinking}{', the default' if args.thinking == 'off' else ''}")
+                     f"{args.thinking}")
     if args.prompt is not None and (mangled := _MSYS_COMMAND.fullmatch(args.prompt.strip())):
         parser.error(
             f"the prompt looks like /{mangled[1]} rewritten as a Windows path by MSYS2. Set "
