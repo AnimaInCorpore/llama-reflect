@@ -387,12 +387,14 @@ class EngineTest(unittest.TestCase):
 
     def test_context_use_is_reported_once_per_threshold(self):
         reads = [call("read_file", path="status.txt") for _ in range(3)]
+        # The test engine's replies may take 256 tokens, so the conversation has 744 of the 1,000.
         engine, _, events = make_engine(self.root, [*reads, text("Done.")], forks=False,
-                                        tokens=[500, 760, 800, 950], context_size=1000)
+                                        tokens=[500, 560, 600, 700], context_size=1000)
         self.assertEqual(asyncio.run(engine.respond("Read the status.")), "Done.")
         warnings = [event for event in events if event.startswith("Context:")]
         self.assertEqual([warning.split(". ")[0] for warning in warnings],
-                         ["Context: 760 of 1,000 tokens in use (76%)", "Context: 950 of 1,000 tokens in use (95%)"])
+                         ["Context: 560 of 744 tokens in use (75%), keeping 256 of the 1,000 for a reply",
+                          "Context: 700 of 744 tokens in use (94%), keeping 256 of the 1,000 for a reply"])
         self.assertIn(f"--resume {engine.tree.path.stem}", warnings[0])
 
     def test_unknown_context_size_shows_no_warning(self):

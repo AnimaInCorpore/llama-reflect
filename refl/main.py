@@ -247,13 +247,16 @@ def main(argv=None):
     parser.add_argument("--fork-effort", metavar="LEVEL",
                         help="reasoning effort for verifier and reviewer requests, such as low; the chat template "
                              "lists its levels at startup (default: the template's default)")
-    parser.add_argument("--max-turns", type=_positive_int, default=20,
-                        help="model requests per prompt across all branches (default: 20)")
-    parser.add_argument("--max-tokens", type=_positive_int, default=16384, help="output tokens per completion (default: 16384)")
+    parser.add_argument("--max-turns", type=_positive_int, default=40,
+                        help="model requests per prompt for the main branch and the checks of its claims; the plan "
+                             "challenge and reflection have budgets of their own (default: 40)")
+    parser.add_argument("--max-tokens", type=_positive_int, default=32768,
+                        help="output tokens per completion, thinking included (default: 32768)")
     parser.add_argument("--thinking-budget", type=_thinking_budget, metavar="N",
                         help="thinking tokens per request before the server ends the thinking block; -1 sets no "
                              "limit (default: half of --max-tokens)")
-    parser.add_argument("--timeout", type=_positive_int, default=600, help="model request timeout in seconds (default: 600)")
+    parser.add_argument("--timeout", type=_positive_int, default=1200,
+                        help="model request timeout in seconds (default: 1200)")
     parser.add_argument("--verbose", action="store_true",
                         help="show every step of the checks, the plan challenge, and reflection, not only their "
                              "summary lines")

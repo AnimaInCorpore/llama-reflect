@@ -599,12 +599,21 @@ class Engine:
                 f"--resume {self.tree.path.stem}.")
 
     def _check_context(self, tokens):
-        """Warn once as the main conversation passes each share of the server's context."""
-        share = tokens / self.context_size
+        """Warn once as the main conversation passes each share of the room it has in the server's context.
+
+        A reply of up to --max-tokens needs room in the same context, and Basalt rejects a request whose prompt
+        and max_tokens together exceed it. So the room for the conversation is the context less one reply,
+        unless that would leave less than half. With 32,768 of 131,072 tokens, requests fail at 98,304, where a
+        warning at 75% of the whole context would only just appear.
+        """
+        room = self.context_size - self.max_tokens if self.max_tokens * 2 <= self.context_size else self.context_size
+        share = tokens / room
         reached = sum(share >= limit for limit in _CONTEXT_WARNINGS)
         if reached > self.context_warnings:
             self.context_warnings = reached
-            self.on_tool(f"Context: {tokens:,} of {self.context_size:,} tokens in use ({share:.0%}). "
+            reserve = (f", keeping {self.max_tokens:,} of the {self.context_size:,} for a reply"
+                       if room < self.context_size else "")
+            self.on_tool(f"Context: {tokens:,} of {room:,} tokens in use ({share:.0%}){reserve}. "
                          f"{self._context_advice()}")
 
     async def _template_moves_text(self):
