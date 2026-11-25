@@ -66,7 +66,8 @@ ROLES = (
          frozenset({UNFIXED, NO_PROGRESS}), tools=True, temperature=0.3),
     Role("Known alternative", "alternative",
          "Name an established technique or tool that solves this kind of problem differently from the current "
-         "approach. Say where it is standard, how to apply it here, and how to check that it is available.",
+         "approach. Say where it is standard, how to apply it here, and how to check that it is available. "
+         "Prefer one that is already installed. One that is missing needs the user's approval first.",
          frozenset({NO_PROGRESS, MANUAL}), tools=True, temperature=0.3),
     Role("Switch tools", "alternative",
          "Keep the goal and change the instrument. Propose doing the blocked step with a different tool or "

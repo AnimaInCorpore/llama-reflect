@@ -5,7 +5,9 @@ from pathlib import PurePosixPath
 
 from .challenge import ANSWER_PROMPT, CHALLENGE_PROMPT, CRITICS, EDIT_TOOLS, REBUTTAL_PROMPT, REBUTTAL_SCHEMA
 from .challenge import REQUESTS as CHALLENGE_REQUESTS
-from .challenge import answer_schema, format_objection, objection_of
+from .challenge import SIMPLIFIER, SIMPLIFY_ANSWER_PROMPT, SIMPLIFY_PROMPT, SIMPLIFY_REBUTTAL_PROMPT
+from .challenge import answer_schema, format_objection, format_simplification, objection_of, simplification_of
+from .challenge import SMALL_EDIT_CHARS, SMALL_EDIT_LINES, simplification_claim, simplify_schema, small_edit
 from .client import THINKING_BUDGET_MESSAGE, ContextLimitError, ServerError, TokenLimitError
 from .reflection import MANUAL, REFLECTION_PROMPT, TEMPERATURE_SLOTS, StallDetector
 from .tools import TOOLS
@@ -37,7 +39,7 @@ _READ_ONLY_TOOLS = [tool for tool in TOOLS if tool["function"]["name"] in _READ_
 _BASH_TOOLS = [tool for tool in TOOLS if tool["function"]["name"] == "bash"]
 _REVIEWERS = len(TEMPERATURE_SLOTS[0])
 _REVIEW_REQUESTS = 2  # at most, for a role with tools
-_ENGINE_PROMPTS = ("Verification results", "Reflection results", "Plan challenge", "Unresolved objections",
+_ENGINE_PROMPTS = ("Verification results", "Reflection results", "Plan challenge", "Unresolved points",
                    "Run the smoke check now.",
                    "Carry out the plan now", "Carry out the revised plan now", "Your last reply reached the limit",
                    "This is the final request", "The request limit of this turn is reached")
@@ -60,6 +62,12 @@ _PROJECT_WRITE_RULE = (
     "Preserve existing AGENTS.md, AGENTS.override.md, CLAUDE.md, CLAUDE.local.md, .mcp.json, and configuration "
     "under .agents/, .claude/, .codex/, and .pi/ when using tools, including Bash. Project skill files can be "
     "updated when relevant."
+)
+# Every role gets this rule, so that no reviewer or critic proposes what the main branch may not do.
+_DEPENDENCY_RULE = (
+    "Solve the task with the tools and libraries that are already available in the workspace and on this system. "
+    "Do not install packages or add dependencies. If the task needs a publicly trusted tool or library that is "
+    "missing, stop and ask the user for it in your answer before trying it."
 )
 _VERDICT_LABELS = {"supported": "VERIFIED", "contradicted": "FALSE ASSUMPTION", "insufficient": "UNVERIFIED"}
 _VERDICT_SCHEMA = {
@@ -107,14 +115,18 @@ _DECISION_REQUEST = (
 # The role comes last, so the model names it after writing the plan and the label matches the plan.
 _DECISION_FIELDS = ("reason", "first_step", "role")
 _CARRY_OUT = "Carry out the plan now, starting with its first step."
-_CHALLENGE_REQUEST = (
-    "Before you act, answer each objection in one or two sentences: say whether it holds, and if it does, how "
-    "you change the plan. When an objection may hold and you cannot tell, make its check the first step. Then "
-    "give the first step of the revised plan. Do not call tools in this reply."
+_OBJECTION_REQUEST = (
+    "Answer each objection in one or two sentences: say whether it holds, and if it does, how you change the "
+    "plan. When an objection may hold and you cannot tell, make its check the first step."
 )
+_SIMPLER_REQUEST = (
+    "For the simpler strategy, say whether you switch to it. Keep your plan only for a concrete reason, such as "
+    "a requirement that the simpler strategy misses."
+)
+_REVISED_PLAN = "Then give the first step of the revised plan. Do not call tools in this reply."
 _UNRESOLVED_REQUEST = (
-    "Change the plan so that it removes their cause, or show from the conversation why they do not apply. Then "
-    "give the first step of the revised plan. Do not call tools in this reply."
+    "For each open objection, change the plan so that it removes the cause, or show from the conversation why it "
+    "does not apply. For an open simpler strategy, switch to it or name the requirement it misses. " + _REVISED_PLAN
 )
 _AFTER_CHALLENGE = "Carry out the revised plan now. Reissue the deferred calls that are still needed."
 
@@ -374,7 +386,7 @@ class Engine:
         # Build the main prompt for each request so resumed sessions, --linear, and --no-verify use the
         # current instructions.
         system = system_prompt or (SYSTEM_PROMPT if self.verification else _NO_VERIFY_PROMPT)
-        system += "\n\n" + _PROJECT_WRITE_RULE
+        system += "\n\n" + _PROJECT_WRITE_RULE + "\n\n" + _DEPENDENCY_RULE
         guidance = self.workspace.project_guidance()
         if guidance:
             system += "\n\nProject guidance from REFLECT.md:\n" + guidance
@@ -385,6 +397,7 @@ class Engine:
 
     def _brief_messages(self, leaf, start, system):
         """Messages for a role that sees only its own branch from `start`, without the main conversation."""
+        system += "\n\n" + _DEPENDENCY_RULE
         guidance = self.workspace.project_guidance()
         if guidance:
             system += "\n\nProject guidance from REFLECT.md:\n" + guidance
@@ -723,17 +736,42 @@ class Engine:
         """Whether the calls make the task's first change to a project file, which starts a challenge."""
         if not self.challenge or self.challenged:
             return False
+        small = []
         for call in calls:
-            if call["function"]["name"] not in EDIT_TOOLS:
+            name = call["function"]["name"]
+            if name not in EDIT_TOOLS:
                 continue
             try:
-                path = json.loads(call["function"]["arguments"])["path"]
+                args = json.loads(call["function"]["arguments"])
+                path = args["path"]
             except (KeyError, TypeError, ValueError):
                 continue
             # Skills and strategy notes under .refl/ record the work rather than change the project.
-            if isinstance(path, str) and path.strip() and PurePosixPath(path.replace("\\", "/")).parts[:1] != (".refl",):
+            if not isinstance(path, str) or not path.strip() or PurePosixPath(path.replace("\\", "/")).parts[:1] == (".refl",):
+                continue
+            if not small_edit(name, args, self._replaced_text(path) if name == "write_file" else None):
                 return True
+            small.append(_call_summary(call["function"]))
+        # A small edit does not use up the challenge, so the task's first larger change still gets one.
+        if small:
+            self.on_tool(f"Challenge\nSkipped for a small edit: {'; '.join(small)}")
         return False
+
+    def _replaced_text(self, path):
+        """The text that write_file would overwrite at `path`, or None for a new file.
+
+        A large, irregular, or unreadable file gives a text that never counts as small.
+        """
+        try:
+            target = self.workspace._path(path)
+            if not target.exists():
+                return None
+            if target.is_file() and target.stat().st_size <= SMALL_EDIT_CHARS * 4:
+                return target.read_text(encoding="utf-8", errors="replace")
+        except (OSError, ValueError):
+            pass
+        # Too large, not a regular file, or unreadable: never small.
+        return "\n" * (SMALL_EDIT_LINES + 1)
 
     async def _challenge(self, calls):
         """Have critics argue why the plan fails, prove their objections, and make the main branch answer them.
@@ -751,9 +789,12 @@ class Engine:
         anchor = self.tree.head
         pending = "; ".join(_call_summary(call["function"]) for call in calls
                             if call["function"]["name"] in EDIT_TOOLS)
-        self.on_tool(f"Challenge\nLooking for reasons the plan fails before its first change: {pending}")
-        # Each critic's objection goes to a verifier as soon as it is ready.
-        results = await asyncio.gather(*(self._object(anchor, critic, pending) for critic in CRITICS))
+        self.on_tool(f"Challenge\nLooking for reasons the plan fails, and for a simpler one, before its first "
+                     f"change: {pending}")
+        # Each finding goes to a verifier as soon as it is ready. The simplifier runs alongside the critics.
+        *results, simpler = await asyncio.gather(*(self._object(anchor, critic, pending) for critic in CRITICS),
+                                                 self._simplify(anchor, pending))
+        # A proven finding is (critic, the point it makes, its rebuttal prompt, its line for the main branch).
         proven, unproven = [], []
         for critic, result in zip(CRITICS, results):
             if result is None:
@@ -762,50 +803,57 @@ class Engine:
             line = f"- {critic.name}: {format_objection(answer)[:800]}"
             label, _, detail = verdict.partition("] ")
             if label == "[VERIFIED":
-                proven.append((critic, answer, f"{line} Verifier: {detail}"))
+                proven.append((critic, objection_of(answer), REBUTTAL_PROMPT, f"{line} Verifier: {detail}"))
             elif label == "[FALSE ASSUMPTION":
                 self.on_tool(f"Challenge\nDropped the {critic.name} objection: {detail}")
             else:
                 unproven.append(f"{line} Not proven: {detail}")
-        if not proven and not unproven:
-            self.on_tool("Challenge\nNo objection held up.")
+        if not proven and not unproven and simpler is None:
+            self.on_tool("Challenge\nNo objection or simpler strategy held up.")
             self.tree.append({"role": "user", "content": (
-                f"Plan challenge\nNo objection to the plan held up in the workspace. {_AFTER_CHALLENGE}")})
+                f"Plan challenge\nNo objection to the plan held up in the workspace, and no simpler strategy was "
+                f"proven. {_AFTER_CHALLENGE}")})
             return
 
-        sections = []
+        sections, requests = [], []
         if proven:
-            sections.append("Proven objections\n" + "\n".join(line for _, _, line in proven))
+            sections.append("Proven objections\n" + "\n".join(line for *_, line in proven))
         if unproven:
             sections.append("Unproven objections\n" + "\n".join(unproven))
+        if proven or unproven:
+            requests.append(_OBJECTION_REQUEST)
+        if simpler is not None:
+            sections.append("Simpler strategy, proven to keep the requirements\n" + simpler[-1])
+            requests.append(_SIMPLER_REQUEST)
+            proven.append(simpler)
         summary = "\n\n".join(sections)
         self.on_tool(f"Challenge\n{summary}")
         self.tree.append({"role": "user", "content": (
-            f"Plan challenge\nBefore your first change ({pending}), critics assumed that your plan fails and looked "
-            f"for the reasons. A verifier checked each objection in the workspace.\n\n{summary}\n\n"
-            f"{_CHALLENGE_REQUEST}")})
+            f"Plan challenge\nBefore your first change ({pending}), critics looked for reasons that your plan fails "
+            f"and for a simpler strategy at the level of the goal. A verifier checked each finding in the "
+            f"workspace.\n\n{summary}\n\nBefore you act: {' '.join(requests)} {_REVISED_PLAN}")})
         await self._answer_objections()
 
-        # One rebuttal round: each critic whose objection was proven judges the answer to it.
+        # One rebuttal round: each critic whose finding was proven judges the answer to it.
         if proven:
             rebuttal_anchor = self.tree.head
-            reasons = await asyncio.gather(*(self._rebut(rebuttal_anchor, critic, answer)
-                                             for critic, answer, _ in proven))
-            unresolved = [f"- {critic.name}: {objection_of(answer)} Still open: {reason}"
-                          for (critic, answer, _), reason in zip(proven, reasons) if reason]
+            reasons = await asyncio.gather(*(self._rebut(rebuttal_anchor, critic, point, prompt)
+                                             for critic, point, prompt, _ in proven))
+            unresolved = [f"- {critic.name}: {point} Still open: {reason}"
+                          for (critic, point, *_), reason in zip(proven, reasons) if reason]
             if unresolved:
                 text = "\n".join(unresolved)
-                self.on_tool(f"Challenge\nUnresolved objections\n{text}")
+                self.on_tool(f"Challenge\nUnresolved points\n{text}")
                 self.tree.append({"role": "user", "content": (
-                    f"Unresolved objections\nThe critics whose objections were proven say that your answer does "
-                    f"not resolve these yet.\n\n{text}\n\n{_UNRESOLVED_REQUEST}")})
+                    f"Unresolved points\nThe critics whose findings were proven say that your answer does not "
+                    f"settle these yet.\n\n{text}\n\n{_UNRESOLVED_REQUEST}")})
                 await self._answer_objections()
             else:
-                self.on_tool("Challenge\nThe revised plan resolves the proven objections.")
+                self.on_tool("Challenge\nThe revised plan settles the proven findings.")
         self.tree.append({"role": "user", "content": _AFTER_CHALLENGE})
 
     async def _answer_objections(self):
-        """Have the main branch answer the objections in the last message, without tools."""
+        """Have the main branch answer the findings in the last message, without tools."""
         try:
             message = await self._complete(self._messages(self.tree.head), [])
             answer = message.get("content")
@@ -827,18 +875,35 @@ class Engine:
         verdict = await self._verify(anchor, f"The planned change ({pending}) fails: {objection_of(answer)}")
         return answer, verdict
 
-    async def _critique(self, anchor, critic, pending):
-        """Run one critic in a read-only fork and return its structured answer, or None without an objection."""
+    async def _simplify(self, anchor, pending):
+        """Return the simplifier's finding if a verifier proves that its strategy keeps the requirements."""
+        answer = await self._critique(anchor, SIMPLIFIER, pending, prompt=SIMPLIFY_PROMPT,
+                                      answer_prompt=SIMPLIFY_ANSWER_PROMPT, schema=simplify_schema(),
+                                      found=simplification_of, nothing="The current plan is already about as simple.")
+        if answer is None:
+            return None
+        strategy = simplification_of(answer)
+        verdict = await self._verify(anchor, simplification_claim(answer))
+        label, _, detail = verdict.partition("] ")
+        if label != "[VERIFIED":
+            self.on_tool(f"Challenge\nDropped the simpler strategy: {detail}")
+            return None
+        line = f"- {SIMPLIFIER.name}: {format_simplification(answer)[:800]} Verifier: {detail}"
+        return SIMPLIFIER, strategy, SIMPLIFY_REBUTTAL_PROMPT, line
+
+    async def _critique(self, anchor, critic, pending, *, prompt=CHALLENGE_PROMPT, answer_prompt=ANSWER_PROMPT,
+                        schema=None, found=objection_of, nothing="The critic returned no objection."):
+        """Run one critic in a read-only fork and return its structured answer, or None if `found` sees nothing."""
         self.on_tool(f"Challenging as {critic.name}")
         start = leaf = self.tree.append({
             "role": "user",
             "content": f"Critic role: {critic.name}\nPlanned first change: {pending}\n\n{critic.focus}",
         }, parent_id=anchor, branch_type="challenge")
         role = f"Your role: {critic.name}. {critic.focus}"
-        reason = "The critic returned no objection."
+        reason = nothing
         try:
             # One request to gather evidence, then the answer without tools, as for a reflection reviewer.
-            message = await self._complete(self._messages(leaf, system_prompt=f"{CHALLENGE_PROMPT}\n\n{role}"),
+            message = await self._complete(self._messages(leaf, system_prompt=f"{prompt}\n\n{role}"),
                                            _READ_ONLY_TOOLS, fork=True, temperature=critic.temperature,
                                            tool_choice="required", branch=start)
             calls = _tool_calls(message)
@@ -850,8 +915,8 @@ class Engine:
                 "content": "Give your answer now using the evidence already in the conversation.",
             }, parent_id=leaf, branch_type="challenge")
             message = await self._complete(
-                self._messages(leaf, system_prompt=f"{CHALLENGE_PROMPT} {ANSWER_PROMPT}\n\n{role}"), [], fork=True,
-                response_format=answer_schema(), temperature=critic.temperature, branch=start,
+                self._messages(leaf, system_prompt=f"{prompt} {answer_prompt}\n\n{role}"), [], fork=True,
+                response_format=schema or answer_schema(), temperature=critic.temperature, branch=start,
             )
             if _tool_calls(message):
                 raise ServerError("The critic called a tool on its final request.")
@@ -860,7 +925,7 @@ class Engine:
                 answer = json.loads(message.get("content") or "")
             except (TypeError, ValueError):
                 answer = None
-            if objection_of(answer):
+            if found(answer):
                 self.tree.finish_fork(leaf, anchor, "merged")
                 return answer
         except (ServerError, TurnLimitError) as error:
@@ -870,16 +935,16 @@ class Engine:
         self.on_tool(f"Challenge {critic.name}: {reason}")
         return None
 
-    async def _rebut(self, anchor, critic, answer):
-        """Have a critic judge the main branch's answer to its proven objection. Return why it is still open."""
+    async def _rebut(self, anchor, critic, point, prompt):
+        """Have a critic judge the main branch's answer to its proven finding. Return why it is still open."""
         start = leaf = self.tree.append({
             "role": "user",
-            "content": (f"Critic role: {critic.name}\nYour proven objection: {objection_of(answer)}\n\n"
-                        f"Does the main branch's last reply resolve it?"),
+            "content": (f"Critic role: {critic.name}\nYour proven finding: {point}\n\n"
+                        f"Does the main branch's last reply settle it?"),
         }, parent_id=anchor, branch_type="challenge")
         try:
             message = await self._complete(
-                self._messages(leaf, system_prompt=f"{REBUTTAL_PROMPT}\n\nYour role: {critic.name}. {critic.focus}"),
+                self._messages(leaf, system_prompt=f"{prompt}\n\nYour role: {critic.name}. {critic.focus}"),
                 [], fork=True, response_format=REBUTTAL_SCHEMA, branch=start,
             )
             leaf = self.tree.append(message, parent_id=leaf, branch_type="challenge")

@@ -10,7 +10,7 @@ from refl.engine import TurnLimitError, _call_summary, attach_images, default_th
 
 from .test_tools import png
 
-from refl.challenge import CHALLENGE_PROMPT, REBUTTAL_PROMPT
+from refl.challenge import CHALLENGE_PROMPT, REBUTTAL_PROMPT, SIMPLIFY_PROMPT, SIMPLIFY_REBUTTAL_PROMPT
 from refl.tree import ConversationTree
 
 from .fakes import call, decision, make_engine, text, verdict
@@ -170,6 +170,10 @@ class EngineTest(unittest.TestCase):
         self.assertEqual(len(brief["messages"]), 2)
         self.assertNotIn("You are Reflect", brief["system"])
         self.assertIn("Your role: Switch tools.", brief["system"])
+        # The main branch, the reviewers with the whole conversation, and the brief ones get the dependency rule.
+        rule = "Do not install packages or add dependencies."
+        self.assertTrue(all(rule in request["system"] for request in server.requests
+                            if not request["system"].startswith("Compare the exact claim")))
         self.assertEqual(brief["temperature"], 0.3)
         summary = brief["messages"][1]["content"]
         self.assertIn("Task: Fix it.", summary)
@@ -416,17 +420,28 @@ if __name__ == "__main__":
     unittest.main()
 
 
-def _critic_route(objections, verdicts=None, rebuttal=None, explore=True):
+# An edit of five lines is large enough to start a plan challenge.
+_LARGE = "".join(f"line {number}\n" for number in range(5))
+
+
+def _critic_route(objections, verdicts=None, rebuttal=None, explore=True, simpler="", simpler_rebuttal=None):
     """Answer the forks of a plan challenge by their content, so their order does not matter.
 
-    `objections` maps a critic to its objection, `verdicts` a word in the objection to the verifier's status,
-    and `rebuttal` gives the status of every rebuttal.
+    `objections` maps a critic to its objection, `verdicts` a word in a finding to the verifier's status, and
+    `rebuttal` gives the status of every objection's rebuttal. `simpler` is the simplifier's strategy, empty for
+    none, and `simpler_rebuttal` the status of its rebuttal.
     """
     def route(request):
         system, schema = request["system"], (request["response_format"] or {}).get("schema", {})
         properties = schema.get("properties", {})
-        if system.startswith(CHALLENGE_PROMPT) and request["tools"]:
+        if system.startswith((CHALLENGE_PROMPT, SIMPLIFY_PROMPT)) and request["tools"]:
             return call("read_file", path="status.txt") if explore else text("Nothing to read.")
+        if "simpler_plan" in properties:
+            return text(json.dumps({"goal": "status.txt says new_ready", "simpler_plan": simpler,
+                                    "relies_on": "status.txt", "why_simpler": "one edit instead of a script",
+                                    "requirements": "keeps line 1"}))
+        if "status" in properties and system.startswith(SIMPLIFY_REBUTTAL_PROMPT):
+            return text(json.dumps({"reason": "It kept the script without a reason.", "status": simpler_rebuttal}))
         if "objection" in properties:
             critic = system.split("Your role: ")[1].split(".")[0]
             return text(json.dumps({"objection": objections.get(critic, ""), "evidence": "status.txt line 1",
@@ -455,7 +470,7 @@ class ChallengeTest(unittest.TestCase):
     def test_proven_objections_reach_the_plan_and_get_one_rebuttal(self):
         route = _critic_route({"Requirements": "It keeps old_ready", "Environment": "Python is missing"},
                               verdicts={"old_ready": "supported", "Python": "contradicted"}, rebuttal="unresolved")
-        replies = [call("write_file", path="app.py", content="print(1)\n"),
+        replies = [call("write_file", path="app.py", content=_LARGE),
                    text("The requirement holds, so I will write new_ready."),
                    text("I will change status.txt first."),
                    call("write_file", path="app.py", content="print(2)\n"),
@@ -473,7 +488,7 @@ class ChallengeTest(unittest.TestCase):
                       "Check: read status.txt. Verifier: supported by status.txt line 1", challenge)
         self.assertNotIn("Python is missing", challenge)
         self.assertTrue(any("Dropped the Environment objection" in event for event in events))
-        unresolved = next(content for content in contents if content.startswith("Unresolved objections"))
+        unresolved = next(content for content in contents if content.startswith("Unresolved points"))
         self.assertIn("- Requirements: It keeps old_ready Still open: The plan still writes old_ready.", unresolved)
         self.assertEqual(contents.count("Carry out the revised plan now. Reissue the deferred calls that are still "
                                         "needed."), 1)
@@ -481,7 +496,8 @@ class ChallengeTest(unittest.TestCase):
         # Each critic and the verifier and rebuttal of its objection have their own sessions.
         stem = engine.tree.path.stem
         forks = {request["session"] for request in server.requests if request["session"] != stem}
-        self.assertEqual(len(forks), 3 + 2 + 1)  # critics, verifiers, and the rebuttal of the proven objection
+        # The critics and the simplifier, the verifiers of two objections, and the rebuttal of the proven one.
+        self.assertEqual(len(forks), 4 + 2 + 1)
         # A saved session with challenge branches loads again.
         resumed = ConversationTree(engine.tree.path.parent, "system", resume=stem)
         self.assertEqual(len(resumed.nodes), len(engine.tree.nodes))
@@ -489,20 +505,91 @@ class ChallengeTest(unittest.TestCase):
     def test_only_the_first_project_change_of_a_task_is_challenged(self):
         route = _critic_route({}, explore=False)
         replies = [call("write_file", path=".refl/skills/notes.md", content="# Notes\n"),
+                   call("write_file", path="a.txt", content=_LARGE),
                    call("write_file", path="a.txt", content="a\n"),
-                   call("write_file", path="a.txt", content="a\n"),
-                   call("write_file", path="b.txt", content="b\n"),
+                   call("write_file", path="b.txt", content=_LARGE),
                    text("Done.")]
         engine, _, events = make_engine(self.root, replies, challenge=True, route=route)
         self.assertEqual(asyncio.run(engine.respond("Write a and b.")), "Done.")
         self.assertEqual(sum(event.startswith("Challenge\nLooking for reasons") for event in events), 1)
-        self.assertIn("Challenge\nNo objection held up.", events)
+        self.assertIn("Challenge\nNo objection or simpler strategy held up.", events)
         self.assertTrue((self.root / "b.txt").exists())
 
-        engine.server.replies = [call("write_file", path="c.txt", content="c\n"),
+        engine.server.replies = [call("write_file", path="c.txt", content=_LARGE),
                                  call("write_file", path="c.txt", content="c\n"), text("Done.")]
         self.assertEqual(asyncio.run(engine.respond("Write c.")), "Done.")
         self.assertEqual(sum(event.startswith("Challenge\nLooking for reasons") for event in events), 2)
+
+    def test_a_proven_simpler_strategy_must_be_taken_or_refused_for_a_reason(self):
+        route = _critic_route({}, verdicts={"Edit line 1": "supported"}, simpler="Edit line 1 of status.txt",
+                              simpler_rebuttal="unresolved")
+        replies = [call("write_file", path="update.py", content=_LARGE),
+                   text("I keep the script."),
+                   text("I switch to the single edit."),
+                   call("edit_file", path="status.txt", old_text="old_ready", new_text="new_ready"),
+                   text("Done.")]
+        engine, server, events = make_engine(self.root, replies, challenge=True, route=route)
+        self.assertEqual(asyncio.run(engine.respond("Set the status to new_ready.")), "Done.")
+        self.assertEqual((self.root / "status.txt").read_text(encoding="utf-8"), "new_ready\n")
+        self.assertFalse((self.root / "update.py").exists())
+
+        contents = [str(message.get("content")) for message in engine.tree.messages(engine.tree.head)]
+        challenge = next(content for content in contents if content.startswith("Plan challenge"))
+        self.assertIn("Simpler strategy, proven to keep the requirements\n- Simpler plan: Goal: status.txt says "
+                      "new_ready. Simpler strategy: Edit line 1 of status.txt. Relies on: status.txt. Saves: one edit "
+                      "instead of a script. Keeps: keeps line 1. Verifier: supported by status.txt line 1", challenge)
+        # The verifier checks what the strategy rests on today, not a prediction that it will work.
+        claim = next(event for event in events if event.startswith("Verifying The workspace has"))
+        self.assertEqual(claim, "Verifying The workspace has what this strategy relies on, and it does what the "
+                                "strategy needs: status.txt. The request and any spec or tests in the workspace set "
+                                "no requirement beyond these: keeps line 1. Strategy: Edit line 1 of status.txt")
+        self.assertIn("For the simpler strategy, say whether you switch to it.", challenge)
+        self.assertNotIn("Answer each objection", challenge)
+        unresolved = next(content for content in contents if content.startswith("Unresolved points"))
+        self.assertIn("- Simpler plan: Edit line 1 of status.txt Still open: It kept the script without a reason.",
+                      unresolved)
+        # The simplifier states the goal before its strategy.
+        schema = next(request["response_format"]["schema"] for request in server.requests
+                      if request["response_format"] and "simpler_plan" in request["response_format"]["schema"]["properties"])
+        self.assertEqual(schema["required"][:2], ["goal", "simpler_plan"])
+
+    def test_a_simpler_strategy_that_misses_a_requirement_is_dropped(self):
+        route = _critic_route({}, verdicts={"Delete": "contradicted"}, simpler="Delete status.txt")
+        replies = [call("write_file", path="a.txt", content=_LARGE),
+                   call("write_file", path="a.txt", content="a\n"), text("Done.")]
+        engine, _, events = make_engine(self.root, replies, challenge=True, route=route)
+        self.assertEqual(asyncio.run(engine.respond("Write a.")), "Done.")
+        self.assertIn("Challenge\nDropped the simpler strategy: contradicted by status.txt line 1", events)
+        self.assertIn("Challenge\nNo objection or simpler strategy held up.", events)
+
+    def test_small_edits_are_not_challenged_and_keep_the_challenge_for_later(self):
+        (self.root / "big.txt").write_text(_LARGE, encoding="utf-8")
+        route = _critic_route({}, explore=False)
+        replies = [call("edit_file", path="status.txt", old_text="old_ready", new_text="new_ready"),
+                   call("write_file", path="new.txt", content="one line\n"),
+                   # A few lines over a large file remove the rest of it, so they are not small.
+                   call("write_file", path="big.txt", content="x\n"),
+                   call("write_file", path="big.txt", content="x\n"),
+                   text("Done.")]
+        engine, _, events = make_engine(self.root, replies, challenge=True, route=route)
+        self.assertEqual(asyncio.run(engine.respond("Update the files.")), "Done.")
+        skipped = [event for event in events if event.startswith("Challenge\nSkipped for a small edit")]
+        self.assertEqual(skipped, ["Challenge\nSkipped for a small edit: edit_file status.txt",
+                                   "Challenge\nSkipped for a small edit: write_file new.txt"])
+        self.assertEqual(sum(event.startswith("Challenge\nLooking for reasons") for event in events), 1)
+        self.assertIn("Looking for reasons the plan fails, and for a simpler one, before its first change: "
+                      "write_file big.txt", next(event for event in events if "Looking for reasons" in event))
+
+    def test_what_counts_as_a_small_edit(self):
+        from refl.challenge import small_edit
+        self.assertTrue(small_edit("edit_file", {"old_text": "a\nb\nc", "new_text": "d"}, None))
+        self.assertFalse(small_edit("edit_file", {"old_text": "a\nb\nc\nd", "new_text": "d"}, None))
+        self.assertFalse(small_edit("edit_file", {"old_text": "a", "new_text": "x" * 201}, None))
+        self.assertTrue(small_edit("write_file", {"content": "a\nb\n"}, None))
+        self.assertTrue(small_edit("write_file", {"content": "a\n"}, "old\n"))
+        self.assertFalse(small_edit("write_file", {"content": "a\n"}, _LARGE))
+        self.assertFalse(small_edit("write_file", {"content": _LARGE}, None))
+        self.assertFalse(small_edit("edit_file", {"old_text": None, "new_text": "a"}, None))
 
     def test_linear_runs_have_no_challenge(self):
         engine, _, events = make_engine(self.root, [call("write_file", path="a.txt", content="a\n"),
@@ -515,7 +602,7 @@ class ChallengeTest(unittest.TestCase):
                               rebuttal="resolved", explore=False)
         # Five requests give the first critic its answer and its verifier one step. The third critic, the
         # verdict, and the main branch's answer find the budget used up, so the objection stays unproven.
-        replies = [call("write_file", path="a.txt", content="a\n"),
+        replies = [call("write_file", path="a.txt", content=_LARGE),
                    call("write_file", path="a.txt", content="a\n"), text("Done.")]
         engine, _, events = make_engine(self.root, replies, challenge=True, route=route)
         with mock.patch("refl.engine.CHALLENGE_REQUESTS", 5):

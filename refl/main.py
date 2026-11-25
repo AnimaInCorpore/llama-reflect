@@ -6,6 +6,7 @@ import sys
 from pathlib import Path
 
 
+from . import style
 from .client import LlamaClient, ServerError, ServerProperties
 from .transport import HttpClient
 from .engine import THINKING_MODES, Engine, SYSTEM_PROMPT, TurnLimitError
@@ -35,7 +36,7 @@ def _thinking_budget(value):
 
 
 def _status(message):
-    print(message, file=sys.stderr, flush=True)
+    print(style.err.event(message), file=sys.stderr, flush=True)
 
 
 def _check_fork_effort(effort, properties):
@@ -106,10 +107,10 @@ async def _submit(engine, prompt):
         raise ValueError("Usage: /exit")
     else:
         try:
-            print(await engine.respond(prompt), flush=True)
+            print(style.out.answer(await engine.respond(prompt)), flush=True)
         except TurnLimitError as error:
             if error.report:
-                print(error.report, flush=True)
+                print(style.out.answer(error.report), flush=True)
             raise
 
 
@@ -217,6 +218,8 @@ def main(argv=None):
                         help="thinking tokens per request before the server ends the thinking block; -1 sets no "
                              "limit (default: half of --max-tokens)")
     parser.add_argument("--timeout", type=_positive_int, default=600, help="model request timeout in seconds (default: 600)")
+    parser.add_argument("--color", choices=style.COLOR_MODES, default="auto",
+                        help="color the output: auto styles it for a terminal unless NO_COLOR is set (default: auto)")
     args = parser.parse_args(argv)
     if args.prompt is not None and not args.prompt.strip():
         parser.error("prompt must be nonempty")
@@ -232,6 +235,7 @@ def main(argv=None):
         )
     for stream in (sys.stdout, sys.stderr):
         _tolerant_output(stream)
+    style.configure(args.color)
     try:
         asyncio.run(_run(args))
     except KeyboardInterrupt:
