@@ -11,9 +11,8 @@ import zlib
 from pathlib import Path
 from unittest import mock
 
+from refl.tools import _OUTPUT_LIMIT as _LIMIT
 from refl.tools import WorkspaceTools
-
-_NOTE = "[Line limit reached. Continue from line 81.]"
 
 
 class ReadFileTest(unittest.TestCase):
@@ -30,18 +29,37 @@ class ReadFileTest(unittest.TestCase):
         path.write_text("".join(f"line {number}\n" for number in range(1, count + 1)), encoding="utf-8")
         return path.name
 
-    def test_default_range_says_where_to_continue(self):
-        output = self.tools.read_file(self.lines(200))["output"]
-        self.assertIn("80: line 80", output)
-        self.assertNotIn("81: line 81", output)
-        self.assertTrue(output.endswith(_NOTE))
+    def test_a_file_that_fits_comes_back_whole(self):
+        output = self.tools.read_file(self.lines(500))["output"]
+        self.assertTrue(output.startswith("1: line 1\n"))
+        self.assertTrue(output.endswith("500: line 500"))
+        self.assertNotIn("Output limit", output)
 
-    def test_no_note_when_the_file_ends_at_the_limit(self):
-        self.assertNotIn("Line limit", self.tools.read_file(self.lines(80))["output"])
+    def test_a_long_file_stops_at_the_limit_and_continues_without_gaps(self):
+        name, seen, start = self.lines(3000), [], 1
+        while True:
+            output = self.tools.read_file(name, start_line=start)["output"]
+            body, _, note = output.partition("\n[Output limit reached. Continue from line ")
+            self.assertLessEqual(len(body), _LIMIT)
+            seen += [int(line.split(":")[0]) for line in body.splitlines()]
+            if not note:
+                break
+            start = int(note.rstrip(".]"))
+        self.assertEqual(seen, list(range(1, 3001)))
 
-    def test_requested_range_past_the_limit(self):
-        self.assertTrue(self.tools.read_file(self.lines(85), end_line=100)["output"].endswith(_NOTE))
-        self.assertNotIn("Line limit", self.tools.read_file(self.lines(80), end_line=200)["output"])
+    def test_requested_range_ends_where_asked(self):
+        output = self.tools.read_file(self.lines(500), start_line=100, end_line=120)["output"]
+        self.assertEqual((output.splitlines()[0], output.splitlines()[-1]), ("100: line 100", "120: line 120"))
+        self.assertIn("Output limit", self.tools.read_file(self.lines(3000), end_line=2000)["output"])
+        self.assertEqual(self.tools.read_file(self.lines(5), start_line=9)["output"],
+                         "No lines in the requested range.")
+
+    def test_a_line_longer_than_the_limit_is_cut_and_the_read_moves_on(self):
+        (self.root / "min.js").write_text("x" * 20000 + "\nshort\n", encoding="utf-8")
+        output = self.tools.read_file("min.js")["output"]
+        self.assertIn(" [Rest of the line truncated]", output)
+        self.assertTrue(output.endswith("[Output limit reached. Continue from line 2.]"))
+        self.assertEqual(self.tools.read_file("min.js", start_line=2)["output"], "2: short")
 
     def test_explicit_short_range_has_no_note(self):
         output = self.tools.read_file(self.lines(200), start_line=5, end_line=10)["output"]

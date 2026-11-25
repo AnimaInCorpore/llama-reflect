@@ -14,7 +14,8 @@ from pathlib import Path
 
 _SPECS = {
     "read_file": (
-        "Read up to 80 numbered lines of a UTF-8 file. Line numbers are 1-based and inclusive.",
+        "Read numbered lines of a UTF-8 file, as many whole lines as fit in about 12,000 characters. Line "
+        "numbers are 1-based and inclusive. A result that stops early says where to continue.",
         {"path": "string", "start_line": "integer", "end_line": "integer"}, ["path"],
     ),
     "grep_search": (
@@ -318,17 +319,23 @@ class WorkspaceTools:
     def read_file(self, path, start_line=1, end_line=None):
         if start_line < 1 or (end_line is not None and end_line < start_line):
             raise ValueError("Expected positive line numbers with start_line <= end_line")
-        limit = min(end_line, start_line + 79) if end_line is not None else start_line + 79
-        count = limit - start_line + 1
+        # Whole lines up to the output limit. A fixed limit of 80 lines took 7 of a turn's 20 requests to read
+        # a 492-line file, while the context holds far more.
+        entries, size, stop = [], 0, None
         with self._file(path).open(encoding="utf-8") as source:
-            # Read one extra line to tell the model whether the file continues past the limit.
-            lines = [line.rstrip("\r\n") for line in islice(source, start_line - 1, limit + 1)]
-        more = len(lines) > count
-        output = "\n".join(f"{number}: {line}" for number, line in enumerate(lines[:count], start_line))
-        if len(output) > _OUTPUT_LIMIT:
-            output = output[:_OUTPUT_LIMIT] + "\n[Remaining output truncated]"
-        if more and (end_line is None or end_line > limit):
-            output += f"\n[Line limit reached. Continue from line {limit + 1}.]"
+            for number, line in enumerate(islice(source, start_line - 1, end_line), start_line):
+                entry = f"{number}: {line.rstrip(chr(13) + chr(10))}"
+                if entries and size + len(entry) + 1 > _OUTPUT_LIMIT:
+                    stop = number
+                    break
+                if len(entry) > _OUTPUT_LIMIT:
+                    # A single line longer than the limit, such as minified code, is cut so the read moves on.
+                    entry = entry[:_OUTPUT_LIMIT] + " [Rest of the line truncated]"
+                entries.append(entry)
+                size += len(entry) + 1
+        output = "\n".join(entries)
+        if stop is not None:
+            output += f"\n[Output limit reached. Continue from line {stop}.]"
         return {"output": output or "No lines in the requested range."}
 
     def grep_search(self, path, pattern):
