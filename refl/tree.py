@@ -60,7 +60,7 @@ class ConversationTree:
                 parent = node.parent_id
                 if (type(node.id) is not int or node.id != index or not isinstance(node.message, dict)
                         or node.message.get("role") not in {"system", "user", "assistant", "tool"}
-                        or node.branch_type not in {"main", "verification", "reflection"}
+                        or node.branch_type not in {"main", "verification", "reflection", "challenge"}
                         or node.status not in {"active", "merged", "pruned"}):
                     raise ValueError("Invalid conversation node")
                 if index == 0:

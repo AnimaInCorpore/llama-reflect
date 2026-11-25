@@ -13,9 +13,12 @@ _ids = itertools.count()
 class FakeServer:
     """Return scripted assistant messages in request order and record each request."""
 
-    def __init__(self, replies, *, moves_text=False, tokens=None):
+    def __init__(self, replies, *, moves_text=False, tokens=None, route=None):
         # A reply that is an exception is raised instead. `tokens` lists the context tokens each request reports.
+        # `route(request)` can answer a request by its content, such as a fork that runs concurrently with
+        # others. When it returns None, the request takes the next scripted reply.
         self.replies = list(replies)
+        self.route = route
         self.tokens = list(tokens or [])
         self.requests = []
         # True renders an assistant's text after its tool results, like Gemma 4's template. None has no
@@ -50,6 +53,11 @@ class FakeServer:
             "reasoning_effort": reasoning_effort,
             "session": session,
         })
+        routed = self.route(self.requests[-1]) if self.route else None
+        if routed is not None:
+            if isinstance(routed, Exception):
+                raise routed
+            return routed, None
         if not self.replies:
             raise AssertionError("Unexpected model request")
         reply = self.replies.pop(0)
@@ -80,11 +88,12 @@ def decision(role="Diagnosis", reason="It explains the failures.", first_step="R
 
 
 def make_engine(root, replies, *, max_turns=20, forks=True, verification=True, thinking="auto", moves_text=False,
-                tokens=None, context_size=None, thinking_budget=None, fork_effort=None, vision=False):
+                tokens=None, context_size=None, thinking_budget=None, fork_effort=None, vision=False, challenge=False, route=None):
+    """Without `challenge`, scripted replies need no answers for the critics."""
     events = []
     tree = ConversationTree(Path(root) / ".refl" / "sessions", SYSTEM_PROMPT)
-    server = FakeServer(replies, moves_text=moves_text, tokens=tokens)
+    server = FakeServer(replies, moves_text=moves_text, tokens=tokens, route=route)
     engine = Engine(server, "model", WorkspaceTools(root), tree, max_turns, 256, events.append,
                     forks=forks, verification=verification, thinking=thinking, context_size=context_size,
-                    thinking_budget=thinking_budget, fork_effort=fork_effort, vision=vision)
+                    thinking_budget=thinking_budget, fork_effort=fork_effort, vision=vision, challenge=challenge)
     return engine, server, events

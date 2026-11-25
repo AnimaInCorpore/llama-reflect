@@ -65,11 +65,26 @@ Resuming copies the saved tree into a new session file and continues from the sa
 5. Once a lookup succeeds, a verdict request contains the claim and the fresh workspace evidence. It uses `llama-server`'s JSON response format to request an explanation and a status of `supported`, `contradicted`, or `insufficient`. Reflect displays these as `VERIFIED`, `FALSE ASSUMPTION`, and `UNVERIFIED`. A useful explanation cites the file and line. If the request budget runs out or the server fails to provide a usable verdict, Reflect passes back `UNVERIFIED`.
 6. Reflect adds the verdicts to the main conversation and requests the next main response. Any further edits or commands run through the main branch's regular tool loop.
 
-`--no-verify` omits the verification instruction and skips verification forks while keeping strategic reflection. `--linear` skips both kinds of forks.
+`--no-verify` omits the verification instruction and skips verification forks while keeping strategic reflection and the plan challenge. `--linear` skips all kinds of forks.
 
 The verdict records the model's interpretation. The saved tool observation gives reviewers access to the evidence behind it. Live tests with a small model showed that a correct file read can still lead to an incorrect verdict label.
 
 Verification tests can exercise a claim that changes after an edit. Start with `status.txt` containing `old_ready`, check the claim with a tag, and let the main branch replace the value. Resume the session and check the old claim again. In the saved tree, the initial verdict should precede the edit, and the later verifier should report the old claim as false.
+
+## Plan challenge
+
+Verification checks claims that the model names, and reflection starts after a stall. Neither looks at a plan before the model acts on it. The plan challenge does, at the point where a plan turns into its first change. Reflect detects that point itself, so the challenge does not depend on a model that remembers to announce its plan.
+
+1. When a main-branch reply makes the task's first `write_file` or `edit_file` call to a path outside `.refl/`, Reflect defers the calls of that reply, as for a verification tag. Skills and strategy notes record work and do not start a challenge.
+2. Three critics fork from that reply in `challenge` branches and see the whole conversation, including the pending change. Their prompt asks them to assume that the plan fails. Requirements, Environment, and Edge cases each get one request with `read_file` and `grep_search`, with a tool call required, and one request for a structured answer: the objection, its evidence, a check, and a likelihood.
+3. Each objection goes to a verifier as soon as it is ready, as the claim that the planned change fails for that reason. A `contradicted` verdict drops the objection. `supported` makes it proven, and `insufficient` passes it on as unproven with its check.
+4. The main branch answers every objection in one request without tools and gives the first step of its revised plan. When it cannot tell whether an objection holds, it is asked to make that objection's check the first step.
+5. Each critic with a proven objection gets one request that judges the answer: `resolved` for a changed plan that removes the cause or a grounded reason why it does not apply, `unresolved` otherwise. A promise to be careful does not count. Open objections go back to the main branch for one more answer without tools. There is no further round, because the same model on both sides tends to agree without new evidence, and each round costs requests and context.
+6. The main branch then carries out the revised plan and reissues the deferred calls it still needs.
+
+The requests of a challenge come from a budget of 24 of their own, checked in `_complete` while the challenge runs. Counting them toward `--max-turns` would leave a task with the default of 20 only a few requests after a full challenge. When the budget runs out, the step that needed the request ends as for a verifier: a critic returns no objection, a verdict becomes `UNVERIFIED`, and a missing answer becomes a note that the main branch will take the objections into account. Each critic, verifier, and rebuttal sends its own `x-session-id`.
+
+In the first live test on Qwen3.8-Flash-Next, the request left out what `SPEC.md` and `check.py` require. All three critics found the spec, all three objections were proven, and the main branch read the spec and the check first and wrote a passing implementation on its first edit, in 43 seconds. Without the challenge the model also passed, in 9 seconds, because it ran `check.py` after a first naive version. The three critics converged on the same objection, so the roles overlap on a task with one obvious gap.
 
 ## Strategic reflection
 

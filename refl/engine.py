@@ -1,7 +1,11 @@
 import asyncio
 import json
 import re
+from pathlib import PurePosixPath
 
+from .challenge import ANSWER_PROMPT, CHALLENGE_PROMPT, CRITICS, EDIT_TOOLS, REBUTTAL_PROMPT, REBUTTAL_SCHEMA
+from .challenge import REQUESTS as CHALLENGE_REQUESTS
+from .challenge import answer_schema, format_objection, objection_of
 from .client import THINKING_BUDGET_MESSAGE, ContextLimitError, ServerError, TokenLimitError
 from .reflection import MANUAL, REFLECTION_PROMPT, TEMPERATURE_SLOTS, StallDetector
 from .tools import TOOLS
@@ -33,9 +37,10 @@ _READ_ONLY_TOOLS = [tool for tool in TOOLS if tool["function"]["name"] in _READ_
 _BASH_TOOLS = [tool for tool in TOOLS if tool["function"]["name"] == "bash"]
 _REVIEWERS = len(TEMPERATURE_SLOTS[0])
 _REVIEW_REQUESTS = 2  # at most, for a role with tools
-_ENGINE_PROMPTS = ("Verification results", "Reflection results", "Run the smoke check now.",
-                   "Carry out the plan now", "Your last reply reached the limit", "This is the final request",
-                   "The request limit of this turn is reached")
+_ENGINE_PROMPTS = ("Verification results", "Reflection results", "Plan challenge", "Unresolved objections",
+                   "Run the smoke check now.",
+                   "Carry out the plan now", "Carry out the revised plan now", "Your last reply reached the limit",
+                   "This is the final request", "The request limit of this turn is reached")
 # One request beyond the limit, so that a turn that ran out of requests still says where the task stands.
 _LIMIT_REPORT_PROMPT = (
     "The request limit of this turn is reached, and no tools remain. Report where the task stands: what is done, "
@@ -102,6 +107,16 @@ _DECISION_REQUEST = (
 # The role comes last, so the model names it after writing the plan and the label matches the plan.
 _DECISION_FIELDS = ("reason", "first_step", "role")
 _CARRY_OUT = "Carry out the plan now, starting with its first step."
+_CHALLENGE_REQUEST = (
+    "Before you act, answer each objection in one or two sentences: say whether it holds, and if it does, how "
+    "you change the plan. When an objection may hold and you cannot tell, make its check the first step. Then "
+    "give the first step of the revised plan. Do not call tools in this reply."
+)
+_UNRESOLVED_REQUEST = (
+    "Change the plan so that it removes their cause, or show from the conversation why they do not apply. Then "
+    "give the first step of the revised plan. Do not call tools in this reply."
+)
+_AFTER_CHALLENGE = "Carry out the revised plan now. Reissue the deferred calls that are still needed."
 
 
 def _proposal_schema(fields):
@@ -310,7 +325,7 @@ _CONTEXT_WARNINGS = (0.75, 0.9)
 class Engine:
     def __init__(self, server, model, workspace, tree, max_turns, max_tokens, on_tool, *, forks=True,
                  verification=True, thinking="auto", thinking_budget=None, fork_effort=None, context_size=None,
-                 vision=False):
+                 vision=False, challenge=True):
         self.server = server
         self.model = model
         self.workspace = workspace
@@ -322,6 +337,11 @@ class Engine:
         self.on_tool = on_tool
         self.forks = forks
         self.verification = forks and verification
+        # Whether critics challenge the plan before the first file change of a task, and whether they did.
+        self.challenge = forks and challenge
+        self.challenged = False
+        # Requests left in the running challenge, which has a budget of its own, or None outside one.
+        self.challenge_left = None
         if thinking not in THINKING_MODES:
             raise ValueError(f"Unknown thinking mode {thinking!r}")
         self.thinking = thinking
@@ -395,7 +415,11 @@ class Engine:
     async def _complete(self, messages, tools, *, fork=False, response_format=None, temperature=0.0,
                         tool_choice=None, branch=None):
         """Request a completion. `branch` names a fork by the ID of its first node, so it gets its own session."""
-        if self.requests_left is not None:
+        if self.challenge_left is not None:
+            if self.challenge_left <= 0:
+                raise TurnLimitError("The plan challenge used all of its requests.")
+            self.challenge_left -= 1
+        elif self.requests_left is not None:
             if self.requests_left <= (1 if fork else 0):
                 raise TurnLimitError("No model requests remain for this step.")
             self.requests_left -= 1
@@ -460,15 +484,16 @@ class Engine:
         except (OSError, RuntimeError, ValueError) as error:
             self.on_tool(f"Strategy log unavailable: {error}")
 
-    async def _observe(self, leaf, calls, *, branch_type="main", defer=False, stalls=None):
+    async def _observe(self, leaf, calls, *, branch_type="main", defer=None, stalls=None):
+        """Run the calls, or answer each with a note to reissue it after reviewing `defer`, if given."""
         read_only = branch_type != "main"
-        prefix = {"verification": "verify ", "reflection": "reflect "}.get(branch_type, "")
+        prefix = {"verification": "verify ", "reflection": "reflect ", "challenge": "challenge "}.get(branch_type, "")
         evidence = []
         for call in calls:
             function = call["function"]
             name = function["name"]
             if defer:
-                result = {"error": "Tool call deferred. Reissue it after reviewing the verification verdict."}
+                result = {"error": f"Tool call deferred. Reissue it after reviewing {defer}."}
             elif read_only and name not in _READ_ONLY_NAMES:
                 result = {"error": f"{name} is unavailable in a read-only {branch_type} fork."}
             else:
@@ -694,6 +719,182 @@ class Engine:
         if self.tree.nodes[self.tree.head].message["role"] in {"user", "tool"}:
             self.tree.append({"role": "assistant", "content": "[The previous turn ended before a final answer.]"})
 
+    def _first_change(self, calls):
+        """Whether the calls make the task's first change to a project file, which starts a challenge."""
+        if not self.challenge or self.challenged:
+            return False
+        for call in calls:
+            if call["function"]["name"] not in EDIT_TOOLS:
+                continue
+            try:
+                path = json.loads(call["function"]["arguments"])["path"]
+            except (KeyError, TypeError, ValueError):
+                continue
+            # Skills and strategy notes under .refl/ record the work rather than change the project.
+            if isinstance(path, str) and path.strip() and PurePosixPath(path.replace("\\", "/")).parts[:1] != (".refl",):
+                return True
+        return False
+
+    async def _challenge(self, calls):
+        """Have critics argue why the plan fails, prove their objections, and make the main branch answer them.
+
+        The requests come from a budget of their own, so the task keeps all of its --max-turns.
+        """
+        self.challenged = True
+        self.challenge_left = CHALLENGE_REQUESTS
+        try:
+            await self._run_challenge(calls)
+        finally:
+            self.challenge_left = None
+
+    async def _run_challenge(self, calls):
+        anchor = self.tree.head
+        pending = "; ".join(_call_summary(call["function"]) for call in calls
+                            if call["function"]["name"] in EDIT_TOOLS)
+        self.on_tool(f"Challenge\nLooking for reasons the plan fails before its first change: {pending}")
+        # Each critic's objection goes to a verifier as soon as it is ready.
+        results = await asyncio.gather(*(self._object(anchor, critic, pending) for critic in CRITICS))
+        proven, unproven = [], []
+        for critic, result in zip(CRITICS, results):
+            if result is None:
+                continue
+            answer, verdict = result
+            line = f"- {critic.name}: {format_objection(answer)[:800]}"
+            label, _, detail = verdict.partition("] ")
+            if label == "[VERIFIED":
+                proven.append((critic, answer, f"{line} Verifier: {detail}"))
+            elif label == "[FALSE ASSUMPTION":
+                self.on_tool(f"Challenge\nDropped the {critic.name} objection: {detail}")
+            else:
+                unproven.append(f"{line} Not proven: {detail}")
+        if not proven and not unproven:
+            self.on_tool("Challenge\nNo objection held up.")
+            self.tree.append({"role": "user", "content": (
+                f"Plan challenge\nNo objection to the plan held up in the workspace. {_AFTER_CHALLENGE}")})
+            return
+
+        sections = []
+        if proven:
+            sections.append("Proven objections\n" + "\n".join(line for _, _, line in proven))
+        if unproven:
+            sections.append("Unproven objections\n" + "\n".join(unproven))
+        summary = "\n\n".join(sections)
+        self.on_tool(f"Challenge\n{summary}")
+        self.tree.append({"role": "user", "content": (
+            f"Plan challenge\nBefore your first change ({pending}), critics assumed that your plan fails and looked "
+            f"for the reasons. A verifier checked each objection in the workspace.\n\n{summary}\n\n"
+            f"{_CHALLENGE_REQUEST}")})
+        await self._answer_objections()
+
+        # One rebuttal round: each critic whose objection was proven judges the answer to it.
+        if proven:
+            rebuttal_anchor = self.tree.head
+            reasons = await asyncio.gather(*(self._rebut(rebuttal_anchor, critic, answer)
+                                             for critic, answer, _ in proven))
+            unresolved = [f"- {critic.name}: {objection_of(answer)} Still open: {reason}"
+                          for (critic, answer, _), reason in zip(proven, reasons) if reason]
+            if unresolved:
+                text = "\n".join(unresolved)
+                self.on_tool(f"Challenge\nUnresolved objections\n{text}")
+                self.tree.append({"role": "user", "content": (
+                    f"Unresolved objections\nThe critics whose objections were proven say that your answer does "
+                    f"not resolve these yet.\n\n{text}\n\n{_UNRESOLVED_REQUEST}")})
+                await self._answer_objections()
+            else:
+                self.on_tool("Challenge\nThe revised plan resolves the proven objections.")
+        self.tree.append({"role": "user", "content": _AFTER_CHALLENGE})
+
+    async def _answer_objections(self):
+        """Have the main branch answer the objections in the last message, without tools."""
+        try:
+            message = await self._complete(self._messages(self.tree.head), [])
+            answer = message.get("content")
+            if _tool_calls(message) or not isinstance(answer, str) or not answer.strip():
+                raise ServerError("Expected a text answer to the objections.")
+        except (ServerError, TurnLimitError) as error:
+            self.on_tool(f"Challenge\nNo answer to the objections: {error}")
+            answer = "I will take the objections into account."
+        else:
+            answer = answer.strip()
+            self.on_tool(f"Challenge\nAnswer\n{answer}")
+        self.tree.append({"role": "assistant", "content": answer})
+
+    async def _object(self, anchor, critic, pending):
+        """Return a critic's answer and the verifier's verdict on its objection, or None without one."""
+        answer = await self._critique(anchor, critic, pending)
+        if answer is None:
+            return None
+        verdict = await self._verify(anchor, f"The planned change ({pending}) fails: {objection_of(answer)}")
+        return answer, verdict
+
+    async def _critique(self, anchor, critic, pending):
+        """Run one critic in a read-only fork and return its structured answer, or None without an objection."""
+        self.on_tool(f"Challenging as {critic.name}")
+        start = leaf = self.tree.append({
+            "role": "user",
+            "content": f"Critic role: {critic.name}\nPlanned first change: {pending}\n\n{critic.focus}",
+        }, parent_id=anchor, branch_type="challenge")
+        role = f"Your role: {critic.name}. {critic.focus}"
+        reason = "The critic returned no objection."
+        try:
+            # One request to gather evidence, then the answer without tools, as for a reflection reviewer.
+            message = await self._complete(self._messages(leaf, system_prompt=f"{CHALLENGE_PROMPT}\n\n{role}"),
+                                           _READ_ONLY_TOOLS, fork=True, temperature=critic.temperature,
+                                           tool_choice="required", branch=start)
+            calls = _tool_calls(message)
+            leaf = self.tree.append(message, parent_id=leaf, branch_type="challenge")
+            if calls:
+                leaf, _ = await self._observe(leaf, calls, branch_type="challenge")
+            leaf = self.tree.append({
+                "role": "user",
+                "content": "Give your answer now using the evidence already in the conversation.",
+            }, parent_id=leaf, branch_type="challenge")
+            message = await self._complete(
+                self._messages(leaf, system_prompt=f"{CHALLENGE_PROMPT} {ANSWER_PROMPT}\n\n{role}"), [], fork=True,
+                response_format=answer_schema(), temperature=critic.temperature, branch=start,
+            )
+            if _tool_calls(message):
+                raise ServerError("The critic called a tool on its final request.")
+            leaf = self.tree.append(message, parent_id=leaf, branch_type="challenge")
+            try:
+                answer = json.loads(message.get("content") or "")
+            except (TypeError, ValueError):
+                answer = None
+            if objection_of(answer):
+                self.tree.finish_fork(leaf, anchor, "merged")
+                return answer
+        except (ServerError, TurnLimitError) as error:
+            reason = str(error)
+
+        self.tree.finish_fork(leaf, anchor, "pruned")
+        self.on_tool(f"Challenge {critic.name}: {reason}")
+        return None
+
+    async def _rebut(self, anchor, critic, answer):
+        """Have a critic judge the main branch's answer to its proven objection. Return why it is still open."""
+        start = leaf = self.tree.append({
+            "role": "user",
+            "content": (f"Critic role: {critic.name}\nYour proven objection: {objection_of(answer)}\n\n"
+                        f"Does the main branch's last reply resolve it?"),
+        }, parent_id=anchor, branch_type="challenge")
+        try:
+            message = await self._complete(
+                self._messages(leaf, system_prompt=f"{REBUTTAL_PROMPT}\n\nYour role: {critic.name}. {critic.focus}"),
+                [], fork=True, response_format=REBUTTAL_SCHEMA, branch=start,
+            )
+            leaf = self.tree.append(message, parent_id=leaf, branch_type="challenge")
+            verdict = json.loads(message.get("content") or "")
+            status, reason = verdict["status"], " ".join(str(verdict["reason"]).split())
+            if status not in ("resolved", "unresolved"):
+                raise ValueError(f"unknown status {status!r}")
+        except (ServerError, TurnLimitError, AttributeError, KeyError, TypeError, ValueError) as error:
+            self.tree.finish_fork(leaf, anchor, "pruned")
+            self.on_tool(f"Challenge {critic.name}: no rebuttal ({error})")
+            return None
+        self.tree.finish_fork(leaf, anchor, "merged")
+        self.on_tool(f"Challenge {critic.name}: {status}. {reason}")
+        return (reason or "No reason given.") if status == "unresolved" else None
+
     async def reflect(self):
         if not self.forks:
             raise ValueError("Run refl without --linear to use /reflect.")
@@ -708,6 +909,7 @@ class Engine:
     async def respond(self, prompt):
         self.stalls.start_turn()
         self.verdicts = {}
+        self.challenged = False
         self.wrote_files = False
         self._close_unfinished_round()
         self.tree.append({"role": "user", "content": prompt})
@@ -799,8 +1001,16 @@ class Engine:
             if not calls and not answer.strip():
                 raise ServerError("Model returned neither an answer nor a tool call")
 
+            # The challenge has its own requests, but the plan needs at least one more of the turn's.
+            challenge = not claims and self.requests_left >= 1 and self._first_change(calls)
             leaf = self.tree.append(message)
-            await self._observe(leaf, calls, defer=bool(claims), stalls=self.stalls if self.forks else None)
+            defer = "the verification verdict" if claims else "the plan challenge" if challenge else None
+            await self._observe(leaf, calls, defer=defer, stalls=self.stalls if self.forks else None)
+            if challenge:
+                self.tree.save()
+                await self._challenge(calls)
+                self.tree.save()
+                continue
             if claims:
                 anchor = self.tree.head
                 verdicts = await asyncio.gather(*(self._verify(anchor, claim) for claim in claims))

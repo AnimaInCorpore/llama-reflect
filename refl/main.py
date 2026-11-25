@@ -163,7 +163,8 @@ async def _run(args):
 
     tree = _open_tree(root, args.resume)
     engine = Engine(server, model, workspace, tree, args.max_turns, args.max_tokens, _status,
-                    forks=not args.linear, verification=not args.no_verify, thinking=args.thinking,
+                    forks=not args.linear, verification=not args.no_verify, challenge=not args.no_challenge,
+                    thinking=args.thinking,
                     thinking_budget=args.thinking_budget, fork_effort=args.fork_effort,
                     context_size=properties.context_size, vision=properties.vision is True)
     if args.prompt is not None:
@@ -198,9 +199,11 @@ def main(argv=None):
     parser.add_argument("--workspace", type=Path, default=Path.cwd(), help="workspace root (default: current directory)")
     parser.add_argument("--resume", metavar="SESSION_ID", help="continue a saved conversation in a new session")
     parser.add_argument("--bash", help="Bash executable (default: detect Bash)")
-    parser.add_argument("--linear", action="store_true", help="run the main tool loop with both kinds of forks disabled")
+    parser.add_argument("--linear", action="store_true", help="run the main tool loop with all kinds of forks disabled")
     parser.add_argument("--no-verify", action="store_true",
                         help="disable verification forks and keep strategic reflection")
+    parser.add_argument("--no-challenge", action="store_true",
+                        help="skip the critics that challenge the plan before the first file change of a task")
     parser.add_argument("--thinking", choices=THINKING_MODES, default="off",
                         help="off: ask the chat template to skip thinking for every request; auto: the chat template "
                              "decides; main: think on the main branch only (default: off)")

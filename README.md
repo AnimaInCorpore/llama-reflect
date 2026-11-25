@@ -1,6 +1,6 @@
 # Reflect
 
-`refl` is a local coding agent for `llama-server`. It keeps each conversation as a tree with persistent sessions, checks claims in read-only verification forks, and starts read-only reflection forks when it notices that a task has stalled.
+`refl` is a local coding agent for `llama-server`. It keeps each conversation as a tree with persistent sessions, checks claims in read-only verification forks, has critics challenge the plan before the first file change of a task, and starts read-only reflection forks when it notices that a task has stalled.
 
 ## Install
 
@@ -109,8 +109,9 @@ Omit the prompt for an interactive session, and type `/exit` or send EOF to quit
 | `--workspace DIR` | Current directory | Project root for tools, sessions, and skills |
 | `--resume SESSION_ID` | | Continue a saved conversation in a new session |
 | `--bash PATH` | Detected | Bash executable for the `bash` tool |
-| `--linear` | Off | Run the main loop without verification or reflection forks |
+| `--linear` | Off | Run the main loop without verification, challenge, or reflection forks |
 | `--no-verify` | Off | Keep strategic reflection and skip verification forks |
+| `--no-challenge` | Off | Skip the critics that challenge the plan before the first file change of a task |
 | `--thinking off\|auto\|main` | `off` | No thinking step, one when the chat template decides so, or one on the main branch only |
 | `--fork-effort LEVEL` | Template default | Reasoning effort for verifier and reviewer requests, such as `low` |
 | `--max-turns N` | 20 | Model requests per prompt, counted across all branches. When they run out, one more request without tools reports where the task stands, and a follow-up such as `continue` goes on from there |
@@ -148,6 +149,12 @@ When a completed model reply contains `<verify>specific claim</verify>`, Reflect
 ```text
 refl "Before editing settings.py, emit <verify>settings.py defines MAX_RETRIES</verify>. Use the verdict to decide what to edit."
 ```
+
+## Plan challenge
+
+Before the first `write_file` or `edit_file` call of a task, Reflect holds the call back and lets three read-only critics assume that the plan will fail. Requirements compares it with the request and any spec, tests, or documentation, Environment checks what it assumes about files, tools, and configuration, and Edge cases looks for an input or caller that breaks. Each critic reads the workspace once and names its most likely objection with evidence and a check. A verifier then checks each objection in the workspace. Refuted objections are dropped, and the main branch gets the rest as proven or unproven. It has to answer each one without tools and revise its plan. Each critic whose objection was proven then judges that answer once, and an objection it still finds open goes back to the main branch one more time. Then the main branch reissues its change or a better one.
+
+The challenge runs once per task, skips changes under `.refl/`, and does not catch changes made only through Bash. Its requests come from a budget of 24 of their own, so they do not count toward `--max-turns`. With three server slots, the critics run at the same time. On a 27B model a challenge took about half a minute. In that test the model solved the task without the challenge as well, because a check in the workspace caught its first attempt. [Plan challenge](docs/design.md#plan-challenge)
 
 ## Strategic reflection
 
