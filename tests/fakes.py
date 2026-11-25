@@ -142,7 +142,7 @@ def reflection_route(ideas=None, statuses=None, status="supported", facts="a.txt
 
 
 def make_engine(root, replies, *, max_turns=20, forks=True, verification=True, thinking="auto", moves_text=False,
-                tokens=None, context_size=None, thinking_budget=None, fork_effort=None, vision=False, challenge=False, route=None,
+                tokens=None, context_size=None, thinking_budget=None, fork_effort=None, vision=False, challenge=False, route=None, fork_thinking_budget=None,
                 on_progress=None):
     """Without `challenge`, scripted replies need no answers for the critics."""
     events = []
@@ -151,5 +151,6 @@ def make_engine(root, replies, *, max_turns=20, forks=True, verification=True, t
     engine = Engine(server, "model", WorkspaceTools(root), tree, max_turns, 256, events.append,
                     forks=forks, verification=verification, thinking=thinking, context_size=context_size,
                     thinking_budget=thinking_budget, fork_effort=fork_effort, vision=vision, challenge=challenge,
+                    fork_thinking_budget=fork_thinking_budget,
                     on_progress=on_progress)
     return engine, server, events

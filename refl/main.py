@@ -202,6 +202,7 @@ async def _run(args):
                     forks=not args.linear, verification=not args.no_verify, challenge=not args.no_challenge,
                     thinking=args.thinking,
                     thinking_budget=args.thinking_budget, fork_effort=args.fork_effort,
+                    fork_thinking_budget=args.fork_thinking_budget,
                     context_size=properties.context_size, vision=properties.vision is True,
                     on_progress=_PANEL.progress if _PANEL is not None else None)
     if args.prompt is not None:
@@ -255,6 +256,9 @@ def main(argv=None):
     parser.add_argument("--thinking-budget", type=_thinking_budget, metavar="N",
                         help="thinking tokens per request before the server ends the thinking block; -1 sets no "
                              "limit (default: half of --max-tokens)")
+    parser.add_argument("--fork-thinking-budget", type=_thinking_budget, metavar="N",
+                        help="thinking tokens per request of a critic, verifier, reviewer, or the moderator; -1 sets "
+                             "no limit (default: 4096, or the main budget if that is smaller)")
     parser.add_argument("--timeout", type=_positive_int, default=1200,
                         help="model request timeout in seconds (default: 1200)")
     parser.add_argument("--verbose", action="store_true",

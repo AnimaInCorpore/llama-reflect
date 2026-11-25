@@ -108,6 +108,56 @@ class EngineTest(unittest.TestCase):
         self.assertEqual(asyncio.run(engine.respond("Update the status.")), "Final.")
         self.assertEqual(sum(event.startswith("Verifying") for event in events), 2)
 
+    def test_a_turn_that_ends_with_the_smoke_check_also_reports(self):
+        (self.root / "a.txt").write_text("a\n", encoding="utf-8")
+        replies = [call("read_file", path="missing.txt"), call("read_file", path="missing.txt")]
+        replies += [call("write_file", path="a.txt", content="b\n")]
+        replies += [call("read_file", path="a.txt", start_line=1, end_line=line) for line in range(1, 4)]
+        replies += [call("bash", command="cat a.txt"), text("Fixed a.txt. Nothing is open.")]
+        engine, server, _ = make_engine(self.root, replies, max_turns=7, route=reflection_route())
+        answer = asyncio.run(engine.respond("Fix it."))
+        self.assertEqual(answer, "Fixed a.txt. Nothing is open.\n\nSmoke check exited with code 0.\nb")
+        self.assertTrue(server.requests[-1]["messages"][-1]["content"].startswith("The request limit"))
+        self.assertEqual(server.requests[-1]["tools"], [])
+
+    def test_the_answer_is_kept_for_the_next_session(self):
+        engine, server, _ = make_engine(self.root, [text("The beach renders."), text("Picking up.")])
+        self.assertEqual(asyncio.run(engine.respond("Fix the beach.")), "The beach renders.")
+        report = (engine.tree.path.parent / "last-report.md").read_text(encoding="utf-8")
+        self.assertEqual(report, f"# Last report\n\nSession: {engine.tree.path.stem}\n\nRequest: Fix the beach.\n\n"
+                                 "The beach renders.\n")
+        self.assertNotIn("last-report.md", server.requests[0]["system"])
+        asyncio.run(engine.respond("resume"))
+        self.assertIn("is in .refl/sessions/last-report.md. Read it first when the user asks to resume",
+                      server.requests[1]["system"])
+
+    def test_forks_think_with_a_budget_of_their_own(self):
+        engine, server, _ = make_engine(self.root, [text(_CLAIM), call("read_file", path="status.txt"), verdict(),
+                                                    text("Done.")], thinking_budget=10000)
+        asyncio.run(engine.respond("Check."))
+        budgets = [request["thinking_budget"] for request in server.requests]
+        self.assertEqual(budgets, [10000, 4096, 4096, 10000])
+        for main, fork, expected in ((100, None, 100), (10000, 500, 500), (10000, -1, None)):
+            engine, server, _ = make_engine(self.root, [text(_CLAIM), call("read_file", path="status.txt"),
+                                                        verdict(), text("Done.")],
+                                            thinking_budget=main, fork_thinking_budget=fork)
+            asyncio.run(engine.respond("Check."))
+            self.assertEqual(server.requests[1]["thinking_budget"], expected)
+
+    def test_reads_in_a_held_back_reply_run_now(self):
+        engine, server, _ = make_engine(self.root, [
+            {"role": "assistant", "content": _CLAIM, "tool_calls": [
+                *call("read_file", path="status.txt")["tool_calls"],
+                *call("write_file", path="status.txt", content="new_ready\n")["tool_calls"]]},
+            call("read_file", path="status.txt"), verdict(),
+            call("write_file", path="status.txt", content="new_ready\n"), text("Done."),
+        ])
+        self.assertEqual(asyncio.run(engine.respond("Update the status.")), "Done.")
+        results = [node.message["content"] for node in engine.tree.nodes
+                   if node.branch_type == "main" and node.message["role"] == "tool"][:2]
+        self.assertIn("old_ready", results[0])
+        self.assertIn("Tool call deferred", results[1])
+
     def test_smoke_check_request_answered_in_text(self):
         (self.root / "a.txt").write_text("a\n", encoding="utf-8")
         replies = [call("read_file", path="missing.txt"), call("read_file", path="missing.txt")]

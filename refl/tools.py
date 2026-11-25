@@ -460,6 +460,11 @@ class WorkspaceTools:
         if not command.strip() or timeout_seconds < 1:
             raise ValueError("Expected a command and a positive timeout")
         env = os.environ.copy()
+        # Python on Windows reads files and writes its output in the console's code page, such as cp1252, unless
+        # told otherwise. In one session, json.load of a UTF-8 file and a print of "→" both failed that way, and
+        # the failure led to a false stall. The user's own settings win.
+        env.setdefault("PYTHONUTF8", "1")
+        env.setdefault("PYTHONIOENCODING", "utf-8")
         if os.name == "nt":
             directory = self.bash_executable.parent
             usr_bin = directory.parent / "usr/bin"

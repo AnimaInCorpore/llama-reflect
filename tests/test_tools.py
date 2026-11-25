@@ -288,6 +288,14 @@ class BashTest(unittest.TestCase):
     def test_exit_code_and_output(self):
         self.assertEqual(self.tools.bash("echo hi; exit 3"), {"exit_code": 3, "output": "hi\n"})
 
+    def test_python_in_bash_reads_and_writes_utf8(self):
+        # On a cp1252 console, Python failed to read a UTF-8 file and to print an arrow.
+        (self.root / "note.txt").write_text("→ Größe\n", encoding="utf-8")
+        result = self.tools.bash("echo $PYTHONUTF8 $PYTHONIOENCODING")
+        self.assertEqual(result, {"exit_code": 0, "output": "1 utf-8\n"})
+        with mock.patch.dict("os.environ", {"PYTHONIOENCODING": "latin-1"}):
+            self.assertEqual(self.tools.bash("echo $PYTHONIOENCODING")["output"], "latin-1\n")
+
     def test_backslashes_reach_bash_unchanged(self):
         # As a -c argument on Windows, the backslashes were halved: a Python heredoc saw "a\nb", not "a\\nb".
         python = Path(sys.executable).as_posix()

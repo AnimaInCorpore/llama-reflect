@@ -26,7 +26,7 @@ python -m refl --help
 
 pip often puts `refl.exe` in a `Scripts` folder that is not on `PATH`, for example with Python from the Microsoft Store, and names that folder in a warning. After the install, `python -m refl` works from any directory, so use it wherever this README calls `refl`. Python looks for the modules it needs to start `-m` in the current folder first, so a project file such as `types.py` stops it with "Could not import runpy module". Start Reflect from another folder with `--workspace` in that case.
 
-The `bash` tool needs Bash from MSYS2 or Git for Windows. Reflect finds `C:\msys64\usr\bin\bash.exe` and the Bash that comes with Git for Windows on its own. It skips the `bash.exe` in the Windows folder, which starts WSL.
+The `bash` tool needs Bash from MSYS2 or Git for Windows. Reflect finds `C:\msys64\usr\bin\bash.exe` and the Bash that comes with Git for Windows on its own. It skips the `bash.exe` in the Windows folder, which starts WSL. Commands run with `PYTHONUTF8=1` and `PYTHONIOENCODING=utf-8` unless you set them, so Python reads and prints UTF-8 instead of the console's code page.
 
 ripgrep is optional. winget installs it and adds it to `PATH` for new PowerShell windows:
 
@@ -117,6 +117,7 @@ Omit the prompt for an interactive session, and type `/exit` or send EOF to quit
 | `--max-turns N` | 40 | Model requests per prompt for the main branch and the checks of its claims. The plan challenge and reflection have budgets of their own. When they run out, one more request without tools reports where the task stands, and a follow-up such as `continue` goes on from there |
 | `--max-tokens N` | 32768 | Output tokens per request, thinking included |
 | `--thinking-budget N` | Half of `--max-tokens` | Thinking tokens per request before the server ends the thinking block. `-1` sets no limit |
+| `--fork-thinking-budget N` | 4096 | The same for each request of a critic, verifier, reviewer, or the moderator. `-1` sets no limit |
 | `--timeout SECONDS` | 1200 | Time per model request, including any wait for a free slot |
 | `--verbose` | Off | Show every step of the checks, the plan challenge, and reflection, not only their summary lines, and the whole thinking of each reply |
 | `--no-status` | Off | Skip the live status panel at the bottom of the terminal |
@@ -151,11 +152,11 @@ The file tools protect existing instruction and configuration files of other cod
 
 ## Sessions
 
-Reflect saves the main conversation and its forks in `.refl/sessions/<session-id>.json` inside the workspace and adds a `.gitignore` there so Git skips them. It prints the session ID at startup and saves when a prompt is accepted and after each completed round. Use `--resume <session-id>` in the same workspace to continue the saved main branch in a new session. A new session names the latest earlier one at startup, with the `--resume` command to continue it.
+Reflect saves the main conversation and its forks in `.refl/sessions/<session-id>.json` inside the workspace and adds a `.gitignore` there so Git skips them. It prints the session ID at startup and saves when a prompt is accepted and after each completed round. Use `--resume <session-id>` in the same workspace to continue the saved main branch in a new session. A new session names the latest earlier one at startup, with the `--resume` command to continue it. Each turn's final answer, or its report when it ran out of requests, is kept in `.refl/sessions/last-report.md`, and the main branch is told to read it first when you ask it to resume or continue.
 
 ## Verification
 
-When a completed model reply contains `<verify>specific claim</verify>`, Reflect starts a verifier with the conversation up to that point. Each verifier has up to three model requests and can use `read_file`, `grep_search`, and `view_image` when the server takes images. Distinct claims in the same reply run concurrently. Tool calls in that reply are deferred so the main branch can act on the verdicts. A claim checked earlier in the same task keeps its verdict until a Bash command or file change.
+When a completed model reply contains `<verify>specific claim</verify>`, Reflect starts a verifier with the conversation up to that point. Each verifier has up to three model requests and can use `read_file`, `grep_search`, and `view_image` when the server takes images. Distinct claims in the same reply run concurrently. Changes in that reply, edits and Bash commands, are deferred so the main branch can act on the verdicts. Reads in it run at once. A claim checked earlier in the same task keeps its verdict until a Bash command or file change.
 
 ```text
 refl "Before editing settings.py, emit <verify>settings.py defines MAX_RETRIES</verify>. Use the verdict to decide what to edit."

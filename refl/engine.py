@@ -61,6 +61,9 @@ def _elapsed(start):
     return f"{seconds} s" if seconds < 60 else f"{seconds // 60} min {seconds % 60} s"
 
 
+# Where the answer that ended the latest turn is kept, in the session folder, which Git ignores.
+_LAST_REPORT = "last-report.md"
+
 _PROMPT_START = (
     "You are Reflect, a coding agent working in the current workspace. "
     "Use the provided tools to carry out the user's request. Use workspace-relative paths. "
@@ -204,6 +207,10 @@ def _format_proposal(answer):
 # auto leaves thinking to the chat template, off disables it for every request, and main keeps it
 # only for main-branch requests.
 THINKING_MODES = ("auto", "off", "main")
+# The default thinking budget of a fork request. Critics and verifiers averaged about 1,000 tokens of thinking.
+FORK_THINKING_BUDGET = 4096
+
+
 def default_thinking_budget(max_tokens):
     """Give half of the output limit to thinking, so the answer keeps the other half.
 
@@ -385,7 +392,7 @@ _CONTEXT_WARNINGS = (0.75, 0.9)
 class Engine:
     def __init__(self, server, model, workspace, tree, max_turns, max_tokens, on_tool, *, forks=True,
                  verification=True, thinking="auto", thinking_budget=None, fork_effort=None, context_size=None,
-                 vision=False, challenge=True, on_progress=None):
+                 vision=False, challenge=True, on_progress=None, fork_thinking_budget=None):
         self.server = server
         self.model = model
         self.workspace = workspace
@@ -411,6 +418,12 @@ class Engine:
         if thinking_budget is None:
             thinking_budget = default_thinking_budget(max_tokens)
         self.thinking_budget = thinking_budget if thinking_budget >= 0 else None
+        # Thinking tokens per fork request: critics, verifiers, reviewers, and the moderator answer one narrow
+        # question. In one session, a verdict on a single claim thought about 9,000 tokens. -1 sets no limit.
+        if fork_thinking_budget is None:
+            fork_thinking_budget = FORK_THINKING_BUDGET if thinking_budget < 0 else min(FORK_THINKING_BUDGET,
+                                                                                         thinking_budget)
+        self.fork_thinking_budget = fork_thinking_budget if fork_thinking_budget >= 0 else None
         # Reasoning effort for verifier and reviewer requests that think, such as "low". None keeps the
         # template's default.
         self.fork_effort = fork_effort
@@ -481,6 +494,13 @@ class Engine:
         count[1] += total
         self._progress(**{name: tuple(count)})
 
+    def _last_report_note(self):
+        """A note on the kept report of the latest turn, for the main branch's system prompt, or ""."""
+        if not (self.tree.path.parent / _LAST_REPORT).is_file():
+            return ""
+        return (f"\n\nThe answer that ended the latest turn in this workspace, possibly in an earlier session, is "
+                f"in .refl/sessions/{_LAST_REPORT}. Read it first when the user asks to resume or continue.")
+
     def _messages(self, leaf, *, system_prompt=None):
         messages = self.tree.messages(leaf)
         if system_prompt is not None:
@@ -495,6 +515,8 @@ class Engine:
         # current instructions.
         system = system_prompt or (SYSTEM_PROMPT if self.verification else _NO_VERIFY_PROMPT)
         system += "\n\n" + _PROJECT_WRITE_RULE + "\n\n" + _DEPENDENCY_RULE
+        if system_prompt is None:
+            system += self._last_report_note()
         guidance = self.workspace.project_guidance()
         if guidance:
             system += "\n\nProject guidance from REFLECT.md:\n" + guidance
@@ -553,6 +575,7 @@ class Engine:
                 raise TurnLimitError("No model requests remain for this step.")
             self.requests_left -= 1
         thinking = self.thinking == "auto" or (self.thinking == "main" and not fork)
+        budget = self.fork_thinking_budget if fork else self.thinking_budget
         if not fork and self.batch_name is None:
             self._progress(phase="Next step, thinking" if thinking else "Next step")
         if self.split_text is None:
@@ -568,7 +591,7 @@ class Engine:
                 message, tokens = await self.server.complete(self.model, messages, tools, self.max_tokens,
                                                              response_format=response_format, temperature=temperature,
                                                              thinking=thinking, tool_choice=tool_choice,
-                                                             thinking_budget=self.thinking_budget,
+                                                             thinking_budget=budget,
                                                              reasoning_effort=self.fork_effort if fork else None,
                                                              session=self._session(branch),
                                                              **({"on_text": stream} if stream else {}))
@@ -583,7 +606,7 @@ class Engine:
             # The main branch's thinking, shown when its reply arrives. Requests do not stream, so not sooner.
             self.on_tool("Thinking\n" + reasoning.strip())
         if thinking and isinstance(reasoning, str) and reasoning.rstrip().endswith(THINKING_BUDGET_MESSAGE):
-            self.on_tool(f"Thinking stopped at its budget of {self.thinking_budget:,} tokens")
+            self.on_tool(f"Thinking stopped at its budget of {budget:,} tokens")
         if not fork and tokens and self.context_size:
             self._check_context(tokens)
         return message
@@ -641,7 +664,9 @@ class Engine:
         for call in calls:
             function = call["function"]
             name = function["name"]
-            if defer:
+            if defer and name not in _READ_ONLY_NAMES:
+                # Reads change nothing, so they run now. In one session a grep held back with an edit had to be
+                # reissued after the plan check.
                 result = {"error": f"Tool call deferred. Reissue it after reviewing {defer}."}
             elif read_only and name not in _READ_ONLY_NAMES:
                 result = {"error": f"{name} is unavailable in a read-only {branch_type} fork."}
@@ -1238,17 +1263,33 @@ class Engine:
         self.tree.save()
         self.requests_left = self.max_turns
         try:
-            return await self._respond()
+            answer = await self._respond()
+            self._keep_report(prompt, answer)
+            return answer
         except (ServerError, TurnLimitError) as error:
             note = f"[Turn stopped] {error}"
             # The report and the note form one reply, so the conversation keeps alternating between roles.
             report = getattr(error, "report", None)
+            if report:
+                self._keep_report(prompt, f"{report}\n\n{note}")
             self.tree.append({"role": "assistant", "content": f"{report}\n\n{note}" if report else note})
             self.tree.save()
             raise
         finally:
             self.track_strategy = False
             self.requests_left = None
+
+    def _keep_report(self, prompt, answer):
+        """Keep the turn's answer in .refl/sessions/last-report.md, so that a later session can pick up from it.
+
+        A model asked to "resume" in a new session spent eight requests reading raw session logs instead.
+        """
+        path = self.tree.path.parent / _LAST_REPORT
+        try:
+            path.write_text(f"# Last report\n\nSession: {self.tree.path.stem}\n\nRequest: {prompt}\n\n{answer}\n",
+                            encoding="utf-8")
+        except OSError as error:
+            self.on_tool(f"Last report unavailable: {error}")
 
     async def _final_answer(self):
         """Ask for the answer on the last request of a task that changed no file, where a smoke check has nothing to
@@ -1291,7 +1332,14 @@ class Engine:
             summary = f"Smoke check exited with code {result['exit_code']}.\n{result['output']}".rstrip()
         self.tree.append({"role": "assistant", "content": summary})
         self.tree.save()
-        return summary
+        # The smoke check took the last request, so without a report the user saw only its exit code. The report
+        # comes on top of the limit, as when a turn runs out of requests.
+        report = await self._limit_report()
+        if report is None:
+            return summary
+        self.tree.append({"role": "assistant", "content": report})
+        self.tree.save()
+        return f"{report}\n\n{summary}"
 
     async def _respond(self):
         reflected = False
