@@ -199,7 +199,7 @@ async def _run(args):
         _PANEL = StatusBar(sys.stderr, True, styled=style.err.enabled)
     tree = _open_tree(root, args.resume)
     engine = Engine(server, model, workspace, tree, args.max_turns, args.max_tokens, _status,
-                    forks=not args.linear, verification=not args.no_verify, challenge=not args.no_challenge,
+                    forks=not args.linear, verification=not args.no_verify, challenge=args.challenge,
                     thinking=args.thinking,
                     thinking_budget=args.thinking_budget, fork_effort=args.fork_effort,
                     fork_thinking_budget=args.fork_thinking_budget,
@@ -240,8 +240,9 @@ def main(argv=None):
     parser.add_argument("--linear", action="store_true", help="run the main tool loop with all kinds of forks disabled")
     parser.add_argument("--no-verify", action="store_true",
                         help="disable verification forks and keep strategic reflection")
-    parser.add_argument("--no-challenge", action="store_true",
-                        help="skip the critics that challenge the plan before the first file change of a task")
+    parser.add_argument("--challenge", action="store_true",
+                        help="have critics challenge the plan before the first larger file change of a task, with a "
+                             "moderator ruling on what they prove (default: off)")
     parser.add_argument("--thinking", choices=THINKING_MODES, default="auto",
                         help="auto: the chat template decides, and Qwen3.8's thinks on every request; main: think on "
                              "the main branch only; off: ask the chat template to skip thinking (default: auto)")
