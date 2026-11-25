@@ -393,7 +393,8 @@ class Engine:
         return "\n\n".join(parts)
 
     async def _complete(self, messages, tools, *, fork=False, response_format=None, temperature=0.0,
-                        tool_choice=None):
+                        tool_choice=None, branch=None):
+        """Request a completion. `branch` names a fork by the ID of its first node, so it gets its own session."""
         if self.requests_left is not None:
             if self.requests_left <= (1 if fork else 0):
                 raise TurnLimitError("No model requests remain for this step.")
@@ -411,15 +412,22 @@ class Engine:
                                                          response_format=response_format, temperature=temperature,
                                                          thinking=thinking, tool_choice=tool_choice,
                                                          thinking_budget=self.thinking_budget,
-                                                         reasoning_effort=self.fork_effort if fork else None)
+                                                         reasoning_effort=self.fork_effort if fork else None,
+                                                         session=self._session(branch))
         except ContextLimitError as error:
-            raise ContextLimitError(error.tokens, error.n_ctx, self._context_advice()) from None
+            raise ContextLimitError(error.tokens, error.n_ctx, self._context_advice(),
+                                    reply_tokens=error.reply_tokens) from None
         reasoning = message.get("reasoning_content")
         if thinking and isinstance(reasoning, str) and reasoning.rstrip().endswith(THINKING_BUDGET_MESSAGE):
             self.on_tool(f"Thinking stopped at its budget of {self.thinking_budget:,} tokens")
         if not fork and tokens and self.context_size:
             self._check_context(tokens)
         return message
+
+    def _session(self, branch):
+        """The x-session-id of the main branch or of the fork that starts at node `branch`."""
+        session = self.tree.path.stem
+        return session if branch is None else f"{session}-{branch}"
 
     def _context_advice(self):
         return (f"Reflect does not shorten conversations yet. For more room, restart llama-server with more "
@@ -503,11 +511,12 @@ class Engine:
                 f"Claim to check: {claim}"
             ),
         }, parent_id=anchor, branch_type="verification")
+        start = leaf
         reason = "Verification reached its three-request limit."
         try:
             for attempt in range(3):
                 message = await self._complete(
-                    self._messages(leaf, system_prompt=_VERIFY_PROMPT), _READ_ONLY_TOOLS, fork=True,
+                    self._messages(leaf, system_prompt=_VERIFY_PROMPT), _READ_ONLY_TOOLS, fork=True, branch=start,
                 )
                 calls = _tool_calls(message)
                 leaf = self.tree.append(message, parent_id=leaf, branch_type="verification")
@@ -527,7 +536,7 @@ class Engine:
                     {"role": "user", "content": f"Claim: {claim}\n\nCurrent evidence:\n" + "\n\n".join(evidence)},
                 ]
                 message = await self._complete(
-                    messages, [], fork=True, response_format=_VERDICT_SCHEMA,
+                    messages, [], fork=True, response_format=_VERDICT_SCHEMA, branch=start,
                 )
                 leaf = self.tree.append(message, parent_id=leaf, branch_type="verification")
                 try:
@@ -586,7 +595,7 @@ class Engine:
                 # One request to gather evidence. Requiring a call keeps a small model from proposing a check
                 # instead of running it. A server that ignores tool_choice can still answer in text.
                 message = await self._complete(context(leaf, REFLECTION_PROMPT), _READ_ONLY_TOOLS, fork=True,
-                                               temperature=role.temperature, tool_choice="required")
+                                               temperature=role.temperature, tool_choice="required", branch=start)
                 calls = _tool_calls(message)
                 leaf = self.tree.append(message, parent_id=leaf, branch_type="reflection")
                 if calls:
@@ -600,7 +609,7 @@ class Engine:
             if proposal is None:
                 message = await self._complete(
                     context(leaf, _PROPOSAL_PROMPT), [], fork=True,
-                    response_format=_proposal_schema(role.fields), temperature=role.temperature,
+                    response_format=_proposal_schema(role.fields), temperature=role.temperature, branch=start,
                 )
                 if _tool_calls(message):
                     raise ServerError("The reviewer called a tool on its final request.")

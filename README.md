@@ -89,6 +89,8 @@ With `--thinking auto` or `main`, a reasoning model can spend several thousand t
 
 Some chat templates, such as Gemma 4's, place an assistant's text after the results of its tool calls. Reflect checks the server's template once per session through `/apply-template` and adjusts the messages it sends when needed. [The coding loop](docs/design.md#the-coding-loop)
 
+Reflect also works with Basalt, which serves the same endpoints except `/apply-template`. Set `LLAMA_BASE_URL` to its address without `/v1` and `LLAMA_API_KEY` to its key. Each request carries an `x-session-id` header, one for the main conversation and one per verifier or reviewer, so Basalt can keep each conversation on one slot and reuse its cached context. `llama-server` ignores the header. Basalt counts `--max-tokens` against the context of a slot, so with the default of 16,384 a conversation fits in 16,384 tokens less than the slot holds. A lower `--max-tokens` leaves more room.
+
 ## Run
 
 Start Reflect from the root of the project you want to work on. Reflect uses that directory for its tools, sessions, and skills. An empty directory works.

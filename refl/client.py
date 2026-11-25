@@ -1,3 +1,4 @@
+import re
 from dataclasses import dataclass
 
 from .transport import ReplyTimeout, TransportError
@@ -5,6 +6,10 @@ from .transport import ReplyTimeout, TransportError
 
 # Text that llama-server writes at the end of a thinking block that used up its budget.
 THINKING_BUDGET_MESSAGE = "Thinking budget reached. I will act on the best plan so far."
+
+# Basalt's reply to a request that does not fit. Unlike llama-server, it counts max_tokens against the context.
+_BASALT_CONTEXT_ERROR = re.compile(
+    r"prompt \((\d+) tokens\) \+ max tokens \((\d+)\) exceeds the context \((\d+)\)")
 
 
 class ServerError(RuntimeError):
@@ -18,12 +23,19 @@ class TokenLimitError(ServerError):
 class ContextLimitError(ServerError):
     """A request that does not fit in the context of a llama-server slot."""
 
-    def __init__(self, tokens, n_ctx, advice=""):
-        message = (f"The request needs {tokens:,} tokens, but llama-server holds {n_ctx:,} tokens of context "
-                   f"per slot.")
+    def __init__(self, tokens, n_ctx, advice="", *, reply_tokens=None):
+        if reply_tokens is None:
+            message = (f"The request needs {tokens:,} tokens, but llama-server holds {n_ctx:,} tokens of context "
+                       f"per slot.")
+        else:
+            message = (f"The request needs {tokens:,} tokens plus {reply_tokens:,} for the reply, but the server "
+                       f"holds {n_ctx:,} tokens of context per slot. This server counts --max-tokens against the "
+                       f"context, so a lower --max-tokens leaves more room for the conversation.")
         super().__init__(f"{message} {advice}".strip())
         self.tokens = tokens
         self.n_ctx = n_ctx
+        # The reply tokens that the server counted against the context, or None if it counts the prompt only.
+        self.reply_tokens = reply_tokens
 
 
 @dataclass
@@ -68,6 +80,10 @@ class LlamaClient:
                         and isinstance(n_ctx, int)):
                     raise ContextLimitError(tokens, n_ctx)
                 detail = detail.get("message")
+                match = _BASALT_CONTEXT_ERROR.search(detail) if isinstance(detail, str) else None
+                if match:
+                    tokens, reply_tokens, n_ctx = map(int, match.groups())
+                    raise ContextLimitError(tokens, n_ctx, reply_tokens=reply_tokens)
             raise ServerError(f"{path} returned HTTP {response.status}: {detail or response.reason}")
         return data
 
@@ -125,7 +141,7 @@ class LlamaClient:
         return prompt
 
     async def complete(self, model, messages, tools, max_tokens, *, response_format=None, temperature=0.0,
-                       thinking=True, tool_choice=None, thinking_budget=None, reasoning_effort=None):
+                       thinking=True, tool_choice=None, thinking_budget=None, reasoning_effort=None, session=None):
         """Return the assistant message and the tokens the request used in the context, or None for those."""
         payload = {
             "model": model,
@@ -150,7 +166,10 @@ class LlamaClient:
             if reasoning_effort is not None:
                 # The server passes the level to chat templates that read it, such as Qwen3.8's.
                 payload["reasoning_effort"] = reasoning_effort
-        data = await self._request("POST", "/v1/chat/completions", json=payload)
+        # Servers such as Basalt keep a conversation on one slot by this header, so its cached context is reused.
+        # llama-server ignores it and picks the slot whose cache matches the prompt best.
+        headers = {"x-session-id": session} if session else None
+        data = await self._request("POST", "/v1/chat/completions", json=payload, headers=headers)
         try:
             choice = data["choices"][0]
             message = choice["message"]

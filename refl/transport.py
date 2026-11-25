@@ -88,11 +88,11 @@ class HttpClient:
         # The address that accepted the last connection, tried first next time.
         self.last_address = None
 
-    async def request(self, method, path, *, json=None, params=None, timeout=None):
+    async def request(self, method, path, *, json=None, params=None, timeout=None, headers=None):
         target = self.prefix + path
         if params:
             target += "?" + urllib.parse.urlencode(params)
-        headers = {"Accept": "application/json", **self.headers}
+        headers = {"Accept": "application/json", **self.headers, **(headers or {})}
         body = None
         if json is not None:
             body = _encode(json)

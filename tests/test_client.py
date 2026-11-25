@@ -105,6 +105,33 @@ class ClientTest(unittest.TestCase):
         self.assertEqual(str(raised.exception),
                          "The request needs 33,010 tokens, but llama-server holds 32,768 tokens of context per slot.")
 
+    def test_a_basalt_request_that_does_not_fit_counts_the_reply(self):
+        def handler(request):
+            return 400, {"error": {"type": "invalid_request_error", "message": (
+                "request exceeds the context window: prompt (80052 tokens) + max tokens (16384) exceeds the "
+                "context (65536); requests are never truncated.")}}
+
+        with self.assertRaises(ContextLimitError) as raised:
+            serve(handler, lambda client: client.complete("qwen", [], [], 16384))
+        error = raised.exception
+        self.assertEqual((error.tokens, error.reply_tokens, error.n_ctx), (80052, 16384, 65536))
+        self.assertTrue(str(error).startswith(
+            "The request needs 80,052 tokens plus 16,384 for the reply, but the server holds 65,536 tokens"))
+
+    def test_a_session_is_sent_as_a_header_only_when_given(self):
+        seen = []
+
+        def handler(request):
+            seen.append(request.headers.get("x-session-id"))
+            return 200, _REPLY
+
+        async def use(client):
+            await client.complete("qwen", [], [], 16, session="abc-7")
+            await client.complete("qwen", [], [], 16)
+
+        serve(handler, use)
+        self.assertEqual(seen, ["abc-7", None])
+
     def test_other_error_replies_name_the_endpoint_and_the_message(self):
         def handler(request):
             return 503, {"error": {"code": 503, "message": "Loading model", "type": "unavailable_error"}}

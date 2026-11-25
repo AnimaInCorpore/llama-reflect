@@ -35,6 +35,23 @@ class EngineTest(unittest.TestCase):
         self.assertEqual(sum(event.startswith("Verifying") for event in events), 1)
         self.assertEqual(server.replies, [])
 
+    def test_main_branch_and_each_fork_send_their_own_session(self):
+        engine, server, _ = make_engine(self.root, [
+            text(_CLAIM),
+            call("read_file", path="status.txt"),
+            verdict(),
+            text(f"Done. {_CLAIM} was verified."),
+        ])
+        asyncio.run(engine.respond("Check the status."))
+        stem = engine.tree.path.stem
+        sessions = [request["session"] for request in server.requests]
+        self.assertEqual((sessions[0], sessions[3]), (stem, stem))
+        self.assertEqual(sessions[1], sessions[2])
+        start = int(sessions[1].removeprefix(f"{stem}-"))
+        node = engine.tree.nodes[start]
+        self.assertEqual(node.branch_type, "verification")
+        self.assertTrue(node.message["content"].startswith("Use read_file or grep_search"))
+
     def test_claim_is_checked_again_after_a_write(self):
         engine, server, events = make_engine(self.root, [
             text(_CLAIM),
@@ -297,6 +314,16 @@ class EngineTest(unittest.TestCase):
             "The request needs 1,200 tokens, but llama-server holds 1,000 tokens of context per slot."))
         self.assertIn(f"--resume {engine.tree.path.stem}", message)
         self.assertEqual(engine.tree.messages(engine.tree.head)[-1]["content"], f"[Turn stopped] {message}")
+
+    def test_a_server_that_counts_the_reply_names_both_parts_and_how_to_continue(self):
+        engine, _, _ = make_engine(self.root, [ContextLimitError(900, 1000, reply_tokens=256)], forks=False)
+        with self.assertRaises(ContextLimitError) as raised:
+            asyncio.run(engine.respond("hi"))
+        self.assertEqual(raised.exception.reply_tokens, 256)
+        message = str(raised.exception)
+        self.assertTrue(message.startswith("The request needs 900 tokens plus 256 for the reply"))
+        self.assertIn("a lower --max-tokens", message)
+        self.assertIn(f"--resume {engine.tree.path.stem}", message)
 
 
     def test_default_thinking_budget_leaves_half_for_the_answer(self):
