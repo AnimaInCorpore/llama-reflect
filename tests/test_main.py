@@ -124,6 +124,20 @@ class MainTest(unittest.TestCase):
             self.assertEqual(main(["hi", "--mentor"]), 0)
         self.assertEqual(seen, [False, True])
 
+    def test_a_sibling_must_be_a_repository(self):
+        errors = io.StringIO()
+        with contextlib.redirect_stderr(errors), self.assertRaises(SystemExit):
+            main(["hi", "--sibling", self.directory.name])
+        self.assertIn("is not a Git repository with commits", errors.getvalue())
+        seen = []
+
+        async def run(args):
+            seen.append((args.wise_guy, args.sibling))
+
+        with mock.patch("refl.main._run", run):
+            self.assertEqual(main(["hi", "--wise-guy"]), 0)
+        self.assertEqual(seen, [(True, None)])
+
     def test_thinking_is_on_by_default(self):
         seen = []
 

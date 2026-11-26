@@ -65,6 +65,15 @@ async def _with_panel(engine, work):
         _PANEL.stop()
 
 
+def _sibling(path):
+    """A --sibling path: an existing Git repository with at least one commit."""
+    from .githistory import is_repository
+    resolved = Path(path).expanduser().resolve()
+    if not is_repository(resolved):
+        raise argparse.ArgumentTypeError(f"{path} is not a Git repository with commits")
+    return resolved
+
+
 def _check_fork_effort(effort, properties):
     """Stop on a level the chat template rejects, and warn about one that is not among its levels."""
     if effort is None or properties.effort_levels is None:
@@ -200,7 +209,7 @@ async def _run(args):
     tree = _open_tree(root, args.resume)
     engine = Engine(server, model, workspace, tree, args.max_turns, args.max_tokens, _status,
                     forks=not args.linear, verification=not args.no_verify, challenge=args.challenge,
-                    mentor=args.mentor,
+                    mentor=args.mentor, wise_guy=args.wise_guy, sibling=args.sibling,
                     thinking=args.thinking,
                     thinking_budget=args.thinking_budget, fork_effort=args.fork_effort,
                     fork_thinking_budget=args.fork_thinking_budget,
@@ -247,6 +256,11 @@ def main(argv=None):
     parser.add_argument("--mentor", action="store_true",
                         help="add a mentor to each reflection that fetches public documentation pages, saved under "
                              ".refl/sources/ (default: off)")
+    parser.add_argument("--wise-guy", action="store_true",
+                        help="add a Wise guy to each reflection that learns from the project's Git history how "
+                             "similar problems were solved (default: off)")
+    parser.add_argument("--sibling", metavar="PATH", type=_sibling,
+                        help="a related Git repository whose history the Wise guy searches too; implies --wise-guy")
     parser.add_argument("--thinking", choices=THINKING_MODES, default="auto",
                         help="auto: the chat template decides, and Qwen3.8's thinks on every request; main: think on "
                              "the main branch only; off: ask the chat template to skip thinking (default: auto)")

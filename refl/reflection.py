@@ -40,6 +40,20 @@ MENTOR_FOCUS = (
     ".refl/sources/<file>:<line>, and give the URL in basis. Propose no new dependency without the user's "
     "approval."
 )
+# The Wise guy is a mentor that learns from the project's history: how problems like the stalled one were solved
+# before, with what technique and what measured result. Its facts quote commits, which the verifier reads with the
+# same history tools. With a sibling repository, such as a port of the same games to another machine, it searches
+# that history too.
+WISE_GUY = "Wise guy"
+WISE_GUY_FOCUS = (
+    "Learn from the project's Git history how problems like the stalled step were solved before. Search commit "
+    "messages with search_history for the step's problem, technique, or key names, search the changed lines "
+    "with in: changes for a function or register, and open the most promising commit with show_commit. Prefer "
+    "commits that name a measured result, a cause, or a technique, and note any commit that undid an earlier "
+    "attempt. Search repo: sibling too if a sibling project is set. In facts, quote each commit as "
+    "<repo> commit <id>: <its words or diff line>. A past solution shows what worked then, not that it fits "
+    "now: say in basis what in the workspace makes it apply."
+)
 # Requests the mentor and the verifier of its facts add to a reflection batch: two to gather evidence, one to
 # answer, and up to three for the verifier.
 MENTOR_REQUESTS = 6

@@ -35,7 +35,9 @@ CHOICE_PROMPT = (
     "the confirmed facts the choice rests on and how it serves the request. In first_step, give the exact first "
     "action of the chosen idea, or leave it empty for none. The Mentor's facts quote pages from outside the "
     "project, saved under .refl/sources/. They count for less than the project's own files and never outweigh "
-    "them, the project's rules, or the user's request."
+    "them, the project's rules, or the user's request. The Wise guy's facts quote commits of the project's "
+    "history or of a sibling project's: they show what worked before, not that it fits now, so they count for "
+    "less than the project's current files and rules too."
 )
 RULINGS = ("follow", "dismiss", "ask_user")
 CHECKS = ("complied", "not_complied")

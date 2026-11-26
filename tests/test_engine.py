@@ -1,5 +1,6 @@
 import asyncio
 import json
+import subprocess
 import tempfile
 import unittest
 from pathlib import Path
@@ -389,6 +390,45 @@ class EngineTest(unittest.TestCase):
         # Other reviewers cannot fetch.
         self.assertFalse(any("fetch_url" in request["tools"] for request in server.requests
                              if request["system"].startswith(REFLECTION_PROMPT)))
+
+    def test_the_wise_guy_searches_the_history_and_its_verifier_can_too(self):
+        subprocess.run(["git", "init", "-q"], cwd=self.root, check=True)
+        for args in (["config", "user.email", "t@example.com"], ["config", "user.name", "T"],
+                     ["add", "status.txt"], ["commit", "-q", "-m", "Status: old_ready replaced by a check"]):
+            subprocess.run(["git", *args], cwd=self.root, check=True, capture_output=True)
+        reviewers = reflection_route(facts="workspace commit 1234: Status: old_ready replaced by a check")
+        wise_calls = []
+
+        def route(request):
+            if request["system"].startswith("You are a read-only mentor") and request["tools"]:
+                wise_calls.append(request["tools"])
+                return call("search_history", pattern="old_ready") if len(wise_calls) == 1 else text("Enough.")
+            if request["system"].startswith("You are Reflect's read-only verifier"):
+                return call("search_history", pattern="old_ready")
+            return reviewers(request)
+
+        replies = [call("read_file", path="missing.txt"), call("read_file", path="missing.txt"), text("Done.")]
+        engine, server, events = make_engine(self.root, replies, route=route)
+        engine.wise_guy = True
+        self.assertEqual(asyncio.run(engine.respond("Fix it.")), "Done.")
+        self.assertIn("search_history", wise_calls[0])
+        self.assertIn('reflect search_history', " ".join(events))
+        self.assertIn("Wise guy", next(e for e in events if "Reflecting" in e))
+        history_results = [node.message["content"] for node in engine.tree.nodes
+                           if node.message["role"] == "tool" and "old_ready replaced" in node.message["content"]]
+        self.assertTrue(history_results)
+        verifier = next(request for request in server.requests
+                        if request["system"].startswith("You are Reflect's read-only verifier"))
+        self.assertIn("show_commit", verifier["tools"])
+        choice = next(request for request in server.requests if request["system"].startswith(MODERATOR_PROMPT))
+        self.assertIn("The Wise guy's facts quote commits", choice["system"])
+
+    def test_history_tools_are_refused_without_the_wise_guy(self):
+        replies = [call("search_history", pattern="x"), text("Done.")]
+        engine, _, _ = make_engine(self.root, replies, forks=False)
+        asyncio.run(engine.respond("Look it up."))
+        result = next(node.message["content"] for node in engine.tree.nodes if node.message["role"] == "tool")
+        self.assertIn("available only to the Wise guy", result)
 
     def test_fetch_url_is_refused_outside_the_mentor(self):
         replies = [call("fetch_url", url="https://example.com/"), text("Done.")]

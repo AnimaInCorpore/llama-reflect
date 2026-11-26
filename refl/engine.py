@@ -14,6 +14,8 @@ from .context import shorten, shorten_point, without_old_thinking
 from .reflection import BREVITY_RULE, FACTS_RULE, GOAL_RULE, HONESTY_RULE, MANUAL, MAX_FACTS, REFLECTION_PROMPT
 from .reflection import BOOKWORM, MENTOR, MENTOR_FOCUS, MENTOR_REQUESTS, Role, StallDetector
 from .web import FETCH_TOOL, fetch_page, saved_sources
+from .githistory import HISTORY_NAMES, HISTORY_TOOLS, History
+from .reflection import WISE_GUY, WISE_GUY_FOCUS
 from .moderator import CHECK_PROMPT, CHECK_SCHEMA, CHOICE_PROMPT, MODERATOR_PROMPT, RULING_PROMPT
 from .moderator import case, choice_schema, ruling_schema, rulings_of
 from .reflection import REQUESTS as REFLECTION_REQUESTS
@@ -94,6 +96,13 @@ _VERIFY_TAG = re.compile(r"<verify>(.*?)</verify>", re.DOTALL | re.IGNORECASE)
 _READ_ONLY_NAMES = {"read_file", "grep_search", "view_image"}
 _READ_ONLY_TOOLS = [tool for tool in TOOLS if tool["function"]["name"] in _READ_ONLY_NAMES]
 _MENTOR_ROLE = Role(MENTOR, "mentor", MENTOR_FOCUS, tools=True, brief=False)
+_WISE_GUY_ROLE = Role(WISE_GUY, "mentor", WISE_GUY_FOCUS, tools=True, brief=False)
+_WISE_GUY_PROMPT = (
+    "You are a read-only mentor helping a coding task that stalled. Find how the project, or its sibling, solved "
+    "a problem like this before: start with a search_history call, and open the most promising commit with "
+    "show_commit. Give one concrete next action that the past solution supports, the commits behind it, and a "
+    "check the main branch can run to see progress. " + GOAL_RULE + " " + HONESTY_RULE
+)
 _MENTOR_PROMPT = (
     "You are a read-only mentor helping a coding task that stalled. Find the outside knowledge the stalled step "
     "lacks: start with a fetch_url call for the page most likely to hold it, and read further in the saved copy "
@@ -101,7 +110,10 @@ _MENTOR_PROMPT = (
     "behind it, and a check the main branch can run to see progress. " + FACTS_RULE + " " + GOAL_RULE + " "
     + HONESTY_RULE
 )
-_BASH_TOOLS = [tool for tool in TOOLS if tool["function"]["name"] == "bash"]
+# The mentors' extra tools and evidence prompt. A mentor gets two evidence requests instead of one, so it can read
+# further in what it found.
+_OUTSIDE = {MENTOR: ([FETCH_TOOL], _MENTOR_PROMPT), WISE_GUY: (HISTORY_TOOLS, _WISE_GUY_PROMPT)}
+_BASH_TOOLS =[tool for tool in TOOLS if tool["function"]["name"] == "bash"]
 # Requests of the turn that a reflection needs: the decision, one step on it, and a final check. The reviewers
 # and their verifiers have a budget of their own.
 _ACT_ON_REFLECTION = 3
@@ -448,7 +460,7 @@ class Engine:
     def __init__(self, server, model, workspace, tree, max_turns, max_tokens, on_tool, *, forks=True,
                  verification=True, thinking="auto", thinking_budget=None, fork_effort=None, context_size=None,
                  vision=False, challenge=True, on_progress=None, fork_thinking_budget=None, mentor=False,
-                 fetcher=None):
+                 fetcher=None, wise_guy=False, sibling=None):
         self.server = server
         self.model = model
         self.workspace = workspace
@@ -465,6 +477,9 @@ class Engine:
         # Whether a mentor joins each reflection, and how it fetches a page: fetcher(root, url) returns a result.
         self.mentor = forks and mentor
         self.fetcher = fetcher or fetch_page
+        # Whether the Wise guy joins each reflection, and the histories it and its verifier search.
+        self.wise_guy = forks and (wise_guy or sibling is not None)
+        self.history = History(workspace.root, sibling)
         self.challenged = False
         # Requests left in the running plan challenge or reflection batch, which has a budget of its own, and
         # its name for the message when the budget runs out. None outside one.
@@ -754,6 +769,14 @@ class Engine:
                 # Reads change nothing, so they run now. In one session a grep held back with an edit had to be
                 # reissued after the plan check.
                 result = {"error": f"Tool call deferred. Reissue it after reviewing {defer}."}
+            elif name in HISTORY_NAMES:
+                if self.wise_guy and branch_type in ("reflection", "verification"):
+                    self.on_tool(prefix + _call_summary(function))
+                    result = await asyncio.to_thread(self.history.execute, function)
+                    if branch_type == "verification" and "output" in result:
+                        evidence.append(f"{name} {function['arguments']}\n{result['output']}")
+                else:
+                    result = {"error": f"{name} is available only to the Wise guy and its verifier."}
             elif name == "fetch_url":
                 if self.mentor and branch_type == "reflection":
                     self.on_tool(prefix + _call_summary(function))
@@ -818,7 +841,8 @@ class Engine:
         try:
             for attempt in range(3):
                 message = await self._complete(
-                    self._messages(leaf, system_prompt=_VERIFY_PROMPT), _READ_ONLY_TOOLS, fork=True, branch=start,
+                    self._messages(leaf, system_prompt=_VERIFY_PROMPT),
+                    [*_READ_ONLY_TOOLS, *(HISTORY_TOOLS if self.wise_guy else [])], fork=True, branch=start,
                     actor=actor,
                 )
                 calls = _tool_calls(message)
@@ -914,10 +938,10 @@ class Engine:
                 # One request to gather evidence. Requiring a call keeps a small model from proposing a check
                 # instead of running it. A reply in text still leads to the structured answer, which needs facts.
                 # The mentor gets a second one, to read further in a page it saved.
-                mentor = role.name == MENTOR
-                tools = [*_READ_ONLY_TOOLS, FETCH_TOOL] if mentor else _READ_ONLY_TOOLS
-                for attempt in range(2 if mentor else 1):
-                    message = await self._complete(context(leaf, _MENTOR_PROMPT if mentor else REFLECTION_PROMPT),
+                extra, prompt = _OUTSIDE.get(role.name, ([], REFLECTION_PROMPT))
+                tools = [*_READ_ONLY_TOOLS, *extra]
+                for attempt in range(2 if extra else 1):
+                    message = await self._complete(context(leaf, prompt),
                                                    tools, fork=True, temperature=role.temperature,
                                                    tool_choice="required" if attempt == 0 else None, branch=start,
                                                    actor=role.name)
@@ -997,8 +1021,8 @@ class Engine:
         unavailable = set() if records else {BOOKWORM}
         level, roles = self.stalls.plan(MANUAL if manual else self.stalls.kind, unavailable=unavailable,
                                         manual=manual)
-        if self.mentor:
-            roles = [*roles, _MENTOR_ROLE]
+        mentors = [role for role, on in ((_MENTOR_ROLE, self.mentor), (_WISE_GUY_ROLE, self.wise_guy)) if on]
+        roles = [*roles, *mentors]
         names = ", ".join(role.name for role in roles)
         self._strategy_event(
             f"## Reflection\n\n{heading}\n\n    {' '.join(reason.split())}\n\nTemperature {level}: {names}")
@@ -1012,7 +1036,7 @@ class Engine:
             self._actor("Moderator", "waiting for proven ideas", "wait")
         # The reviewers, the verifiers of their facts, and the moderator have a budget of their own, as for the
         # plan challenge.
-        self.batch_left = REFLECTION_REQUESTS + (MENTOR_REQUESTS if self.mentor else 0)
+        self.batch_left = REFLECTION_REQUESTS + MENTOR_REQUESTS * len(mentors)
         self.batch_name = "reflection"
         try:
             ideas = await asyncio.gather(*(self._proven_idea(anchor, reason, role, brief, history)
