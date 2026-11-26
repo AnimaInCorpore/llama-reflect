@@ -1,4 +1,5 @@
 import json
+import os
 import unittest
 
 from refl.reflection import FAILURE, MANUAL, NO_PROGRESS, UNFIXED, StallDetector, choose_roles
@@ -180,6 +181,19 @@ class StallDetectorTest(unittest.TestCase):
         self.record("bash", {"command": "test -f out.txt"}, {"exit_code": 1, "output": ""})
         reasons = self.explore(8)
         self.assertEqual(reasons[-1], "10 tool calls in a row changed no file while python check.py still fails.")
+
+    def test_three_unchecked_edits_of_code_are_a_stall_but_of_documents_not(self):
+        reasons = [self.record("edit_file", {"path": "tools/blittime.py"}, {"output": "Edited", "changed": True})
+                   for _ in range(3)]
+        self.assertEqual(reasons[-1], f"{os.path.normpath('tools/blittime.py')} was changed three times without a "
+                                      "successful Bash check.")
+        detector = StallDetector({"delay": 0, "remaining": 0})
+        reasons = []
+        for _ in range(4):
+            detector.record({"name": "edit_file", "arguments": json.dumps({"path": "docs/blittime.md"})},
+                            {"output": "Edited", "changed": True})
+            reasons.append(detector.stall())
+        self.assertEqual(reasons, [None] * 4)
 
     def test_an_old_failure_goes_stale(self):
         # The real case: a `find /` timed out at the start, and 40 tool calls later, while the main branch edited

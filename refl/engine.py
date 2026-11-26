@@ -184,8 +184,41 @@ _EVIDENCE_PROMPT = (
 _FACTS_EVIDENCE_PROMPT = (
     "Compare each numbered fact with the supplied workspace evidence, on its own and in order. For each, in "
     "reason, say in one sentence what the source shows, citing the file and line. Set status to supported if the "
-    "evidence confirms that fact, contradicted if it disproves it, or insufficient if it does neither."
+    "evidence confirms that fact, contradicted if it disproves it, or insufficient if it does neither. Answer as "
+    '{"verdicts": [{"reason": "...", "status": "supported"}, ...]} with one entry per fact, in order.'
 )
+
+
+def _fact_verdicts(content, count):
+    """The (status, reason) of each fact in a verifier's answer, in order.
+
+    Basalt does not enforce the response schema, and in a benchmark run every answer came in a shape of the
+    model's own: {"facts": [{"fact": 1, ...}]}, {"facts": [{"id": 1, ...}]}, or {"1": {...}, "2": {...}}. Each
+    was read as invalid, so no reflection idea could pass. These shapes are read now, and others raise ValueError.
+    """
+    data = json.loads(content or "")
+    items = data if isinstance(data, list) else None
+    if isinstance(data, dict):
+        listed = next((data[key] for key in ("verdicts", "facts", "results") if isinstance(data.get(key), list)), None)
+        numbered = {key: value for key, value in data.items() if str(key).strip().isdigit() and isinstance(value, dict)}
+        if listed is not None:
+            items = listed
+        elif numbered:
+            items = [numbered[key] for key in sorted(numbered, key=lambda key: int(str(key).strip()))]
+        elif "status" in data and count == 1:
+            items = [data]
+    if not isinstance(items, list) or len(items) != count or not all(isinstance(item, dict) for item in items):
+        raise ValueError("one verdict per fact")
+    numbers = [next((item[key] for key in ("fact", "id", "number") if key in item), None) for item in items]
+    if sorted(map(str, numbers)) == [str(number) for number in range(1, count + 1)]:
+        items = [items[[str(number) for number in numbers].index(str(index))] for index in range(1, count + 1)]
+    verdicts = []
+    for item in items:
+        status, reason = item.get("status"), item.get("reason")
+        if status not in _VERDICT_LABELS or not isinstance(reason, str):
+            raise ValueError("a verdict without a known status and a reason")
+        verdicts.append((status, reason))
+    return verdicts
 
 
 def _facts_verdict_schema(count):
@@ -468,7 +501,7 @@ _CONTEXT_MARGIN = 16
 class Engine:
     def __init__(self, server, model, workspace, tree, max_turns, max_tokens, on_tool, *, forks=True,
                  verification=True, thinking="auto", thinking_budget=None, fork_effort=None, context_size=None,
-                 vision=False, challenge=True, on_progress=None, fork_thinking_budget=None, mentor=False,
+                 vision=False, challenge=False, on_progress=None, fork_thinking_budget=None, mentor=False,
                  fetcher=None, wise_guy=False, sibling=None):
         self.server = server
         self.model = model
@@ -877,14 +910,12 @@ class Engine:
                 )
                 leaf = self.tree.append(message, parent_id=leaf, branch_type="verification")
                 try:
-                    verdict = json.loads(message.get("content") or "")
                     if facts:
-                        results = [f"[{_VERDICT_LABELS[item['status']]}] {' '.join(item['reason'].split())[:300]}"
-                                   for item in verdict["verdicts"]]
-                        if len(results) == len(facts):
-                            self.tree.finish_fork(leaf, anchor, "merged")
-                            return results
-                        raise ValueError("one verdict per fact")
+                        results = [f"[{_VERDICT_LABELS[status]}] {' '.join(reason.split())[:300]}"
+                                   for status, reason in _fact_verdicts(message.get("content"), len(facts))]
+                        self.tree.finish_fork(leaf, anchor, "merged")
+                        return results
+                    verdict = json.loads(message.get("content") or "")
                     label = _VERDICT_LABELS[verdict["status"]]
                     detail = " ".join(verdict["reason"].split())
                     if detail:

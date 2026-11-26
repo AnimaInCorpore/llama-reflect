@@ -202,6 +202,9 @@ def choose_roles(level, kind, used=frozenset(), unavailable=frozenset()):
 
 
 _FILE_WRITES = {"write_file", "edit_file"}
+# Edits of documents, which no Bash check covers, do not count toward "changed three times without a successful
+# Bash check". In a benchmark run, three edits of docs/blittime.md started a reflection that found nothing.
+_DOCUMENT_SUFFIXES = (".md", ".rst", ".txt", ".adoc")
 # Tool results in a row without a file change, while a failing command is unresolved, that count as a stall.
 # Replayed over 471 benchmark runs, 10 fired in no solved run and early enough for a reflection in 21 failed
 # ones. 15 caught 9 in time, and 8 also fired in 13 solved runs. Only a failure that a check reports, or a
@@ -431,7 +434,8 @@ class StallDetector:
         if unchanged >= 3:
             return self._report(("unchanged result", latest.action), f"{latest.subject} returned the same result three times.")
 
-        if latest.name in _FILE_WRITES and latest.path and latest.result.get("changed") is True:
+        if (latest.name in _FILE_WRITES and latest.path and latest.result.get("changed") is True
+                and not latest.path.lower().endswith(_DOCUMENT_SUFFIXES)):
             for event in reversed(recent):
                 if event.name == "bash" and event.result.get("exit_code") == 0:
                     break

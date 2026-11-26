@@ -126,6 +126,17 @@ python bench/history.py run --repo PATH --tasks bench/history/stearcade.json --a
 
 `candidates` lists commits that change at most two code files, 80 lines by default, together with a test file. `validate` checks that each task's check fails at the parent with the commit's tests and passes at the commit. Most STEArcade candidates are game work whose tests need the ROM set and a build of the game. `bench/history/stearcade.json` starts with one task that needs neither: commit `9c2c94b` infers the desktop's 50, 60, or 71 Hz from a clock calibration in `tools/blittime.py`, with three tests in `tools/test_blittime.py`. At the parent, the tests fail on the missing `clock_calibration`, and at the commit they pass.
 
+The first run used Qwen3.8-Flash-Next (IQ3_S) on Basalt 0.5.7 with thinking, 40 requests, and 32,768 tokens per reply. Both arms solved the task.
+
+| Arm | Passed | Seconds | Requests | Prompt tokens processed | Completion tokens | Ended |
+| --- | --- | --- | --- | --- | --- | --- |
+| linear | yes | 522 | 41 main | 918,172 | 34,861 | at the request limit |
+| reflect | yes | 1,244 | 65 main and challenge, 18 reflection, 19 verification | 1,447,030 | 97,781 | with an answer |
+
+Without reflection, the model passed the tests at request 24 of 40. It had read for 15 requests and made the fix in 8 edits of one function. It then checked a synthetic 60 Hz report, documented the change in `docs/blittime.md` as the commit message asks, and started on a similar 50 Hz assumption in DLTEST that the request does not mention, until the turn ended at the limit without an answer. The main branch now hears once when 5 requests are left.
+
+With reflection, the arm took 2.4 times as long and ended with an answer. It also ran the plan challenge, because the `Engine` class still defaulted to it while `refl` had made it opt-in. The challenge took 7 minutes, proved 2 findings, and the main branch followed both: it kept today's accepted range of 200 to 202 ticks and replaced a duplicated parse and a fixed `/50` rather than leaving them. Three reflections, of 3 minutes, 1 minute 50 seconds, and 1 minute 53 seconds, proved no idea, but not on their merits: Basalt does not enforce the response schema, every per-fact verdict came in a shape of the model's own, and Reflect read each one as invalid. The first reflection fired on 11 reads at the start while the task's test still failed, and the third on three edits of a document. All three are fixed now: the verdict shapes are read, the class defaults to no challenge, and document edits do not count as unchecked edits. One task and one run per arm say nothing about which arm is better.
+
 ## Larger study
 
 ### Benchmark sequence

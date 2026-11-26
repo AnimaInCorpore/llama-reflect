@@ -7,7 +7,7 @@ from pathlib import Path
 from unittest import mock
 
 from refl.client import THINKING_BUDGET_MESSAGE, ContextLimitError, ServerError, TokenLimitError
-from refl.engine import TurnLimitError, _call_summary, attach_images, default_thinking_budget, tool_text
+from refl.engine import Engine, TurnLimitError, _call_summary, attach_images, default_thinking_budget, tool_text
 
 from .test_tools import png
 
@@ -436,6 +436,31 @@ class EngineTest(unittest.TestCase):
         asyncio.run(engine.respond("Look it up."))
         result = next(node.message["content"] for node in engine.tree.nodes if node.message["role"] == "tool")
         self.assertIn("fetch_url is available only to the mentor.", result)
+
+    def test_fact_verdicts_are_read_in_the_shapes_the_model_chose(self):
+        from refl.engine import _fact_verdicts
+        # The shapes from a benchmark run on Basalt, which does not enforce the response schema.
+        expected = [("insufficient", "one"), ("supported", "two")]
+        for content in (
+                {"verdicts": [{"reason": "one", "status": "insufficient"}, {"reason": "two", "status": "supported"}]},
+                {"facts": [{"fact": 2, "reason": "two", "status": "supported"},
+                           {"fact": 1, "reason": "one", "status": "insufficient"}]},
+                {"facts": [{"id": 1, "reason": "one", "status": "insufficient"},
+                           {"id": 2, "reason": "two", "status": "supported"}]},
+                {"2": {"reason": "two", "status": "supported"}, "1": {"reason": "one", "status": "insufficient"}}):
+            with self.subTest(content=content):
+                self.assertEqual(_fact_verdicts(json.dumps(content), 2), expected)
+        self.assertEqual(_fact_verdicts(json.dumps({"reason": "one", "status": "supported"}), 1),
+                         [("supported", "one")])
+        for content in ({"verdicts": [{"reason": "one", "status": "supported"}]},
+                        {"verdicts": [{"reason": "a", "status": "maybe"}, {"reason": "b", "status": "supported"}]},
+                        "not json"):
+            with self.subTest(content=content), self.assertRaises(ValueError):
+                _fact_verdicts(content if isinstance(content, str) else json.dumps(content), 2)
+
+    def test_the_engine_runs_no_plan_challenge_unless_asked(self):
+        import inspect
+        self.assertIs(inspect.signature(Engine).parameters["challenge"].default, False)
 
     def test_each_fact_of_an_idea_is_judged_on_its_own(self):
         # The real case: an idea that named the real bug was rejected, because one of its facts gave a wrong line.
