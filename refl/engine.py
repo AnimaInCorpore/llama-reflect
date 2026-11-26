@@ -119,7 +119,16 @@ _BASH_TOOLS =[tool for tool in TOOLS if tool["function"]["name"] == "bash"]
 _ACT_ON_REFLECTION = 3
 _ENGINE_PROMPTS = ("Verification results", "Reflection results", "Plan challenge", "Not followed yet",
                    "For the user", "Run the smoke check now.", "Carry out the moderator's plan now", "Carry out the revised plan now", "Your last reply reached the limit",
-                   "This is the final request", "The request limit of this turn is reached")
+                   "This is the final request", "The request limit of this turn is reached", "Budget:")
+# A note to the main branch when few requests of the turn remain. In a history benchmark run, the model passed the
+# tests at request 24 of 40, then documented, reread files, and started on a similar problem nobody had asked
+# about, and the turn ended at the limit without an answer. The model never saw how many requests it had left.
+_BUDGET_NOTE_AT = 5
+_BUDGET_NOTE = (
+    "Budget: {left} requests are left in this turn, including the one for your answer. Finish what the user's "
+    "request asks for, skip anything it does not ask for, combine edits where you can, and end with your answer. "
+    "Do not start new investigations."
+)
 # One request beyond the limit, so that a turn that ran out of requests still says where the task stands.
 _LIMIT_REPORT_PROMPT = (
     "The request limit of this turn is reached, and no tools remain. Report where the task stands: what is done, "
@@ -1516,7 +1525,14 @@ class Engine:
     async def _respond(self):
         reflected = False
         cut_off = False
+        # The note comes once per turn, and only if the turn has more requests than it allows for.
+        note_at = min(_BUDGET_NOTE_AT, self.max_turns // 2)
         while self.requests_left:
+            if note_at >= 2 and self.requests_left == note_at:
+                self.on_tool(f"Budget: {note_at} requests left in this turn")
+                self.tree.append({"role": "user", "content": _BUDGET_NOTE.format(left=note_at)})
+                self.tree.save()
+                note_at = 0
             if reflected and self.requests_left == 1:
                 return await (self._smoke_check() if self.wrote_files else self._final_answer())
             try:

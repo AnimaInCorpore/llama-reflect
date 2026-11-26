@@ -556,6 +556,26 @@ class EngineTest(unittest.TestCase):
             stored = next(node.message for node in engine.tree.nodes if node.message["role"] == "assistant")
             self.assertEqual((stored["content"], len(stored["tool_calls"])), ("I will read status.txt.", 1))
 
+    def test_the_main_branch_hears_once_when_few_requests_are_left(self):
+        reads = [call("read_file", path="status.txt", start_line=1, end_line=line) for line in range(1, 9)]
+        engine, server, events = make_engine(self.root, [*reads, text("Done.")], forks=False, max_turns=10)
+        self.assertEqual(asyncio.run(engine.respond("Read the status.")), "Done.")
+        self.assertEqual(events.count("Budget: 5 requests left in this turn"), 1)
+        notes = [index for index, request in enumerate(server.requests)
+                 if request["messages"][-1]["content"] and str(request["messages"][-1]["content"]).startswith("Budget:")]
+        # The sixth request is the first with 5 left, and the note stays in the conversation after it.
+        self.assertEqual(notes, [5])
+        self.assertIn("5 requests are left in this turn, including the one for your answer.",
+                      server.requests[5]["messages"][-1]["content"])
+        # The note is Reflect's, so it is not taken for the user's request.
+        self.assertEqual(engine._user_request(engine.tree.head), "Read the status.")
+
+    def test_a_short_turn_gets_no_budget_note(self):
+        reads = [call("read_file", path="status.txt") for _ in range(2)]
+        engine, _, events = make_engine(self.root, [*reads, text("Done.")], forks=False, max_turns=3)
+        asyncio.run(engine.respond("Read it."))
+        self.assertFalse(any(event.startswith("Budget:") for event in events))
+
     def test_context_use_is_reported_once_per_threshold(self):
         reads = [call("read_file", path="status.txt") for _ in range(3)]
         # The test engine's replies may take 256 tokens, so the conversation has 744 of the 1,000.

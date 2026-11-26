@@ -51,6 +51,7 @@ _PREFIXES = (
     ("Strategy log unavailable", "warning"),
     ("Thinking stopped", "warning"),
     ("The reply reached", "warning"),
+    ("Budget: ", "warning"),
     ("The chat template has no", "warning"),
     ("--fork-effort", "warning"),
 )
