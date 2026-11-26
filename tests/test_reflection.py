@@ -181,6 +181,16 @@ class StallDetectorTest(unittest.TestCase):
         reasons = self.explore(8)
         self.assertEqual(reasons[-1], "10 tool calls in a row changed no file while python check.py still fails.")
 
+    def test_an_old_failure_goes_stale(self):
+        # The real case: a `find /` timed out at the start, and 40 tool calls later, while the main branch edited
+        # through Bash, a reflection named it as the command that still fails.
+        self.record("bash", {"command": "find / -name three.module.js"}, {"error": "Bash timed out", "output": ""})
+        self.explore(5)
+        self.record("write_file", {"path": "scene.js"}, {"output": "Wrote scene.js", "changed": True})
+        self.explore(6, start=5)
+        self.record("write_file", {"path": "render.js"}, {"output": "Wrote render.js", "changed": True})
+        self.assertEqual(self.explore(10, start=11), [None] * 10)
+
     def test_a_file_change_restarts_the_count(self):
         self.record("bash", {"command": "python check.py"}, {"exit_code": 1, "output": "FAILED"})
         self.explore(5)

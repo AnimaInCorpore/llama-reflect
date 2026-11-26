@@ -6,14 +6,14 @@ cannot bring in facts of its own. It replaces two judges that had a stake in the
 answer to its own objection, and a stalled main branch choosing its own way out.
 """
 
-from .reflection import HONESTY_RULE
+from .reflection import BREVITY_RULE, HONESTY_RULE
 
 MODERATOR_PROMPT = (
     "You are the moderator between the reflectors of a coding agent and its main branch, which carries out the "
     "user's request. You decide which findings the main branch follows. Decide only from the facts that the "
     "reflectors cited and a verifier confirmed, measured against the user's request as the user stated it. "
     "Bring in no facts, ideas, or preferences of your own, and judge nothing by what this message does not "
-    "show. " + HONESTY_RULE
+    "show. " + HONESTY_RULE + " " + BREVITY_RULE
 )
 RULING_PROMPT = (
     "Rule on each finding. follow: its conclusion follows from its confirmed facts, and following it serves the "

@@ -1,6 +1,6 @@
 """Critics that look for the reasons a plan will fail, and for a simpler one, before its first file change."""
 
-from .reflection import GOAL_RULE, HONESTY_RULE, Role
+from .reflection import BREVITY_RULE, GOAL_RULE, HONESTY_RULE, Role
 
 
 CHALLENGE_PROMPT = (
@@ -14,7 +14,7 @@ CHALLENGE_PROMPT = (
 ANSWER_PROMPT = (
     "Name the one most likely reason that the plan fails. In objection, state it. In evidence, give the tool "
     "result that supports it, or say that it is unverified. In check, give a cheap command or read that "
-    "confirms or refutes it. In likelihood, rate it high, medium, or low. Keep each field brief."
+    "confirms or refutes it. In likelihood, rate it high, medium, or low. " + BREVITY_RULE
 )
 FIELDS = ("objection", "evidence", "check", "likelihood")
 LIKELIHOODS = ("high", "medium", "low")
@@ -38,7 +38,7 @@ SIMPLIFY_ANSWER_PROMPT = (
     "it or is about as simple. In relies_on, name the existing files, functions, or tools in the workspace that "
     "the strategy depends on, or none. In why_simpler, say what it saves compared with the current plan. In "
     "requirements, list every requirement of the request and of any spec or tests, and how the strategy keeps "
-    "it. Keep each field brief."
+    "it. " + BREVITY_RULE
 )
 # The goal comes first, so the model abstracts before it proposes.
 SIMPLIFY_FIELDS = ("goal", "simpler_plan", "relies_on", "why_simpler", "requirements")

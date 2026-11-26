@@ -264,7 +264,8 @@ class EngineTest(unittest.TestCase):
         # The verdict and the moderator propose nothing, so they do not.
         rule = "Do not install packages or add dependencies."
         self.assertTrue(all(rule in request["system"] for request in server.requests
-                            if not request["system"].startswith(("Compare the exact claim", MODERATOR_PROMPT))))
+                            if not request["system"].startswith(("Compare the exact claim", "Compare each numbered fact",
+                                                                   MODERATOR_PROMPT))))
         self.assertEqual(brief["temperature"], 0.3)
         summary = brief["messages"][1]["content"]
         self.assertIn("Task: Fix it.", summary)
@@ -275,8 +276,8 @@ class EngineTest(unittest.TestCase):
                        if str(node.message.get("content", "")).startswith("Reflection results"))
         proposals = next(event for event in events if event.startswith("Strategy\nReflection proposals"))
         self.assertIn("Proven ideas\n- Diagnosis: Check whether missing.txt exists. Facts: status.txt line 1 says "
-                      "old_ready. Basis: it fits. Cost: one command. Fails if: nothing changes. Verifier: supported "
-                      "by the workspace\n- Observe: Print the directory listing.", proposals)
+                      "old_ready. Basis: it fits. Cost: one command. Fails if: nothing changes.\n- Observe: Print the "
+                      "directory listing.", proposals)
         self.assertIn("\n- Switch tools: Edit the bytes with Python.", proposals)
         self.assertNotIn("Unverified", results)
 
@@ -335,11 +336,33 @@ class EngineTest(unittest.TestCase):
         self.assertIn("Chosen idea\n- Diagnosis: Diagnosis idea.", results)
         self.assertNotIn("Observe idea", results)
         self.assertNotIn("Switch tools idea", results)
-        self.assertIn("Reflection Observe: dropped, its facts are refuted. contradicted by the workspace", events)
+        self.assertIn("Reflection Observe: dropped, its fact is not confirmed. contradicted by the workspace", events)
         self.assertIn("Reflection Switch tools: dropped, the idea names no facts.", events)
         choice = next(request for request in server.requests if request["response_format"]
                       and "role" in request["response_format"]["schema"]["properties"])
         self.assertEqual(choice["response_format"]["schema"]["properties"]["role"]["enum"], ["Diagnosis", "none"])
+
+    def test_each_fact_of_an_idea_is_judged_on_its_own(self):
+        # The real case: an idea that named the real bug was rejected, because one of its facts gave a wrong line.
+        route = reflection_route(facts={"Diagnosis": ["status.txt line 1 says old_ready", "wrong line 5 pushes"],
+                                        "Observe": ["wrong one", "unclear two"], "Switch tools": ""},
+                                 statuses={"wrong": "contradicted", "unclear": "insufficient"})
+        replies = [call("read_file", path="missing.txt"), call("read_file", path="missing.txt"), text("Done.")]
+        engine, server, events = make_engine(self.root, replies, route=route)
+        self.assertEqual(asyncio.run(engine.respond("Fix it.")), "Done.")
+        results = next(node.message["content"] for node in engine.tree.nodes
+                       if str(node.message.get("content", "")).startswith("Reflection results"))
+        self.assertIn("- Diagnosis: Diagnosis idea. Facts: status.txt line 1 says old_ready. Basis: it fits.", results)
+        self.assertIn("(1 of 2 facts confirmed.) Refuted: wrong line 5 pushes", results)
+        self.assertIn("Reflection Observe: dropped, none of its 2 facts is confirmed. contradicted by the workspace",
+                      events)
+        verifier = next(request for request in server.requests
+                        if request["system"].startswith("Compare each numbered fact"))
+        self.assertEqual(verifier["response_format"]["schema"]["properties"]["verdicts"]["maxItems"], 2)
+        reviewer = next(request for request in server.requests if request["response_format"]
+                        and "proposal" in request["response_format"]["schema"]["properties"])
+        self.assertEqual(reviewer["response_format"]["schema"]["properties"]["facts"]["maxItems"], 3)
+        self.assertIn("Be short and concise", reviewer["system"])
 
     def test_without_a_proven_idea_there_is_no_decision(self):
         replies = [call("read_file", path="missing.txt"), call("read_file", path="missing.txt"), text("Done.")]
@@ -348,9 +371,12 @@ class EngineTest(unittest.TestCase):
         results = next(node.message["content"] for node in engine.tree.nodes
                        if str(node.message.get("content", "")).startswith("Reflection results"))
         self.assertIn("No reviewer idea rested on facts that a verifier could confirm.", results)
+        # The note must not claim confirmed facts that no idea had.
+        self.assertNotIn("A verifier confirmed", results)
+        self.assertIn("Take the observed stall itself as the finding.", results)
         self.assertFalse(any(request["response_format"] and "role" in request["response_format"]["schema"]["properties"]
                              for request in server.requests))
-        self.assertEqual(sum("its facts are not proven" in event for event in events), 3)
+        self.assertEqual(sum("its fact is not confirmed" in event for event in events), 3)
 
     def test_an_unusable_choice_still_shows_the_proven_ideas(self):
         replies = [call("read_file", path="missing.txt"), call("read_file", path="missing.txt"), text("Done.")]
@@ -445,7 +471,8 @@ class EngineTest(unittest.TestCase):
         self.assertEqual([warning.split(". ")[0] for warning in warnings],
                          ["Context: 560 of 744 tokens in use (75%), keeping 256 of the 1,000 for a reply",
                           "Context: 700 of 744 tokens in use (94%), keeping 256 of the 1,000 for a reply"])
-        self.assertIn(f"--resume {engine.tree.path.stem}", warnings[0])
+        self.assertIn("When it is full, Reflect gives replies less room and then shortens older messages.",
+                      warnings[0])
 
     def test_unknown_context_size_shows_no_warning(self):
         engine, _, events = make_engine(self.root, [text("Done.")], forks=False, tokens=[990])
@@ -471,6 +498,42 @@ class EngineTest(unittest.TestCase):
         self.assertTrue(message.startswith("The request needs 900 tokens plus 256 for the reply"))
         self.assertIn("a lower --max-tokens", message)
         self.assertIn(f"--resume {engine.tree.path.stem}", message)
+
+    def test_a_reply_gets_less_room_when_the_server_counts_it(self):
+        # Basalt counts max_tokens against the context. The room left is enough while it is a quarter of the limit.
+        replies = [ContextLimitError(50000, 65536, reply_tokens=20000), text("Done.")]
+        engine, server, events = make_engine(self.root, replies, forks=False, max_tokens=20000, thinking_budget=10000)
+        self.assertEqual(asyncio.run(engine.respond("hi")), "Done.")
+        self.assertEqual([request["max_tokens"] for request in server.requests], [20000, 15520])
+        self.assertEqual([request["thinking_budget"] for request in server.requests], [10000, 7760])
+        self.assertFalse(any(event.startswith("Context: shortened") for event in events))
+
+    def test_older_messages_are_shortened_when_the_conversation_does_not_fit(self):
+        (Path(self.root) / "big.txt").write_text("x" * 3000 + "\n", encoding="utf-8")
+        reads = [call("read_file", path="big.txt") for _ in range(7)]
+        engine, server, events = make_engine(self.root, [*reads, ContextLimitError(1200, 1000), text("Done."),
+                                                         text("Again.")], forks=False)
+        self.assertEqual(asyncio.run(engine.respond("Read it.")), "Done.")
+        self.assertIn("Context: shortened the 3 older messages to fit the server's context: long tool output and "
+                      "file contents are cut, and images are left out.", events)
+        retried = server.requests[-1]["messages"]
+        self.assertIn("characters left out to save context", retried[3]["content"])
+        self.assertNotIn("characters left out", retried[-1]["content"])
+        # Later requests keep the shortening, so the server's cache of the conversation holds.
+        self.assertEqual(asyncio.run(engine.respond("Once more.")), "Again.")
+        self.assertIn("characters left out to save context", server.requests[-1]["messages"][3]["content"])
+
+    def test_only_the_latest_thinking_goes_back_to_the_server(self):
+        first = {**call("read_file", path="status.txt"), "reasoning_content": "first thoughts"}
+        second = {**call("read_file", path="status.txt"), "reasoning_content": "second thoughts"}
+        engine, server, _ = make_engine(self.root, [first, second, text("Done.")], forks=False)
+        self.assertEqual(asyncio.run(engine.respond("Read it.")), "Done.")
+        sent = [message.get("reasoning_content") for message in server.requests[-1]["messages"]
+                if message["role"] == "assistant"]
+        self.assertEqual(sent, [None, "second thoughts"])
+        stored = [node.message.get("reasoning_content") for node in engine.tree.nodes
+                  if node.message["role"] == "assistant" and node.message.get("tool_calls")]
+        self.assertEqual(stored, ["first thoughts", "second thoughts"])
 
 
     def test_default_thinking_budget_leaves_half_for_the_answer(self):

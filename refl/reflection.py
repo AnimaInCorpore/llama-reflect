@@ -18,6 +18,14 @@ FACTS_RULE = (
     "cannot confirm does not reach the main branch. Earlier command output or a file's earlier content cannot "
     "be checked that way."
 )
+# Reflectors answer in a few words with a fact. In one session, verdicts restated every part of a claim, and the
+# main branch received paragraphs where one line with a file and line would do.
+BREVITY_RULE = (
+    "Be short and concise: give each field in one or two sentences, and each fact in one line that names the "
+    "file and line and quotes what is there. Do not restate the task, the claim, or the evidence."
+)
+# At most this many facts per idea. Each is checked on its own, so one wrong detail does not sink the others.
+MAX_FACTS = 3
 # Every reflector serves the user's request, not a goal of its own.
 GOAL_RULE = (
     "Keep the user's request in view as the user stated it. What you propose must serve that request: do not "
@@ -160,6 +168,10 @@ _FILE_WRITES = {"write_file", "edit_file"}
 # in no solved one, and it no longer fired in two real sessions on a grep without a match or an ls of a
 # missing folder.
 _QUIET_LIMIT = 10
+# A failure older than this many tool calls no longer counts as unresolved for that rule. In a real session, a
+# `find /` that timed out at the start of a task was named 40 tool calls later as the command that still fails,
+# while the main branch edited through Bash, which the rule does not see as a file change.
+_STALE_FAILURE = 2 * _QUIET_LIMIT
 # Summaries that test runners and Python print. A piped command such as `pytest | tail` exits successfully
 # even when the tests fail.
 _FAILURE_REPORT = re.compile(
@@ -239,6 +251,8 @@ class StallDetector:
         # The latest Bash command whose output reported a failure, or that ended in an error, and that has not
         # passed since.
         self.unresolved = None
+        self.unresolved_at = 0  # the tool call count when it failed
+        self.calls = 0  # tool results in the task
         self.kind = None  # stall kind of the latest report
         self.batches = 0  # reflection batches since the task started or last made progress
         self.used = set()  # role names used in those batches
@@ -252,6 +266,8 @@ class StallDetector:
         self.last_bash = None
         self.quiet = 0
         self.unresolved = None
+        self.unresolved_at = 0
+        self.calls = 0
         self.kind = None
         self.batches = 0
         self.used.clear()
@@ -297,6 +313,7 @@ class StallDetector:
             self.reported = {key for key in self.reported if key[0] == "edits"}
         elif passed:
             self.reported = {key for key in self.reported if key[0] != "edits"}
+        self.calls += 1
         signature = _result_signature(result)
         if observation.failed:
             previous, count = self.failures.get(observation.action, (None, 0))
@@ -308,7 +325,7 @@ class StallDetector:
             self.runs[observation.action] = self.runs.get(observation.action, 0) + 1
             self.last_bash = observation
             if observation.reports_check_failure:
-                self.unresolved = observation
+                self.unresolved, self.unresolved_at = observation, self.calls
             elif (self.unresolved is not None and self.unresolved.core == observation.core
                   and not observation.reports_failure):
                 self.unresolved = None
@@ -382,7 +399,8 @@ class StallDetector:
             if edits >= 3:
                 return self._report(("edits", latest.path),
                                     f"{latest.subject} was changed three times without a successful Bash check.")
-        if self.quiet >= _QUIET_LIMIT and self.unresolved is not None:
+        if (self.quiet >= _QUIET_LIMIT and self.unresolved is not None
+                and self.calls - self.unresolved_at <= _STALE_FAILURE):
             # Activity that never converges, such as a new script each time, repeats nothing the rules above see.
             reason = self._report(("wandering", self.unresolved.action, self.quiet),
                                   f"{self.quiet} tool calls in a row changed no file while {self.unresolved.subject} "

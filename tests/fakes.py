@@ -45,6 +45,7 @@ class FakeServer:
                        thinking=True, tool_choice=None, thinking_budget=None, reasoning_effort=None, session=None,
                        on_text=None):
         self.requests.append({
+            "max_tokens": max_tokens,
             "system": messages[0]["content"],
             "messages": messages,
             "tools": [tool["function"]["name"] for tool in tools],
@@ -133,6 +134,14 @@ def reflection_route(ideas=None, statuses=None, status="supported", facts="a.txt
             return text(json.dumps(answer))
         if system.startswith("You are Reflect's read-only verifier"):
             return call("grep_search", pattern=".", path=".")
+        if "verdicts" in properties:
+            # One verdict per numbered fact, each by the first word of `statuses` in that fact.
+            claim = request["messages"][1]["content"].split("\n\nCurrent evidence")[0]
+            lines = [line.split(". ", 1)[1] for line in claim.splitlines()[1:]]
+            found = [next((value for word, value in (statuses or {}).items() if word in line), status)
+                     for line in lines]
+            return text(json.dumps({"verdicts": [{"reason": f"{value} by the workspace", "status": value}
+                                                 for value in found]}))
         if "status" in properties and system.startswith("Compare the exact claim"):
             claim = request["messages"][1]["content"].split("\n\nCurrent evidence")[0]
             found = next((value for word, value in (statuses or {}).items() if word in claim), status)
@@ -143,12 +152,12 @@ def reflection_route(ideas=None, statuses=None, status="supported", facts="a.txt
 
 def make_engine(root, replies, *, max_turns=20, forks=True, verification=True, thinking="auto", moves_text=False,
                 tokens=None, context_size=None, thinking_budget=None, fork_effort=None, vision=False, challenge=False, route=None, fork_thinking_budget=None,
-                on_progress=None):
+                on_progress=None, max_tokens=256):
     """Without `challenge`, scripted replies need no answers for the critics."""
     events = []
     tree = ConversationTree(Path(root) / ".refl" / "sessions", SYSTEM_PROMPT)
     server = FakeServer(replies, moves_text=moves_text, tokens=tokens, route=route)
-    engine = Engine(server, "model", WorkspaceTools(root), tree, max_turns, 256, events.append,
+    engine = Engine(server, "model", WorkspaceTools(root), tree, max_turns, max_tokens, events.append,
                     forks=forks, verification=verification, thinking=thinking, context_size=context_size,
                     thinking_budget=thinking_budget, fork_effort=fork_effort, vision=vision, challenge=challenge,
                     fork_thinking_budget=fork_thinking_budget,

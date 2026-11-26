@@ -10,7 +10,9 @@ from .challenge import SIMPLIFIER, SIMPLIFY_ANSWER_PROMPT, SIMPLIFY_PROMPT
 from .challenge import answer_schema, format_objection, format_simplification, objection_of, simplification_of
 from .challenge import SMALL_EDIT_CHARS, SMALL_EDIT_LINES, simplification_claim, simplify_schema, small_edit
 from .client import THINKING_BUDGET_MESSAGE, ContextLimitError, ServerError, TokenLimitError
-from .reflection import FACTS_RULE, GOAL_RULE, HONESTY_RULE, MANUAL, REFLECTION_PROMPT, StallDetector
+from .context import shorten, shorten_point, without_old_thinking
+from .reflection import BREVITY_RULE, FACTS_RULE, GOAL_RULE, HONESTY_RULE, MANUAL, MAX_FACTS, REFLECTION_PROMPT
+from .reflection import StallDetector
 from .moderator import CHECK_PROMPT, CHECK_SCHEMA, CHOICE_PROMPT, MODERATOR_PROMPT, RULING_PROMPT
 from .moderator import case, choice_schema, ruling_schema, rulings_of
 from .reflection import REQUESTS as REFLECTION_REQUESTS
@@ -142,17 +144,38 @@ _VERIFY_PROMPT = (
     "Your tool results will be used to decide the verdict."
 )
 _EVIDENCE_PROMPT = (
-    "Compare the exact claim with the supplied workspace evidence. In reason, explain what the source shows, "
-    "say whether it agrees with the claim, and cite the file and line if available. Set status to supported "
-    "if the evidence confirms the claim, contradicted if it disproves the claim, or insufficient if it does neither."
+    "Compare the exact claim with the supplied workspace evidence. In reason, say in one or two sentences what "
+    "the source shows and whether it agrees with the claim, citing the file and line if available. Set status to "
+    "supported if the evidence confirms the claim, contradicted if it disproves the claim, or insufficient if it "
+    "does neither."
 )
+# Facts of a reviewer's idea are judged one by one. In one session, a verifier judged three facts as one claim and
+# rejected an idea that named the real bug, because another fact gave a wrong line for one statement.
+_FACTS_EVIDENCE_PROMPT = (
+    "Compare each numbered fact with the supplied workspace evidence, on its own and in order. For each, in "
+    "reason, say in one sentence what the source shows, citing the file and line. Set status to supported if the "
+    "evidence confirms that fact, contradicted if it disproves it, or insufficient if it does neither."
+)
+
+
+def _facts_verdict_schema(count):
+    return {
+        "type": "json_object",
+        "schema": {
+            "type": "object",
+            "properties": {"verdicts": {"type": "array", "items": _VERDICT_SCHEMA["schema"],
+                                        "minItems": count, "maxItems": count}},
+            "required": ["verdicts"],
+            "additionalProperties": False,
+        },
+    }
 _PROPOSAL_PROMPT = (
     "You are a read-only reviewer helping a coding task that stalled. Answer in your role. In proposal, give "
     "one concrete next action that does not contradict the task's stated requirements, or leave it empty if the "
-    "evidence supports none. In facts, give the facts in the workspace as it is now that the proposal rests on, "
-    "with file and line. In basis, give the reasoning, known technique, or analogy that connects those "
+    "evidence supports none. In facts, list up to three facts in the workspace as it is now that the proposal "
+    "rests on, most important first, each one line with file and line. A verifier checks each on its own. In basis, give the reasoning, known technique, or analogy that connects those "
     "facts to the proposal. In cost, say what trying it takes. In fails_if, give the result that would show it "
-    "did not work. Keep each field brief. " + FACTS_RULE + " " + GOAL_RULE + " " + HONESTY_RULE
+    "did not work. " + BREVITY_RULE + " " + FACTS_RULE + " " + GOAL_RULE + " " + HONESTY_RULE
 )
 _FIELD_LABELS = {"abstraction": "Abstract form", "facts": "Facts", "basis": "Basis", "cost": "Cost",
                  "fails_if": "Fails if"}
@@ -162,6 +185,12 @@ _AFTER_REFLECTION = (
     "commands you repeated before this reflection. For a localized fix, read only the lines you need "
     "and make a targeted edit. Preserve unrelated code and keep the final request for rerunning the check that "
     "showed the problem."
+)
+# Without a proven idea, the note must not claim one. In one session, it said a verifier had confirmed the facts
+# behind each idea right after saying that no idea had any.
+_NOTHING_PROVEN = (
+    "Take the observed stall itself as the finding. Run a check that shows its cause before you change more, and "
+    "do not go back to the edits or commands you repeated before this reflection."
 )
 _CARRY_OUT = "Carry out the moderator's plan now, starting with its first step."
 _FOLLOW_REQUEST = (
@@ -183,22 +212,35 @@ _AFTER_CHALLENGE = "Carry out the revised plan now. Reissue the deferred calls t
 
 
 def _proposal_schema(fields):
+    properties = {field: {"type": "string"} for field in fields}
+    if "facts" in properties:
+        properties["facts"] = {"type": "array", "items": {"type": "string"}, "maxItems": MAX_FACTS}
     return {
         "type": "json_object",
         "schema": {
             "type": "object",
-            "properties": {field: {"type": "string"} for field in fields},
+            "properties": properties,
             "required": list(fields),
             "additionalProperties": False,
         },
     }
 
 
+def _facts_of(answer):
+    """The facts of a reviewer's answer as a list of at most MAX_FACTS lines. A single string is one fact."""
+    facts = answer.get("facts") if isinstance(answer, dict) else None
+    facts = facts if isinstance(facts, list) else [facts]
+    lines = [" ".join(str(fact or "").split()) for fact in facts]
+    return [line[:300] for line in lines
+            if line.strip(" .").lower() not in ("", "none", "unverified", "unknown")][:MAX_FACTS]
+
+
 def _format_proposal(answer):
     """Turn a structured reviewer answer into one line for the main branch."""
     parts = [" ".join(answer["proposal"].split())]
     for field, label in _FIELD_LABELS.items():
-        value = " ".join(str(answer.get(field, "")).split())
+        value = answer.get(field, "")
+        value = " ".join(("; ".join(map(str, value)) if isinstance(value, list) else str(value)).split())
         if value:
             parts.append(f"{label}: {value}")
     return " ".join(part if part.endswith((".", "?", "!")) else part + "." for part in parts)
@@ -387,6 +429,10 @@ _TEMPLATE_PROBE = [
 
 # Shares of the server's context at which the main conversation triggers a warning.
 _CONTEXT_WARNINGS = (0.75, 0.9)
+# The smallest reply that a request gets before older messages are shortened, unless --max-tokens is smaller,
+# and the tokens left free when a reply is fitted to the context.
+_MIN_REPLY = 4096
+_CONTEXT_MARGIN = 16
 
 
 class Engine:
@@ -440,6 +486,10 @@ class Engine:
         # Tokens of context per server slot, if the server reports it, and how many warnings were shown.
         self.context_size = context_size
         self.context_warnings = 0
+        # Main-branch messages before this index are sent shortened, and the reply limit of the latest main
+        # request, which is lower than --max-tokens when the conversation fills the context.
+        self.shortened = 1
+        self.reply_limit = max_tokens
         # Whether the server takes image input. Without it the model does not get the view_image tool.
         self.vision = vision
         # Called with the phase and its counts, such as critics=(4, 6), for a status line. Counts per phase.
@@ -580,27 +630,50 @@ class Engine:
             self._progress(phase="Next step, thinking" if thinking else "Next step")
         if self.split_text is None:
             self.split_text = await self._template_moves_text()
-        messages = attach_images(messages, self.vision)
         if not self.vision:
             tools = [tool for tool in tools if tool["function"]["name"] != "view_image"]
-        if self.split_text:
-            messages = split_text_and_calls(messages)
-        try:
-            stream = self._stream_to_panel(actor or (None if fork else "Main branch"))
+        # A request that does not fit gets a smaller reply, down to a quarter of --max-tokens, if the server counts
+        # the reply against the context. Below that, the older messages are shortened, once for the main branch,
+        # whose later requests keep that shortening so the server's cache holds.
+        raw, shortened, reply = without_old_thinking(messages), self.shortened, self.max_tokens
+        floor = min(self.max_tokens, max(_MIN_REPLY, self.max_tokens // 4))
+        while True:
+            sent = attach_images(shorten(raw, shortened), self.vision)
+            if self.split_text:
+                sent = split_text_and_calls(sent)
+            limit = budget if reply == self.max_tokens else min(budget or reply, reply // 2)
+            if not fork:
+                self.reply_limit = reply
             try:
-                message, tokens = await self.server.complete(self.model, messages, tools, self.max_tokens,
-                                                             response_format=response_format, temperature=temperature,
-                                                             thinking=thinking, tool_choice=tool_choice,
-                                                             thinking_budget=budget,
-                                                             reasoning_effort=self.fork_effort if fork else None,
-                                                             session=self._session(branch),
-                                                             **({"on_text": stream} if stream else {}))
-            finally:
-                if stream:
-                    stream("done", "")
-        except ContextLimitError as error:
-            raise ContextLimitError(error.tokens, error.n_ctx, self._context_advice(),
-                                    reply_tokens=error.reply_tokens) from None
+                stream = self._stream_to_panel(actor or (None if fork else "Main branch"))
+                try:
+                    message, tokens = await self.server.complete(self.model, sent, tools, reply,
+                                                                 response_format=response_format,
+                                                                 temperature=temperature, thinking=thinking,
+                                                                 tool_choice=tool_choice,
+                                                                 thinking_budget=limit if thinking else budget,
+                                                                 reasoning_effort=self.fork_effort if fork else None,
+                                                                 session=self._session(branch),
+                                                                 **({"on_text": stream} if stream else {}))
+                finally:
+                    if stream:
+                        stream("done", "")
+                break
+            except ContextLimitError as error:
+                room = error.n_ctx - error.tokens - _CONTEXT_MARGIN if error.reply_tokens is not None else None
+                point = shorten_point(len(raw))
+                if room is not None and floor <= room < reply:
+                    reply = room
+                elif point > shortened:
+                    shortened, reply = point, self.max_tokens
+                else:
+                    raise ContextLimitError(error.tokens, error.n_ctx, self._context_advice(),
+                                            reply_tokens=error.reply_tokens) from None
+        if not fork and shortened > self.shortened:
+            self.shortened = shortened
+            self.on_tool(f"Context: shortened the {shortened - 1:,} older messages to fit the server's context: "
+                         f"long tool output and file contents are cut, and images are left out.")
+        budget = limit
         reasoning = message.get("reasoning_content")
         if not fork and isinstance(reasoning, str) and reasoning.strip():
             # The main branch's thinking, shown when its reply arrives. Requests do not stream, so not sooner.
@@ -617,9 +690,9 @@ class Engine:
         return session if branch is None else f"{session}-{branch}"
 
     def _context_advice(self):
-        return (f"Reflect does not shorten conversations yet. For more room, restart llama-server with more "
-                f"context per slot, such as a larger -c or a smaller -np, and continue with "
-                f"--resume {self.tree.path.stem}.")
+        return (f"Reflect already left out older thinking and shortened older messages. For more room, give the "
+                f"server more context per slot, such as a larger -c or a smaller -np for llama-server, and continue "
+                f"with --resume {self.tree.path.stem}.")
 
     def _check_context(self, tokens):
         """Warn once as the main conversation passes each share of the room it has in the server's context.
@@ -636,8 +709,8 @@ class Engine:
             self.context_warnings = reached
             reserve = (f", keeping {self.max_tokens:,} of the {self.context_size:,} for a reply"
                        if room < self.context_size else "")
-            self.on_tool(f"Context: {tokens:,} of {room:,} tokens in use ({share:.0%}){reserve}. "
-                         f"{self._context_advice()}")
+            self.on_tool(f"Context: {tokens:,} of {room:,} tokens in use ({share:.0%}){reserve}. When it is full, "
+                         f"Reflect gives replies less room and then shortens older messages.")
 
     async def _template_moves_text(self):
         """Check whether the server's chat template renders an assistant's text after its tool results."""
@@ -701,7 +774,14 @@ class Engine:
             }, parent_id=leaf, branch_type=branch_type)
         return leaf, evidence
 
-    async def _verify(self, anchor, claim, actor="Verifier"):
+    async def _verify(self, anchor, claim, actor="Verifier", *, facts=None):
+        """Check a claim in a read-only fork and return its verdict, such as "[VERIFIED] reason".
+
+        With `facts`, a list, the claim is that each fact holds, and the result is a list with a verdict per fact.
+        """
+        if facts:
+            claim = "These facts hold in the workspace:\n" + "\n".join(
+                f"{number}. {fact}" for number, fact in enumerate(facts, 1))
         self.on_tool(f"Verifying {claim}")
         leaf = self.tree.append({
             "role": "user",
@@ -732,15 +812,23 @@ class Engine:
                 if not evidence or attempt == 2:
                     continue
                 messages = [
-                    {"role": "system", "content": _EVIDENCE_PROMPT},
+                    {"role": "system", "content": _FACTS_EVIDENCE_PROMPT if facts else _EVIDENCE_PROMPT},
                     {"role": "user", "content": f"Claim: {claim}\n\nCurrent evidence:\n" + "\n\n".join(evidence)},
                 ]
                 message = await self._complete(
-                    messages, [], fork=True, response_format=_VERDICT_SCHEMA, branch=start, actor=actor,
+                    messages, [], fork=True, branch=start, actor=actor,
+                    response_format=_facts_verdict_schema(len(facts)) if facts else _VERDICT_SCHEMA,
                 )
                 leaf = self.tree.append(message, parent_id=leaf, branch_type="verification")
                 try:
                     verdict = json.loads(message.get("content") or "")
+                    if facts:
+                        results = [f"[{_VERDICT_LABELS[item['status']]}] {' '.join(item['reason'].split())[:300]}"
+                                   for item in verdict["verdicts"]]
+                        if len(results) == len(facts):
+                            self.tree.finish_fork(leaf, anchor, "merged")
+                            return results
+                        raise ValueError("one verdict per fact")
                     label = _VERDICT_LABELS[verdict["status"]]
                     detail = " ".join(verdict["reason"].split())
                     if detail:
@@ -754,7 +842,7 @@ class Engine:
             reason = str(error)
 
         self.tree.finish_fork(leaf, anchor, "pruned")
-        return f"[UNVERIFIED] {reason}"
+        return [f"[UNVERIFIED] {reason}"] * len(facts) if facts else f"[UNVERIFIED] {reason}"
 
     async def _review(self, anchor, stall, role, brief, history):
         """Run one reviewer in a read-only fork and return its structured answer, or None without an idea."""
@@ -840,23 +928,31 @@ class Engine:
         self._tick("reviewers")
         if answer is None:
             return None
-        facts = " ".join(str(answer.get("facts", "")).split())
-        if facts.strip(" .").lower() in ("", "none", "unverified", "unknown"):
+        facts = _facts_of(answer)
+        if not facts:
             self.on_tool(f"Reflection {role.name}: dropped, the idea names no facts.")
             self._actor(role.name, "dropped, no facts named", "quiet")
             return None
         self._actor(role.name, "verifier checks its facts", "work")
         self._tick("verifiers", done=0, total=1)
-        verdict = await self._verify(anchor, f"These facts hold in the workspace: {facts}", actor=role.name)
+        verdicts = await self._verify(anchor, None, actor=role.name, facts=facts)
         self._tick("verifiers")
-        label, _, detail = verdict.partition("] ")
-        if label != "[VERIFIED":
-            why = "refuted" if label == "[FALSE ASSUMPTION" else "not proven"
-            self.on_tool(f"Reflection {role.name}: dropped, its facts are {why}. {detail}")
-            self._actor(role.name, f"dropped, facts {why}", "bad" if why == "refuted" else "quiet")
+        confirmed = [fact for fact, verdict in zip(facts, verdicts) if verdict.startswith("[VERIFIED]")]
+        refuted = [fact for fact, verdict in zip(facts, verdicts) if verdict.startswith("[FALSE ASSUMPTION]")]
+        # Only confirmed facts argue for the idea. A refuted one stays in view, so the moderator can weigh it.
+        if not confirmed:
+            why = "refuted" if refuted else "not proven"
+            what = "its fact is not" if len(facts) == 1 else f"none of its {len(facts)} facts is"
+            self.on_tool(f"Reflection {role.name}: dropped, {what} confirmed. {verdicts[0].partition('] ')[2]}")
+            self._actor(role.name, f"dropped, facts {why}", "bad" if refuted else "quiet")
             return None
         self._actor(role.name, f"proven: {_short(answer.get('proposal', ''))}", "good")
-        return f"{_format_proposal(answer)[:800]} Verifier: {detail}"
+        idea = _format_proposal({**answer, "facts": confirmed})[:800]
+        if len(confirmed) < len(facts):
+            idea += f" ({len(confirmed)} of {len(facts)} facts confirmed.)"
+        if refuted:
+            idea += " Refuted: " + "; ".join(refuted)[:300]
+        return idea
 
     async def _reflect(self, reason, *, manual=False):
         anchor = self.tree.head
@@ -918,7 +1014,8 @@ class Engine:
         else:
             # A manual reflection, no proven idea, or no usable choice: the main branch sees what was proven.
             outcome = "the main branch sees them all" if found else "nothing to try"
-            content = f"Reflection results\n{heading}: {reason}\n\n{summary}\n\n{_AFTER_REFLECTION}"
+            content = (f"Reflection results\n{heading}: {reason}\n\n{summary}\n\n"
+                       f"{_AFTER_REFLECTION if found else _NOTHING_PROVEN}")
         self.tree.append({"role": "user", "content": content})
         self.on_tool(f"Reflection: {len(found)} of {len(roles)} ideas proven; {outcome} ({_elapsed(start)})")
 
@@ -1354,8 +1451,8 @@ class Engine:
                 if cut_off:
                     raise
                 cut_off = True
-                self.on_tool(f"The reply reached the {self.max_tokens:,}-token limit. Asking for a shorter one.")
-                self.tree.append({"role": "user", "content": _CUT_OFF_PROMPT.format(limit=self.max_tokens)})
+                self.on_tool(f"The reply reached the {self.reply_limit:,}-token limit. Asking for a shorter one.")
+                self.tree.append({"role": "user", "content": _CUT_OFF_PROMPT.format(limit=self.reply_limit)})
                 self.tree.save()
                 continue
             calls = _tool_calls(message)
