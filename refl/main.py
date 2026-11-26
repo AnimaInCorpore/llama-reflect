@@ -200,6 +200,7 @@ async def _run(args):
     tree = _open_tree(root, args.resume)
     engine = Engine(server, model, workspace, tree, args.max_turns, args.max_tokens, _status,
                     forks=not args.linear, verification=not args.no_verify, challenge=args.challenge,
+                    mentor=args.mentor,
                     thinking=args.thinking,
                     thinking_budget=args.thinking_budget, fork_effort=args.fork_effort,
                     fork_thinking_budget=args.fork_thinking_budget,
@@ -243,6 +244,9 @@ def main(argv=None):
     parser.add_argument("--challenge", action="store_true",
                         help="have critics challenge the plan before the first larger file change of a task, with a "
                              "moderator ruling on what they prove (default: off)")
+    parser.add_argument("--mentor", action="store_true",
+                        help="add a mentor to each reflection that fetches public documentation pages, saved under "
+                             ".refl/sources/ (default: off)")
     parser.add_argument("--thinking", choices=THINKING_MODES, default="auto",
                         help="auto: the chat template decides, and Qwen3.8's thinks on every request; main: think on "
                              "the main branch only; off: ask the chat template to skip thinking (default: auto)")

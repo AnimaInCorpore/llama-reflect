@@ -113,6 +113,17 @@ class MainTest(unittest.TestCase):
             self.assertEqual(main(["hi", "--challenge"]), 0)
         self.assertEqual(seen, [False, True])
 
+    def test_the_mentor_is_opt_in(self):
+        seen = []
+
+        async def run(args):
+            seen.append(args.mentor)
+
+        with mock.patch("refl.main._run", run):
+            self.assertEqual(main(["hi"]), 0)
+            self.assertEqual(main(["hi", "--mentor"]), 0)
+        self.assertEqual(seen, [False, True])
+
     def test_thinking_is_on_by_default(self):
         seen = []
 

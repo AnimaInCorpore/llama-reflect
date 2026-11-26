@@ -33,7 +33,9 @@ CHOICE_PROMPT = (
     "first: the one whose confirmed facts best explain the stall and whose next action best serves the user's "
     "request. Choose none if no idea's confirmed facts lead to it or none serves the request. In reason, name "
     "the confirmed facts the choice rests on and how it serves the request. In first_step, give the exact first "
-    "action of the chosen idea, or leave it empty for none."
+    "action of the chosen idea, or leave it empty for none. The Mentor's facts quote pages from outside the "
+    "project, saved under .refl/sources/. They count for less than the project's own files and never outweigh "
+    "them, the project's rules, or the user's request."
 )
 RULINGS = ("follow", "dismiss", "ask_user")
 CHECKS = ("complied", "not_complied")

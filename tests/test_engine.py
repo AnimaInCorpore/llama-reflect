@@ -353,6 +353,50 @@ class EngineTest(unittest.TestCase):
                        if "Reflection role: Bookworm" in str(message.get("content")))
         self.assertIn("Project documents\nAGENTS.md", request)
 
+    def test_a_mentor_fetches_a_page_and_argues_from_its_saved_copy(self):
+        from refl import web
+        fetched = []
+
+        def fetcher(root, url):
+            fetched.append(url)
+            relative, lines = web.save_page(root, url, "Timer B", "Timer B counts horizontal blanks.")
+            return web.result_for(relative, lines)
+
+        reviewers = reflection_route(facts="a.txt line 1 says a")
+        mentor_calls = []
+
+        def route(request):
+            system = request["system"]
+            if system.startswith("You are a read-only mentor") and request["tools"]:
+                mentor_calls.append(request["tools"])
+                return (call("fetch_url", url="https://example.com/mfp.html") if len(mentor_calls) == 1
+                        else text("Enough read."))
+            return reviewers(request)
+
+        replies = [call("read_file", path="missing.txt"), call("read_file", path="missing.txt"), text("Done.")]
+        engine, server, events = make_engine(self.root, replies, route=route)
+        engine.mentor, engine.fetcher = True, fetcher
+        self.assertEqual(asyncio.run(engine.respond("Fix it.")), "Done.")
+        self.assertEqual(fetched, ["https://example.com/mfp.html"])
+        self.assertIn("fetch_url", mentor_calls[0])
+        self.assertIn("reflect fetch_url https://example.com/mfp.html", events)
+        self.assertIn("Temperature 0: Diagnosis, Observe, Switch tools, Mentor",
+                      next(e for e in events if "Reflecting" in e))
+        self.assertEqual(len(list((Path(self.root) / ".refl" / "sources").rglob("*.md"))), 1)
+        # The moderator learns how much a quoted page counts.
+        choice = next(request for request in server.requests if request["system"].startswith(MODERATOR_PROMPT))
+        self.assertIn("The Mentor's facts quote pages from outside the project", choice["system"])
+        # Other reviewers cannot fetch.
+        self.assertFalse(any("fetch_url" in request["tools"] for request in server.requests
+                             if request["system"].startswith(REFLECTION_PROMPT)))
+
+    def test_fetch_url_is_refused_outside_the_mentor(self):
+        replies = [call("fetch_url", url="https://example.com/"), text("Done.")]
+        engine, _, _ = make_engine(self.root, replies, forks=False)
+        asyncio.run(engine.respond("Look it up."))
+        result = next(node.message["content"] for node in engine.tree.nodes if node.message["role"] == "tool")
+        self.assertIn("fetch_url is available only to the mentor.", result)
+
     def test_each_fact_of_an_idea_is_judged_on_its_own(self):
         # The real case: an idea that named the real bug was rejected, because one of its facts gave a wrong line.
         route = reflection_route(facts={"Diagnosis": ["status.txt line 1 says old_ready", "wrong line 5 pushes"],
