@@ -49,6 +49,17 @@ REFLECTION_PROMPT = (
 FAILURE, UNFIXED, NO_PROGRESS, MANUAL = "failure", "unfixed failure", "no progress", "manual"
 _ANY = frozenset({FAILURE, UNFIXED, NO_PROGRESS, MANUAL})
 PROPOSAL_FIELDS = ("proposal", "facts", "basis", "cost", "fails_if")
+# The reviewer and the critic that read the project's own records. In two game-porting projects, the decisions
+# that mattered were in documents: dated rules from the user in AGENTS.md, "Dead ends" lists, porting guides of
+# 48 KB, and per-game progress logs. A line in a file is also the kind of fact a verifier can confirm.
+BOOKWORM = "Bookworm"
+BOOKWORM_FOCUS = (
+    "Read the project's own records for what they already decided or solved about this step: the guidance and "
+    "documentation files, such as design notes, guides, and progress logs, with their rules, dead ends, and "
+    "measured results, the project skills, the recent commits, and working examples in the code. Search them "
+    "with grep_search for the step's key names, such as a function, file, tool, register, or error message, and "
+    "read the matching lines. Quote the decision or solution in facts with its file and line."
+)
 # Requests for one reflection batch: the reviewers and the verifiers of their facts. They do not count toward
 # --max-turns, as for the plan challenge. A request beyond this stops that step, and the rest goes on.
 REQUESTS = 18
@@ -70,8 +81,7 @@ class Role:
 
 # Earlier roles in each group take priority when several fit.
 ROLES = (
-    Role("Existing patterns", "grounded",
-         "Find a project skill, commit, or working example that solved a similar step, and propose reusing it.",
+    Role(BOOKWORM, "grounded", BOOKWORM_FOCUS + " Propose following the decision or reusing the solution.",
          tools=True, brief=False),
     Role("Diagnosis", "grounded",
          "Name two or three competing causes for the stall, the evidence for each, and one cheap check whose "

@@ -12,7 +12,7 @@ from .challenge import SMALL_EDIT_CHARS, SMALL_EDIT_LINES, simplification_claim,
 from .client import THINKING_BUDGET_MESSAGE, ContextLimitError, ServerError, TokenLimitError
 from .context import shorten, shorten_point, without_old_thinking
 from .reflection import BREVITY_RULE, FACTS_RULE, GOAL_RULE, HONESTY_RULE, MANUAL, MAX_FACTS, REFLECTION_PROMPT
-from .reflection import StallDetector
+from .reflection import BOOKWORM, StallDetector
 from .moderator import CHECK_PROMPT, CHECK_SCHEMA, CHOICE_PROMPT, MODERATOR_PROMPT, RULING_PROMPT
 from .moderator import case, choice_schema, ruling_schema, rulings_of
 from .reflection import REQUESTS as REFLECTION_REQUESTS
@@ -569,7 +569,7 @@ class Engine:
             system += self._last_report_note()
         guidance = self.workspace.project_guidance()
         if guidance:
-            system += "\n\nProject guidance from REFLECT.md:\n" + guidance
+            system += "\n\n" + guidance
         if skills:
             system += "\n\nRead relevant project skills before investigating: " + json.dumps(skills, ensure_ascii=False)
         messages[0] = {**messages[0], "content": system}
@@ -580,7 +580,7 @@ class Engine:
         system += "\n\n" + _DEPENDENCY_RULE
         guidance = self.workspace.project_guidance()
         if guidance:
-            system += "\n\nProject guidance from REFLECT.md:\n" + guidance
+            system += "\n\n" + guidance
         return [{"role": "system", "content": system}, *self.tree.messages(leaf, start=start)]
 
     def _user_request(self, anchor):
@@ -853,7 +853,10 @@ class Engine:
         if role.brief:
             request = f"{brief}\n\n{request}"
         skill = None
-        if role.name == "Existing patterns":
+        if role.name == BOOKWORM:
+            documents = self.workspace.document_paths()
+            if documents:
+                request += "\n\nProject documents\n" + "\n".join(documents)
             if history:
                 request += "\n\nRecent project commits\n" + history
             paths = self.workspace.skill_paths()
@@ -958,7 +961,8 @@ class Engine:
         anchor = self.tree.head
         heading = "Request" if manual else "Observed stall"
         history = await asyncio.to_thread(self.workspace.recent_commits)
-        unavailable = set() if history or self.workspace.skill_paths() else {"Existing patterns"}
+        records = history or self.workspace.skill_paths() or self.workspace.document_paths(limit=1)
+        unavailable = set() if records else {BOOKWORM}
         level, roles = self.stalls.plan(MANUAL if manual else self.stalls.kind, unavailable=unavailable,
                                         manual=manual)
         names = ", ".join(role.name for role in roles)
@@ -1088,8 +1092,8 @@ class Engine:
         self.batch_left, self.batch_name = CHALLENGE_REQUESTS, "plan challenge"
         self.challenge_outcome = "stopped early"
         start = time.monotonic()
-        self._progress(phase="Plan check", critics=(0, len(CRITICS) + 1), moderator="waiting")
-        for critic in (*CRITICS, SIMPLIFIER):
+        self._progress(phase="Plan check", critics=(0, len(self._critics()) + 1), moderator="waiting")
+        for critic in (*self._critics(), SIMPLIFIER):
             self._actor(critic.name, "waiting for a slot", "wait")
         self._actor("Moderator", "waiting for proven findings", "wait")
         try:
@@ -1105,11 +1109,12 @@ class Engine:
         self.on_tool(f"Challenge\nLooking for reasons the plan fails, and for a simpler one, before its first "
                      f"change: {pending}")
         # Each finding goes to a verifier as soon as it is ready. The simplifier runs alongside the critics.
-        *results, simpler = await asyncio.gather(*(self._object(anchor, critic, pending) for critic in CRITICS),
+        critics = self._critics()
+        *results, simpler = await asyncio.gather(*(self._object(anchor, critic, pending) for critic in critics),
                                                  self._simplify(anchor, pending))
         # A proven finding is (critic, the point it makes, its line with its confirmed facts).
         proven = []
-        for critic, result in zip(CRITICS, results):
+        for critic, result in zip(critics, results):
             if result is None:
                 continue
             answer, verdict = result
@@ -1288,6 +1293,17 @@ class Engine:
         line = f"{SIMPLIFIER.name}: {format_simplification(answer)[:800]} Verifier: {detail}"
         return SIMPLIFIER, strategy, line
 
+    def _documents_note(self, critic):
+        """The project's documents for the Bookworm's request, or ""."""
+        documents = self.workspace.document_paths() if critic.name == BOOKWORM else []
+        return "\n\nProject documents\n" + "\n".join(documents) if documents else ""
+
+    def _critics(self):
+        """The critics for this workspace. The Bookworm needs documents to read."""
+        if self.workspace.document_paths(limit=1):
+            return list(CRITICS)
+        return [critic for critic in CRITICS if critic.name != BOOKWORM]
+
     async def _critique(self, anchor, critic, pending, *, prompt=CHALLENGE_PROMPT, answer_prompt=ANSWER_PROMPT,
                         schema=None, found=objection_of, nothing="The critic returned no objection."):
         """Run one critic in a read-only fork and return its structured answer, or None if `found` sees nothing."""
@@ -1296,7 +1312,7 @@ class Engine:
         start = leaf = self.tree.append({
             "role": "user",
             "content": (f"User's request: {self._user_request(anchor)[:1500]}\nCritic role: {critic.name}\n"
-                        f"Planned first change: {pending}\n\n{critic.focus}"),
+                        f"Planned first change: {pending}\n\n{critic.focus}" + self._documents_note(critic)),
         }, parent_id=anchor, branch_type="challenge")
         role = f"Your role: {critic.name}. {critic.focus}"
         reason = nothing

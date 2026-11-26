@@ -1,0 +1,13 @@
+{
+  "url": "https://github.com/AnimaInCorpore/STEArcade",
+  "copy": [],
+  "tasks": [
+    {
+      "name": "blittime-refresh-rate",
+      "commit": "9c2c94b",
+      "check": "cd tools && python -m unittest test_blittime",
+      "tests": ["tools/test_blittime.py"],
+      "timeout": 120
+    }
+  ]
+}

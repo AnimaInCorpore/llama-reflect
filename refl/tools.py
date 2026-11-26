@@ -61,6 +61,12 @@ TOOLS = [
 
 _TYPES = {"string": str, "integer": int}
 _OUTPUT_LIMIT = 12000
+# Folders that hold no documents of the project itself, or too many to list.
+_NOT_DOCUMENTS = {"node_modules", "third_party", "vendor", "build", "dist", "venv", "__pycache__", "site-packages"}
+# Top-level folders whose files are documents, plain text included, and that come right after the root's own.
+_DOCUMENT_FOLDERS = {"docs", "doc", "documentation", "wiki", "notes"}
+# Guidance files at the workspace root, in the order they appear in the system prompt.
+_GUIDANCE_FILES = ("REFLECT.md", "AGENTS.md", "CLAUDE.md")
 # grep_search shows up to this many matching lines, each cut at this many characters, and stops after this
 # many seconds.
 _MATCH_LIMIT = 30
@@ -247,14 +253,52 @@ class WorkspaceTools:
         return None
 
     def project_guidance(self):
-        path = self.root / "REFLECT.md"
-        if not path.is_file():
-            return ""
-        with self._file("REFLECT.md").open(encoding="utf-8") as source:
-            content = source.read(_OUTPUT_LIMIT + 1)
-        if len(content) > _OUTPUT_LIMIT:
-            return content[:_OUTPUT_LIMIT] + "\n[Remaining project guidance truncated]"
-        return content.strip()
+        """The guidance files at the workspace root, each under its own heading, or "".
+
+        REFLECT.md is Reflect's own. AGENTS.md and CLAUDE.md are what other coding agents read: in two game-porting
+        projects, AGENTS.md held the mandatory rules, such as which MAME source is authoritative, and Reflect saw
+        none of them. A file with the same text as an earlier one, such as a CLAUDE.md copied from AGENTS.md, is
+        left out.
+        """
+        parts, seen = [], set()
+        for name in _GUIDANCE_FILES:
+            if not (self.root / name).is_file():
+                continue
+            try:
+                with self._file(name).open(encoding="utf-8", errors="replace") as source:
+                    content = source.read(_OUTPUT_LIMIT + 1)
+            except (OSError, ValueError):
+                continue
+            if len(content) > _OUTPUT_LIMIT:
+                content = content[:_OUTPUT_LIMIT] + f"\n[The rest of {name} is cut. Read it with read_file.]"
+            content = content.strip()
+            if content and content not in seen:
+                seen.add(content)
+                parts.append(f"Project guidance from {name}:\n{content}")
+        return "\n\n".join(parts)
+
+    def document_paths(self, limit=60, scan=20000):
+        """The project's documents for the Bookworm: the root's own first, then those in a documentation folder
+        such as docs/, then the rest, shallowest first. Markdown and reStructuredText count everywhere, and plain
+        text in a documentation folder too. Hidden folders and folders of other projects' code, such as
+        third_party/, are left out. At most `scan` entries are looked at.
+        """
+        found, seen = [], 0
+        for directory, folders, files in os.walk(self.root):
+            folders[:] = sorted(name for name in folders if not name.startswith(".") and name not in _NOT_DOCUMENTS)
+            relative = Path(directory).relative_to(self.root)
+            in_folder = bool(relative.parts) and relative.parts[0].lower() in _DOCUMENT_FOLDERS
+            suffixes = (".md", ".rst", ".txt") if in_folder else (".md", ".rst")
+            for name in files:
+                seen += 1
+                if name.lower().endswith(suffixes) and not name.startswith("."):
+                    found.append(((relative / name).as_posix(), in_folder))
+            if seen > scan:
+                break
+        found.sort(key=lambda item: (0 if "/" not in item[0] else 1 if item[1] else 2, item[0].count("/"),
+                                     item[0].casefold()))
+        paths = [path for path, _ in found]
+        return paths[:limit] + ([f"... and {len(paths) - limit} more"] if len(paths) > limit else [])
 
     def recent_commits(self):
         if not (self.root / ".git").exists():

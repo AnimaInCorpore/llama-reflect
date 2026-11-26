@@ -114,6 +114,18 @@ All 34 Python exercises then ran once per arm with the same settings. Both arms 
 
 A live rerun of `pov` with two runs per arm confirmed that the rule fires, after 17 to 19 tool results, and that the reflect arm reflected once in each run. All four runs still ended with 10 of 15 tests failing. The Diagnosis reviewer recommended replacing the rerooting loop with a fresh implementation built on an undirected adjacency map. The main branch chose that idea but patched the same loop again, as it did with the cheapest ideas in earlier versions.
 
+## History benchmark
+
+Exercises do not show whether Reflect can do the work of a project such as STEArcade, which ports arcade games to the Atari STE with its own translators, a reference machine built from MAME, and mandatory rules in `AGENTS.md`. Of its 676 commits, 576 name a Claude model as co-author. `bench/history.py` turns that history into tasks. A task is a commit whose change a test confirms: the workspace is a `git clone --shared` at the commit's parent, the request is the commit message plus the check command, and the run passes when the check passes with the commit's version of the test files, which grading writes again. The clone lives in the results folder, so the local repository and its `.git` stay as they are. Untracked inputs that the checks need, such as ROM sets, are copied from the local clone, or linked with `--link`, which is faster but lets a run change the originals.
+
+```text
+python bench/history.py candidates --repo PATH
+python bench/history.py validate --repo PATH --tasks bench/history/stearcade.json
+python bench/history.py run --repo PATH --tasks bench/history/stearcade.json --arms linear reflect
+```
+
+`candidates` lists commits that change at most two code files, 80 lines by default, together with a test file. `validate` checks that each task's check fails at the parent with the commit's tests and passes at the commit. Most STEArcade candidates are game work whose tests need the ROM set and a build of the game. `bench/history/stearcade.json` starts with one task that needs neither: commit `9c2c94b` infers the desktop's 50, 60, or 71 Hz from a clock calibration in `tools/blittime.py`, with three tests in `tools/test_blittime.py`. At the parent, the tests fail on the missing `clock_calibration`, and at the commit they pass.
+
 ## Larger study
 
 ### Benchmark sequence

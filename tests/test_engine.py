@@ -342,6 +342,17 @@ class EngineTest(unittest.TestCase):
                       and "role" in request["response_format"]["schema"]["properties"])
         self.assertEqual(choice["response_format"]["schema"]["properties"]["role"]["enum"], ["Diagnosis", "none"])
 
+    def test_the_bookworm_reviewer_gets_the_project_documents(self):
+        (Path(self.root) / "AGENTS.md").write_text("Never retry missing.txt.\n", encoding="utf-8")
+        route = reflection_route(facts="AGENTS.md line 1 says never retry missing.txt")
+        replies = [call("read_file", path="missing.txt"), call("read_file", path="missing.txt"), text("Done.")]
+        engine, server, events = make_engine(self.root, replies, route=route)
+        self.assertEqual(asyncio.run(engine.respond("Fix it.")), "Done.")
+        self.assertIn("Temperature 0: Bookworm, Diagnosis, Switch tools", next(e for e in events if "Reflecting" in e))
+        request = next(message["content"] for request in server.requests for message in request["messages"]
+                       if "Reflection role: Bookworm" in str(message.get("content")))
+        self.assertIn("Project documents\nAGENTS.md", request)
+
     def test_each_fact_of_an_idea_is_judged_on_its_own(self):
         # The real case: an idea that named the real bug was rejected, because one of its facts gave a wrong line.
         route = reflection_route(facts={"Diagnosis": ["status.txt line 1 says old_ready", "wrong line 5 pushes"],
@@ -731,6 +742,28 @@ class ChallengeTest(unittest.TestCase):
         self.assertTrue(any(name == "Main branch" and kind == "done" and tokens > 0
                             for name, kind, tokens, *_ in streams))
         self.assertTrue(all(request["streamed"] for request in engine.server.requests))
+
+    def test_the_bookworm_critic_reads_the_project_documents(self):
+        (Path(self.root) / "docs").mkdir()
+        (Path(self.root) / "docs" / "speed.md").write_text("Dead end: a cache of app.py results.\n", encoding="utf-8")
+        route = _critic_route({"Bookworm": "docs/speed.md line 1 records the cache as a dead end"},
+                              verdicts={"dead end": "supported"})
+        replies = [call("write_file", path="app.py", content=_LARGE), text("I will not add the cache."),
+                   call("write_file", path="app.py", content=_LARGE), text("Done.")]
+        engine, server, events = make_engine(self.root, replies, challenge=True, route=route)
+        self.assertEqual(asyncio.run(engine.respond("Write app.py.")), "Done.")
+        request = next(request for request in server.requests if "Critic role: Bookworm" in str(request["messages"]))
+        brief = next(message["content"] for message in request["messages"]
+                     if "Critic role: Bookworm" in str(message.get("content")))
+        self.assertIn("Project documents\ndocs/speed.md", brief)
+        self.assertTrue(any("Bookworm" in event and "dead end" in event for event in events))
+
+    def test_without_documents_there_is_no_bookworm_critic(self):
+        route = _critic_route({})
+        replies = [call("write_file", path="app.py", content=_LARGE), text("Done.")]
+        engine, server, _ = make_engine(self.root, replies, challenge=True, route=route)
+        asyncio.run(engine.respond("Write app.py."))
+        self.assertFalse(any("Critic role: Bookworm" in str(request["messages"]) for request in server.requests))
 
     def test_the_moderator_rules_on_proven_findings_and_checks_the_revised_plan(self):
         route = _critic_route({"Requirements": "It keeps old_ready", "Environment": "Python is missing"},

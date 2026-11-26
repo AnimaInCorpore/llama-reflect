@@ -20,7 +20,7 @@ class RoleTest(unittest.TestCase):
                       moderator.MODERATOR_PROMPT)
         self.assertIn("Bring in no facts, ideas, or preferences of your own", moderator.MODERATOR_PROMPT)
         self.assertEqual([critic.name for critic in challenge.CRITICS],
-                         ["Requirements", "Environment", "Edge cases", "Security", "Quality"])
+                         ["Requirements", "Environment", "Edge cases", "Security", "Bookworm", "Quality"])
         for prompt in (REFLECTION_PROMPT, engine._PROPOSAL_PROMPT):
             self.assertIn(FACTS_RULE, prompt)
         # Every reviewer can gather facts, and every answer names them for the verifier.
@@ -28,10 +28,10 @@ class RoleTest(unittest.TestCase):
         self.assertNotIn("without evidence", " ".join(role.focus for role in ROLES))
 
     def test_first_reflection_is_grounded(self):
-        self.assertEqual(names(choose_roles(0, FAILURE, unavailable={"Existing patterns"})),
+        self.assertEqual(names(choose_roles(0, FAILURE, unavailable={"Bookworm"})),
                          ["Diagnosis", "Observe", "Switch tools"])
-        self.assertEqual(names(choose_roles(0, NO_PROGRESS)), ["Existing patterns", "Diagnosis", "Rebuild and swap"])
-        self.assertEqual(names(choose_roles(0, UNFIXED, unavailable={"Existing patterns"})),
+        self.assertEqual(names(choose_roles(0, NO_PROGRESS)), ["Bookworm", "Diagnosis", "Rebuild and swap"])
+        self.assertEqual(names(choose_roles(0, UNFIXED, unavailable={"Bookworm"})),
                          ["Diagnosis", "Observe", "Rebuild and swap"])
 
     def test_manual_reflection_uses_the_idea_roles(self):
@@ -39,7 +39,7 @@ class RoleTest(unittest.TestCase):
 
     def test_repeated_stalls_raise_the_temperature_and_rotate_roles(self):
         detector = StallDetector({"delay": 0, "remaining": 0})
-        batches = [detector.plan(FAILURE, unavailable={"Existing patterns"}) for _ in range(3)]
+        batches = [detector.plan(FAILURE, unavailable={"Bookworm"}) for _ in range(3)]
         self.assertEqual([level for level, _ in batches], [0, 1, 2])
         self.assertEqual(names(batches[1][1]), ["Prerequisites", "Shrink the problem", "Analogy"])
         self.assertEqual(names(batches[2][1]), ["Rebuild and swap", "Naive shortcut", "Inversion"])

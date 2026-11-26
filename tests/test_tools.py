@@ -70,6 +70,42 @@ if __name__ == "__main__":
     unittest.main()
 
 
+class ProjectGuidanceTest(unittest.TestCase):
+    def setUp(self):
+        self.directory = tempfile.TemporaryDirectory()
+        self.root = Path(self.directory.name)
+        self.tools = WorkspaceTools(self.root)
+
+    def tearDown(self):
+        self.directory.cleanup()
+
+    def test_agents_and_claude_files_are_read_after_reflect_md(self):
+        self.assertEqual(self.tools.project_guidance(), "")
+        (self.root / "AGENTS.md").write_text("Use the MAME 0.286 source.\n", encoding="utf-8")
+        (self.root / "REFLECT.md").write_text("Run port.py test.\n", encoding="utf-8")
+        (self.root / "CLAUDE.md").write_text("Use the MAME 0.286 source.\n", encoding="utf-8")
+        self.assertEqual(self.tools.project_guidance(),
+                         "Project guidance from REFLECT.md:\nRun port.py test.\n\n"
+                         "Project guidance from AGENTS.md:\nUse the MAME 0.286 source.")
+
+    def test_documents_are_listed_shallowest_first_without_other_projects(self):
+        for path in ("README.md", "games/pacman/README.md", "docs/speed.md", "docs/porting-guide.md",
+                     "docs/reference/z80.md", "docs/megaste-instructions.txt", "doc/api.rst",
+                     "third_party/mame/docs/index.rst", ".github/notes.md", "node_modules/x/README.md", "notes.txt",
+                     "tools/requirements.txt"):
+            (self.root / path).parent.mkdir(parents=True, exist_ok=True)
+            (self.root / path).write_text("text", encoding="utf-8")
+        # Plain text counts only in a documentation folder, and those folders come right after the root.
+        self.assertEqual(self.tools.document_paths(),
+                         ["README.md", "doc/api.rst", "docs/megaste-instructions.txt", "docs/porting-guide.md",
+                          "docs/speed.md", "docs/reference/z80.md", "games/pacman/README.md"])
+        self.assertEqual(self.tools.document_paths(limit=2), ["README.md", "doc/api.rst", "... and 5 more"])
+
+    def test_a_long_file_is_cut_with_a_note(self):
+        (self.root / "AGENTS.md").write_text("x" * 20000, encoding="utf-8")
+        self.assertTrue(self.tools.project_guidance().endswith("[The rest of AGENTS.md is cut. Read it with read_file.]"))
+
+
 class EditFileTest(unittest.TestCase):
     def setUp(self):
         self.directory = tempfile.TemporaryDirectory()

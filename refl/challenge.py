@@ -1,6 +1,6 @@
 """Critics that look for the reasons a plan will fail, and for a simpler one, before its first file change."""
 
-from .reflection import BREVITY_RULE, GOAL_RULE, HONESTY_RULE, Role
+from .reflection import BOOKWORM, BOOKWORM_FOCUS, BREVITY_RULE, GOAL_RULE, HONESTY_RULE, Role
 
 
 CHALLENGE_PROMPT = (
@@ -49,7 +49,7 @@ SIMPLIFIER = Role("Simpler plan", "challenge",
 # Requests for one challenge: the critics and the simplifier, their verifiers, the moderator's rulings and checks,
 # and the main branch's answers. They do not count toward --max-turns, which would leave the task too few
 # requests. A request beyond this stops that step, and the rest goes on.
-REQUESTS = 44
+REQUESTS = 50
 # The tools whose first call in a task starts the challenge. Changes made through Bash are not caught.
 EDIT_TOOLS = {"write_file", "edit_file"}
 # An edit of a few lines is cheaper to check by making it than by six critics. In a live test, a one-line edit
@@ -77,6 +77,10 @@ CRITICS = (
          "shell command, query, or path built from input, a path that can leave its folder, a secret in code or "
          "logs, a weakened check or permission, or code that is downloaded and run. Name the hole and the input "
          "that reaches it.",
+         tools=True, brief=False),
+    Role(BOOKWORM, "challenge",
+         BOOKWORM_FOCUS + " Find a rule, an earlier decision, or a recorded dead end that the planned change breaks "
+         "or repeats.",
          tools=True, brief=False),
     Role("Quality", "challenge",
          "Check whether the planned change keeps the code easy to keep correct: it follows the project's "
