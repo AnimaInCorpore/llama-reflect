@@ -1239,6 +1239,12 @@ def _check_ledger(ws):
 TASKS = {task.name: task for task in (_SHADOWED, _STALE, _LATIN1, _SLOW, _REPORT, _RATES, _NAMES, _LEDGER_TASK)}
 
 
+def api_headers():
+    """The Authorization header for LLAMA_API_KEY, as refl sends it, such as for Basalt."""
+    key = os.environ.get("LLAMA_API_KEY")
+    return {"Authorization": f"Bearer {key}"} if key else {}
+
+
 def materialize(task, workspace):
     for relative, content in task.files.items():
         path = workspace / relative
@@ -1452,7 +1458,7 @@ async def run_arm(task, arm, workspace, args):
         })
 
     events = []
-    server = LlamaClient(HttpClient(args.url, timeout=args.timeout, on_response=record))
+    server = LlamaClient(HttpClient(args.url, headers=api_headers(), timeout=args.timeout, on_response=record))
     model = args.model or await server.default_model()
     try:
         context_size = (await server.properties(model)).context_size
@@ -1573,7 +1579,7 @@ async def run(args):
 async def judge_results(args):
     """Count distinct ideas in the reflections of an earlier results directory."""
     runs = json.loads(Path(args.judge, "results.json").read_text(encoding="utf-8"))
-    server = LlamaClient(HttpClient(args.url, timeout=args.timeout))
+    server = LlamaClient(HttpClient(args.url, headers=api_headers(), timeout=args.timeout))
     model = args.model or await server.default_model()
     for run in runs:
         trajectory = run["trajectory"]
